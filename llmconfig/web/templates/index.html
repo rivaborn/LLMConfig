@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>LLMConfig</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <div class="brand">LLM<span>Config</span></div>
+    <div id="summary" class="summary">
+      <span id="owner" class="badge">…</span>
+      <div class="vram">
+        <div class="vram-bar"><div id="vram-fill" class="vram-fill"></div></div>
+        <span id="vram-text" class="vram-text"></span>
+      </div>
+      <span id="loaded" class="loaded"></span>
+      <button id="unload" class="btn btn-warn" title="Free the GPU">Unload</button>
+    </div>
+    <details class="keybox">
+      <summary>⚙</summary>
+      <label>API key <input id="apikey" type="password" placeholder="X-API-Key (if set)" /></label>
+    </details>
+  </header>
+
+  <main>
+    <section class="col">
+      <h2>Ollama <small id="ollama-up" class="dot"></small></h2>
+      <div class="pull">
+        <input id="pull-name" placeholder="pull a model, e.g. qwen3-coder:30b" />
+        <button id="pull-btn" class="btn">Pull</button>
+      </div>
+      <div id="ollama-list" class="list"></div>
+      <p id="ollama-err" class="err"></p>
+    </section>
+
+    <section class="col">
+      <h2>vLLM <small id="vllm-up" class="dot"></small></h2>
+      <p class="hint">One model per process; loading swaps the GPU to vLLM.</p>
+      <div id="vllm-list" class="list"></div>
+      <p id="vllm-err" class="err"></p>
+    </section>
+
+    <aside class="activity">
+      <h2>Activity</h2>
+      <pre id="log" class="log">idle</pre>
+    </aside>
+  </main>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

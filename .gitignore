@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Environment / secrets — NEVER commit
+.env
+*.local
+
+# Runtime-generated vLLM alias registry (seeded from llmconfig/data/vllm_models.default.yaml).
+# The user edits this copy; the committed seed is the default.
+/data/vllm_models.yaml
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log

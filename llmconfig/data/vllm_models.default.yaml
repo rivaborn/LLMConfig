@@ -1,0 +1,122 @@
+# Default vLLM alias catalog — seeded into ./data/vllm_models.yaml on first run.
+# Mirrors the `serve.sh` alias table on .40 (see wiki: runbooks/local-llm).
+# `managed_by: serve.sh` ⇒ the app starts it via `serve.sh <alias>` (which owns the
+# tuned launch args + the 3090 UUID pin). `served_name` is what /v1/models reports.
+# Edit the generated ./data/vllm_models.yaml (this file is the committed default).
+aliases:
+  - alias: smoke
+    hf_repo: Qwen/Qwen2.5-0.5B-Instruct
+    served_name: smoke
+    mode: compile
+    status: ok
+    notes: Install sanity check (~1 GB)
+    load_timeout_s: 120
+    managed_by: serve.sh
+
+  - alias: vl7
+    hf_repo: Qwen/Qwen2.5-VL-7B-Instruct
+    served_name: qwen2.5-vl-7b
+    mode: compile
+    status: ok
+    notes: Vision; FP16 (~16 GB on GPU)
+    load_timeout_s: 180
+    managed_by: serve.sh
+
+  - alias: coder14
+    hf_repo: Qwen/Qwen2.5-Coder-14B-Instruct-AWQ
+    served_name: qwen2.5-coder-14b
+    mode: compile
+    status: ok
+    notes: Daily light coder; FP8 KV at native 32K. Tool-calls unreliable (Qwen2.5-Coder)
+    load_timeout_s: 180
+    managed_by: serve.sh
+
+  - alias: gemma4
+    hf_repo: cyankiwi/gemma-4-26B-A4B-it-AWQ-4bit
+    served_name: gemma-4-26b
+    mode: compile
+    status: ok
+    notes: MoE 26B-A4B; FP16 KV (FP8 incompatible on Ampere+compressed-tensors); MM disabled
+    load_timeout_s: 240
+    managed_by: serve.sh
+
+  - alias: q35-27b
+    hf_repo: QuantTrio/Qwen3.5-27B-AWQ
+    served_name: qwen3.5-27b
+    mode: compile
+    status: ok
+    notes: Mamba hybrid; util 0.93
+    load_timeout_s: 180
+    managed_by: serve.sh
+
+  - alias: q3-32b
+    hf_repo: Qwen/Qwen3-32B-AWQ
+    served_name: qwen3-32b
+    mode: compile
+    status: ok
+    notes: Dense 32B; tool-calls verified (hermes)
+    load_timeout_s: 180
+    managed_by: serve.sh
+
+  - alias: coder32
+    hf_repo: Qwen/Qwen2.5-Coder-32B-Instruct-AWQ
+    served_name: qwen2.5-coder-32b
+    mode: compile
+    status: ok
+    notes: Daily heavy coder; tool-calls unreliable (Qwen2.5-Coder)
+    load_timeout_s: 180
+    managed_by: serve.sh
+
+  - alias: vl32
+    hf_repo: Qwen/Qwen2.5-VL-32B-Instruct-AWQ
+    served_name: qwen2.5-vl-32b
+    mode: eager
+    status: ok
+    notes: Vision; --cpu-offload-gb 4 → eager-only
+    load_timeout_s: 240
+    managed_by: serve.sh
+
+  - alias: q36-moe
+    hf_repo: Qwen/Qwen3.6-35B-A3B-FP8
+    served_name: qwen3.6-moe
+    mode: eager
+    status: unverified
+    notes: CPU offload 16 GB; ~11 min cold load; chat unverified
+    load_timeout_s: 900
+    managed_by: serve.sh
+
+  - alias: coder30-awq
+    hf_repo: QuantTrio/Qwen3-Coder-30B-A3B-Instruct-AWQ
+    served_name: qwen3-coder-30b
+    mode: compile
+    status: ok
+    notes: BASELINE daily coder. AWQ-INT4, FP8 KV, 65536 ctx. Tool-calls verified e2e
+    load_timeout_s: 180
+    managed_by: serve.sh
+
+  - alias: coder30-fp8
+    hf_repo: Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
+    served_name: qwen3-coder-30b
+    mode: eager
+    status: blocked
+    notes: vLLM 0.20.2 FP8+cpu-offload b_scales bug. Shares served name with coder30-awq; prefer AWQ
+    load_timeout_s: 240
+    managed_by: serve.sh
+
+  - alias: q36-27b
+    hf_repo: Qwen/Qwen3.6-27B-FP8
+    served_name: qwen3.6-27b
+    mode: eager
+    status: blocked
+    notes: Same FP8+cpu-offload b_scales bug in vLLM 0.20.2
+    load_timeout_s: 240
+    managed_by: serve.sh
+
+  - alias: devstral
+    hf_repo: mistralai/Devstral-Small-2507
+    served_name: devstral
+    mode: eager
+    status: skipped
+    notes: 48 GB FP16; needs WSL RAM ≥28 GB
+    load_timeout_s: 600
+    managed_by: serve.sh

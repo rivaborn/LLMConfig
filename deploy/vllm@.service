@@ -1,0 +1,21 @@
+[Unit]
+Description=vLLM serving serve.sh alias %i (managed by LLMConfig)
+After=default.target
+
+[Service]
+Type=simple
+# %i is the serve.sh alias (e.g. coder30-awq). serve.sh pins the RTX 3090 by UUID,
+# sources the venv, and exec's `vllm serve` with the alias's tuned launch args.
+# Edit the path if VLLM_SERVE_SCRIPT differs from the default.
+ExecStart=/bin/bash /home/folar/vllm/serve.sh %i
+# vLLM holds VRAM for the whole process lifetime; a failed model load should NOT
+# auto-restart (it would thrash the GPU). LLMConfig drives start/stop explicitly.
+Restart=no
+# Loads can take up to ~11 min (q36-moe); Type=simple is "active" once the process
+# spawns, so readiness is polled by LLMConfig via the relay, not by systemd.
+TimeoutStartSec=0
+KillSignal=SIGINT
+KillMode=mixed
+
+[Install]
+WantedBy=default.target
