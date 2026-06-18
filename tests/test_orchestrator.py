@@ -94,6 +94,22 @@ class FakeVllm:
         return "fake journal"
 
 
+class FakeKeepalive:
+    def __init__(self):
+        self.ensure_calls = 0
+        self.stopped = False
+
+    def ensure(self):
+        self.ensure_calls += 1
+        return True
+
+    def alive(self):
+        return self.ensure_calls > 0 and not self.stopped
+
+    def stop(self):
+        self.stopped = True
+
+
 def _make(monkeypatch, tmp_path):
     world = World()
     registry = Registry(tmp_path / "reg.yaml")
@@ -102,6 +118,7 @@ def _make(monkeypatch, tmp_path):
     orch = Orchestrator(settings, registry, jobs)
     orch.ollama = FakeOllama(world)
     orch.vllm = FakeVllm(world, registry)
+    orch.keepalive = FakeKeepalive()
 
     async def fake_query_gpu(s=None):
         return world.gpu()
@@ -127,6 +144,8 @@ async def test_load_vllm_evicts_ollama(monkeypatch, tmp_path):
     assert world.ollama == {}, "Ollama models must be evicted before vLLM starts"
     assert world.vllm_served == "qwen3-coder-30b"
     assert job.result["server"] == "vllm"
+    # WSL must be held open or the model dies on the distro's idle-shutdown.
+    assert orch.keepalive.ensure_calls >= 1, "vLLM load must start the WSL keepalive"
 
 
 async def test_load_vllm_blocked_alias_refused(monkeypatch, tmp_path):

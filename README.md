@@ -74,12 +74,18 @@ the **3090 UUID**, VRAM thresholds, optional `LLMCONFIG_API_KEY`, and `HF_TOKEN`
 `GET/POST/PUT/DELETE /api/vllm/aliases` · `POST /api/vllm/download`. Interactive docs at `/docs`.
 
 ## Status
-The orchestration logic is built against the documented `.40` setup (the homelab
-wiki, current as of 2026-06-16). The box was mid-Windows-update during
-development, so **live end-to-end verification is pending** — run `llmconfig
-doctor` and the checks in the project plan once it's back (reachable from a dev
-box over the Tailscale subnet route, `ssh folar@192.168.1.40`). vLLM control
-reuses the existing `serve.sh` + relay; it does not reimplement them.
+**Live-verified on `.40` (2026-06-17).** `doctor --local` is green; both paths
+were exercised end-to-end on the RTX 3090: Ollama load/unload, and a vLLM load
+(`smoke`) that evicted everything, packed VRAM, served real completions through
+the relay, and unloaded back to 0 MiB.
+
+One thing live testing caught that the docs didn't: **WSL2 idle-shuts-down the
+whole distro a few seconds after the last `wsl.exe` call returns**, which killed
+the `vllm@` unit (and the socat relay) seconds after a load — even with
+lingering enabled. LLMConfig now holds the distro open for its lifetime via a
+`WslKeepalive` (`wsl.exe … sleep infinity`) that a vLLM load starts automatically
+and the app releases on graceful shutdown. vLLM control reuses the existing
+`serve.sh` + relay; it does not reimplement them.
 ```
 pip install -e ".[dev]" && pytest    # unit tests (registry, gpu parsing, orchestrator)
 ```

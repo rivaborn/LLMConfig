@@ -20,6 +20,7 @@ from .jobs import JobManager
 from .registry import Registry
 from .schemas import Job, LoadedModel, LoadRequest, StatusResponse, UnloadRequest
 from .schemas import GpuOut
+from .wsl import WslKeepalive
 
 
 class Orchestrator:
@@ -29,6 +30,7 @@ class Orchestrator:
         self.jobs = jobs
         self.ollama = OllamaBackend(settings)
         self.vllm = VllmBackend(settings, registry)
+        self.keepalive = WslKeepalive(settings)
         self._lock = asyncio.Lock()
         self._active_job_id: Optional[str] = None
 
@@ -129,6 +131,14 @@ class Orchestrator:
         if not req.force and (await self.vllm.served()) == served_target:
             self.jobs.log(job, f"vLLM already serving {served_target}")
             return self._vllm_result(served_target, await query_gpu(self.s))
+
+        # Hold WSL open before starting vLLM: otherwise the distro idle-shuts-down
+        # seconds after this load returns and takes the model (and relay) with it.
+        if not self.keepalive.ensure():
+            self.jobs.log(job, "warning: could not start the WSL keepalive (wsl.exe missing?); "
+                               "vLLM may not survive WSL idle-shutdown")
+        else:
+            self.jobs.log(job, "WSL keepalive active (distro held open)")
 
         self.jobs.log(job, "unloading any Ollama models…")
         names = await self.ollama.unload_all()

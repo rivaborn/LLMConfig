@@ -5,6 +5,7 @@ edits/download) require `X-API-Key` only when LLMCONFIG_API_KEY is set.
 """
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
@@ -38,7 +39,14 @@ def create_app() -> FastAPI:
     jobs = JobManager()
     orch = Orchestrator(settings, registry, jobs)
 
-    app = FastAPI(title="LLMConfig", version=__version__,
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI):
+        yield
+        # Release the WSL keepalive so the distro can idle-shut-down cleanly when
+        # the control app stops (an already-loaded vLLM model goes with it).
+        orch.keepalive.stop()
+
+    app = FastAPI(title="LLMConfig", version=__version__, lifespan=lifespan,
                   description="GPU-arbitrated control plane for Ollama + vLLM.")
     app.state.settings = settings
     app.state.registry = registry

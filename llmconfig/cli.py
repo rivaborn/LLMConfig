@@ -5,6 +5,7 @@ Talks to the app on .40 (default http://127.0.0.1:11430). Point it elsewhere wit
 """
 from __future__ import annotations
 
+import sys
 import time
 from typing import Optional
 
@@ -222,6 +223,15 @@ def _poll_job(jid: str) -> None:
 
 
 def main() -> None:
+    # On Windows the console defaults to a legacy code page (cp1252), which turns
+    # the report glyphs (— … → ●) into mojibake. Force UTF-8 on our streams.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except (ValueError, OSError):
+                pass
     app()
 
 

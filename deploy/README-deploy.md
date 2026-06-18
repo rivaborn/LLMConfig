@@ -44,3 +44,12 @@ UI: `http://192.168.1.40:11430/` · API docs: `…/docs`
 - If `LLMCONFIG_API_KEY` is set in `.env`, write ops require the `X-API-Key` header (the UI has a field; the CLI reads `$LLMCONFIG_API_KEY`).
 - The app must run with rights to control the `ollama` service — NSSM's LocalSystem or the elevated scheduled task covers this; a plain user shell may hit "access denied" on `Restart-Service`.
 - vLLM is reached at `127.0.0.1:11437` (the socat relay) — never `localhost` (IPv4 happy-eyeballs).
+- **WSL persistence:** WSL2 shuts the distro down ~seconds after the last `wsl.exe`
+  call exits, which would kill a just-loaded vLLM model (and the relay). The app
+  handles this itself — a vLLM load starts a `wsl.exe … sleep infinity` keepalive
+  that holds the distro open until the app stops. No extra step is needed. (If the
+  app is *killed* rather than stopped gracefully, the keepalive is orphaned and
+  keeps the distro up harmlessly; `wsl --shutdown` clears it.)
+- `serve.sh` is invoked as `bash serve.sh <alias>` by the `vllm@` unit, so it does
+  not strictly need its `+x` bit — but `doctor` checks `test -x`, so keep it
+  executable (`chmod +x ~/vllm/serve.sh`) to keep the check green.
