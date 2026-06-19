@@ -16,11 +16,16 @@ copy .env.example .env      # edit if any defaults differ from this box
 # inside WSL: wsl -d Ubuntu-24.04 -u folar
 mkdir -p ~/.config/systemd/user
 cp /mnt/c/Coding/rivaborn/LLMConfig/deploy/vllm@.service ~/.config/systemd/user/
+# serve.sh is vendored at deploy/serve.sh (the box's working launcher: per-alias vLLM
+# args + the torch-based 3090 GPU resolution). Deploy it to ~/vllm/serve.sh:
+mkdir -p ~/vllm && cp /mnt/c/Coding/rivaborn/LLMConfig/deploy/serve.sh ~/vllm/serve.sh && chmod +x ~/vllm/serve.sh
 systemctl --user daemon-reload
 # lingering should already be enabled (the vllm-relay unit needs it):
 loginctl enable-linger folar
 ```
-> Edit `ExecStart` in `vllm@.service` if your `serve.sh` is not at `/home/folar/vllm/serve.sh`.
+> `serve.sh` is vendored in `deploy/serve.sh`; edit `ExecStart` in `vllm@.service` if you place it
+> somewhere other than `/home/folar/vllm/serve.sh`. Its chat-template files (`~/vllm/templates/*.jinja`)
+> are box-side and **not** vendored — copy them over too.
 
 ## 3. Verify the box matches expectations
 ```powershell
@@ -67,8 +72,9 @@ via `127.0.0.1:11435` either way).
 on the 3070 Ti. Mirror the primary vLLM setup with a 3070 Ti-pinned variant:
 ```bash
 # inside WSL: wsl -d Ubuntu-24.04 -u folar
-# 1) serve-companion.sh — like serve.sh but pins the 3070 Ti and uses a lower
-#    --gpu-memory-utilization + small (≤8 GB) models; serves on an internal port (e.g. 11439).
+# 1) serve-companion.sh — like serve.sh but resolves the 3070 Ti's index via torch (match
+#    "2caf7863"; vLLM 0.20.2 needs an integer index and ignores CUDA_DEVICE_ORDER) and uses a
+#    lower --gpu-memory-utilization + small (<=8 GB) models; serves on an internal port (11439).
 #    Its alias table must match llmconfig/data/vllm_models_companion.default.yaml.
 # 2) a 2nd socat relay: 127.0.0.1:11438  →  the companion vLLM internal port (11439).
 # 3) install the unit:
@@ -89,8 +95,13 @@ llmconfig status                                     # shows both lanes
 >   does *not* resolve `GPU-<uuid>` — given a UUID it discovers no GPU and silently
 >   runs on CPU (`library=cpu`, `total_vram=0 B` in its log). `install-companion.ps1`
 >   keeps the UUID as the source of truth but translates it to an index under
->   `CUDA_DEVICE_ORDER=PCI_BUS_ID` (so indices match `nvidia-smi`). vLLM/PyTorch *do*
->   accept the UUID, so `vllm-companion@.service` pins by UUID.
+>   `CUDA_DEVICE_ORDER=PCI_BUS_ID` (so indices match `nvidia-smi`).
+> - **vLLM 0.20.2 needs an integer index too — and its worker ignores `CUDA_DEVICE_ORDER`.**
+>   A `GPU-<uuid>` fails its ModelConfig `int()` parse, and the worker uses CUDA default
+>   **FASTEST_FIRST** (3090 = index **0**, the *opposite* of PCI/nvidia-smi order where it's 1).
+>   So `serve.sh` resolves the 3090's index via the venv **torch** (matching the UUID) and
+>   **hard-fails** if absent — never silently index 0 (the 3070 Ti). `vllm-companion@.service`
+>   likewise does *not* pin by UUID; its `serve-companion.sh` must torch-resolve the 3070 Ti.
 > - **This box already pins to the 3090 via a User-scope `CUDA_VISIBLE_DEVICES=1`**
 >   (PCI_BUS_ID order → index 1 = the 3090). That's the de-facto "primary pinned to
 >   3090". The companion NSSM service runs as LocalSystem (does *not* inherit the User

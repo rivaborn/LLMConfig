@@ -4,11 +4,12 @@ After=default.target
 
 [Service]
 Type=simple
-# Companion lane = the RTX 3070 Ti (8 GB). CUDA_VISIBLE_DEVICES pins that card by
-# UUID so this instance can NEVER land on the 3090; serve-companion.sh should also
-# self-pin (belt-and-suspenders) and use a lower --gpu-memory-utilization + small
-# models that fit 8 GB. %i is the serve-companion.sh alias (e.g. qwen3-4b).
-Environment=CUDA_VISIBLE_DEVICES=GPU-2caf7863-102e-31e5-be4d-5ec860addc78
+# Companion lane = the RTX 3070 Ti (8 GB). Do NOT pin via Environment=CUDA_VISIBLE_DEVICES
+# here: vLLM 0.20.2 needs an INTEGER index (a GPU-<uuid> fails ModelConfig's int() parse) AND
+# its worker ignores CUDA_DEVICE_ORDER (uses CUDA default FASTEST_FIRST). So serve-companion.sh
+# must resolve the 3070 Ti's index by UUID via torch (mirror serve.sh's 3090 logic, matching
+# "2caf7863") and hard-fail if absent — then exec vllm with a lower --gpu-memory-utilization
+# and small (<=8 GB) models. %i is the serve-companion.sh alias (e.g. qwen3-4b).
 ExecStart=/bin/bash /home/folar/vllm/serve-companion.sh %i
 # vLLM holds VRAM for the whole process lifetime; a failed load should NOT
 # auto-restart (it would thrash the GPU). LLMConfig drives start/stop explicitly.
