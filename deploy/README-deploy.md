@@ -51,6 +51,11 @@ sharing the primary model store:
 ```powershell
 powershell -ExecutionPolicy Bypass -File deploy\install-companion.ps1
 ```
+By default it binds **`0.0.0.0:11435` and opens a firewall rule** so an off-box client
+(e.g. the opencode `/swap` relay) can reach the 3070 Ti directly — it is **auth-less and
+LAN-only**, like the primary Ollama; never expose it past the perimeter. Pass
+`-OnBoxOnly` to bind `127.0.0.1` and skip the firewall (LLMConfig on the box reaches it
+via `127.0.0.1:11435` either way).
 
 **b. Enable the lane** in `.env`, then verify:
 ```powershell

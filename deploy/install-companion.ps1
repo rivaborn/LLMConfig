@@ -10,10 +10,15 @@ LLMConfig then controls it through the same winsvc path as the primary
 GPU pinning note (learned live on this box): Ollama's CUDA_VISIBLE_DEVICES wants a
 device *index*, not a `GPU-<uuid>` string (it won't resolve the UUID and falls back to
 CPU). We keep the UUID as the source of truth and translate it to an index under
-CUDA_DEVICE_ORDER=PCI_BUS_ID (so indices match nvidia-smi). This box also sets a
-User-scope CUDA_VISIBLE_DEVICES=1 (the 3090) as the default pin; the NSSM service runs
-as LocalSystem and does NOT inherit that, and AppEnvironmentExtra sets the 3070 Ti
-explicitly - so the companion lands on the right card.
+CUDA_DEVICE_ORDER=PCI_BUS_ID (so indices match nvidia-smi). The NSSM service runs as
+LocalSystem and sets CUDA_VISIBLE_DEVICES in its own AppEnvironmentExtra, so it pins
+the 3070 Ti explicitly. (A User-scope CUDA_VISIBLE_DEVICES=1 exists for the 3090 but
+only affects user-session/WSL processes; LocalSystem services don't inherit it.)
+
+Bind: by default the companion Ollama binds LAN-wide (0.0.0.0:11435) and a firewall
+rule is added, so an off-box client (e.g. the opencode /swap relay) can reach the
+3070 Ti directly. Like the primary Ollama it is **auth-less and LAN-only** -- never
+expose it past the perimeter. Pass -OnBoxOnly to bind 127.0.0.1 and skip the firewall.
 
 By default this also stops the Ollama tray app and removes its login-autostart: the
 tray hosts the auto-updater, which can't stop the NSSM-managed ollama.exe and corrupts
@@ -37,7 +42,8 @@ param(
     [int]$GpuIndex = -1,            # override; otherwise derived from $GpuUuid
     [string]$OllamaExe = "",
     [string]$ModelsDir = "",
-    [switch]$KeepTrayApp           # by default, stop + disable the Ollama tray/updater
+    [switch]$KeepTrayApp,           # by default, stop + disable the Ollama tray/updater
+    [switch]$OnBoxOnly             # bind 127.0.0.1 (no LAN/firewall); default is LAN 0.0.0.0 + firewall
 )
 $ErrorActionPreference = "Stop"
 
@@ -89,10 +95,12 @@ if ($GpuIndex -lt 0) {
     $GpuIndex = [int](($line -split ",")[0].Trim())
 }
 
+$BindHost = if ($OnBoxOnly) { "127.0.0.1" } else { "0.0.0.0" }
+
 Write-Host "ollama.exe : $OllamaExe"
 Write-Host "models dir : $ModelsDir  (shared with the primary instance)"
 Write-Host "GPU pin    : index $GpuIndex  (= $GpuUuid, PCI_BUS_ID order)"
-Write-Host "listen     : 127.0.0.1:$Port"
+Write-Host "listen     : ${BindHost}:$Port  $(if ($OnBoxOnly) {'(on-box only)'} else {'(LAN + firewall)'})"
 
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     Write-Host "Service '$ServiceName' already exists - reconfiguring."
@@ -104,12 +112,25 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
 & $nssm set $ServiceName Start SERVICE_AUTO_START
 & $nssm set $ServiceName DisplayName "Ollama (companion, RTX 3070 Ti)"
 & $nssm set $ServiceName AppEnvironmentExtra `
-    "OLLAMA_HOST=127.0.0.1:$Port" `
+    "OLLAMA_HOST=${BindHost}:$Port" `
     "CUDA_DEVICE_ORDER=PCI_BUS_ID" `
     "CUDA_VISIBLE_DEVICES=$GpuIndex" `
     "OLLAMA_MODELS=$ModelsDir"
 & $nssm start $ServiceName
-Write-Host "Started '$ServiceName' (Ollama on :$Port pinned to GPU index $GpuIndex / the 3070 Ti)."
+Write-Host "Started '$ServiceName' (Ollama on ${BindHost}:$Port pinned to GPU index $GpuIndex / the 3070 Ti)."
+
+# LAN access for off-box clients (e.g. the opencode /swap relay). Auth-less + LAN-only.
+if (-not $OnBoxOnly) {
+    $fwName = "OllamaCompanion $Port"
+    if (-not (Get-NetFirewallRule -DisplayName $fwName -ErrorAction SilentlyContinue)) {
+        New-NetFirewallRule -DisplayName $fwName -Direction Inbound -Action Allow `
+            -Protocol TCP -LocalPort $Port -Profile Any | Out-Null
+        Write-Host "Added firewall rule '$fwName' (inbound TCP $Port)."
+    } else {
+        Write-Host "Firewall rule '$fwName' already present."
+    }
+}
+
 Write-Host "`nVerify GPU offload in the service log (should NOT say library=cpu / total_vram=0):"
 Write-Host "  nssm get $ServiceName AppStdout   # then load a small model and check nvidia-smi"
 Write-Host "Next: set COMPANION_ENABLED=1 in .env, then: llmconfig doctor --local"
