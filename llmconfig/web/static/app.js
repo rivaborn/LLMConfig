@@ -20,7 +20,9 @@ async function api(path, opts) {
   return r.json();
 }
 
-let busy = false; // a load/unload/pull job is running
+let busy = false;        // a load/unload/pull job is running (UI does one at a time)
+let LANES = [];          // [{id, name, enabled, default}]
+const panels = {};       // lane id -> {el, refs, lane}
 
 function log(text, append) {
   const el = $("log");
@@ -28,93 +30,185 @@ function log(text, append) {
   el.scrollTop = el.scrollHeight;
 }
 
-// ---- status ----
-async function refreshStatus() {
-  let d;
-  try { d = await api("/api/status"); } catch (e) { return; }
-  const owner = d.owner;
-  const ob = $("owner");
-  ob.textContent = owner;
-  ob.className = "badge " + owner;
-
-  const g = d.gpu || {};
-  $("vram-fill").style.width = (g.found ? g.utilization_pct : 0) + "%";
-  $("vram-text").textContent = g.found ? `${g.used_mb}/${g.total_mb} MiB (${g.utilization_pct}%)` : "GPU n/a";
-
-  const lm = d.loaded;
-  if (lm && lm.server === "ollama") {
-    const spill = lm.spilled ? `, ${GIB(lm.on_cpu_bytes)} CPU` : " (all GPU)";
-    $("loaded").textContent = `${lm.model} · ollama · ${GIB(lm.on_gpu_bytes)} GPU${spill}`;
-  } else if (lm) {
-    $("loaded").textContent = `${lm.model} · vllm`;
-  } else {
-    $("loaded").textContent = "no model loaded";
-  }
-  $("ollama-up").className = "dot" + (d.ollama_up ? " up" : "");
-  $("vllm-up").className = "dot" + (d.vllm_up ? " up" : "");
+// ---- boot: discover lanes, build a panel each ----
+async function boot() {
+  try { LANES = await api("/api/lanes"); }
+  catch (e) { LANES = [{ id: "primary", name: "GPU", enabled: true, default: null }]; }
+  const root = $("lanes");
+  root.innerHTML = "";
+  LANES.forEach((l) => { const p = buildPanel(l); panels[l.id] = p; root.appendChild(p.el); });
+  await refreshAll();
 }
 
-// ---- catalog ----
-async function refreshModels() {
-  let d;
-  try { d = await api("/api/models"); } catch (e) { return; }
-  const ol = $("ollama-list"); ol.innerHTML = "";
-  (d.ollama || []).forEach((m) => ol.appendChild(modelCard("ollama", m.name, GIB(m.size_bytes), "", m.loaded)));
-  $("ollama-err").textContent = d.ollama_error || "";
-
-  const vl = $("vllm-list"); vl.innerHTML = "";
-  (d.vllm || []).forEach((a) => vl.appendChild(
-    modelCard("vllm", a.alias, `→ ${a.served_name}`, a.status, a.loaded)
-  ));
-  $("vllm-err").textContent = d.vllm_error || "";
+function buildPanel(lane) {
+  const el = document.createElement("section");
+  el.className = "lane";
+  el.innerHTML = `
+    <div class="lane-head">
+      <span class="lane-name">${lane.name || lane.id}</span>
+      <span class="badge owner">…</span>
+      <div class="vram"><div class="vram-bar"><div class="vram-fill"></div></div><span class="vram-text"></span></div>
+      <span class="loaded"></span>
+      <button class="btn btn-warn unload" title="Free this GPU">Unload</button>
+    </div>
+    <div class="lane-cols">
+      <div class="col">
+        <h3>Ollama <small class="dot ollama-dot"></small></h3>
+        <div class="pull">
+          <input class="pull-name" placeholder="pull a model, e.g. qwen3:4b" />
+          <button class="btn pull-btn">Pull</button>
+        </div>
+        <div class="list ollama-list"></div>
+        <p class="err ollama-err"></p>
+      </div>
+      <div class="col">
+        <h3>vLLM <small class="dot vllm-dot"></small></h3>
+        <div class="list vllm-list"></div>
+        <p class="err vllm-err"></p>
+      </div>
+    </div>`;
+  const q = (s) => el.querySelector(s);
+  const refs = {
+    owner: q(".owner"), vramFill: q(".vram-fill"), vramText: q(".vram-text"), loaded: q(".loaded"),
+    ollamaDot: q(".ollama-dot"), vllmDot: q(".vllm-dot"),
+    ollamaList: q(".ollama-list"), vllmList: q(".vllm-list"),
+    ollamaErr: q(".ollama-err"), vllmErr: q(".vllm-err"),
+    pullName: q(".pull-name"), pullBtn: q(".pull-btn"), unload: q(".unload"),
+  };
+  refs.unload.onclick = () => doUnload(lane.id);
+  refs.pullBtn.onclick = () => doPull(lane.id, refs.pullName);
+  refs.pullName.addEventListener("keydown", (e) => { if (e.key === "Enter") doPull(lane.id, refs.pullName); });
+  return { el, refs, lane };
 }
 
-function modelCard(server, name, meta, status, loaded) {
+function laneDefault(id) {
+  const l = LANES.find((x) => x.id === id);
+  return l && l.default ? l.default : null;
+}
+
+function modelCard(laneId, server, name, meta, status, loaded) {
+  const def = laneDefault(laneId);
+  const isDefault = def && def.server === server && def.model === name;
+
   const card = document.createElement("div");
   card.className = "card" + (loaded ? " loaded-card" : "");
+
   const left = document.createElement("div");
   left.innerHTML = `<div class="name">${name}` +
     (status ? ` <span class="tag ${status}">${status}</span>` : "") +
     `</div><div class="meta">${meta}</div>`;
+
+  const actions = document.createElement("div");
+  actions.className = "actions";
+
+  const star = document.createElement("button");
+  star.className = "btn star" + (isDefault ? " on" : "");
+  star.title = isDefault ? "Startup default (click to clear)" : "Set as startup default";
+  star.textContent = isDefault ? "★" : "☆";
+  star.disabled = busy;
+  star.onclick = () => setDefault(laneId, server, name);
+
   const btn = document.createElement("button");
   btn.className = "btn";
   btn.textContent = loaded ? "Loaded" : "Load";
   btn.disabled = loaded || busy;
-  btn.onclick = () => doLoad(server, name);
-  card.appendChild(left); card.appendChild(btn);
+  btn.onclick = () => doLoad(laneId, server, name);
+
+  actions.appendChild(star);
+  actions.appendChild(btn);
+  card.appendChild(left);
+  card.appendChild(actions);
   return card;
 }
 
+// ---- status / catalog ----
+async function refreshStatus() {
+  let d;
+  try { d = await api("/api/status"); } catch (e) { return; }
+  (d.lanes || []).forEach((l) => {
+    const p = panels[l.id];
+    if (!p) return;
+    const r = p.refs;
+    r.owner.textContent = l.owner;
+    r.owner.className = "badge owner " + l.owner;
+    const g = l.gpu || {};
+    r.vramFill.style.width = (g.found ? g.utilization_pct : 0) + "%";
+    r.vramText.textContent = g.found ? `${g.used_mb}/${g.total_mb} MiB (${g.utilization_pct}%)` : "GPU n/a";
+    const lm = l.loaded;
+    if (lm && lm.server === "ollama") {
+      const spill = lm.spilled ? `, ${GIB(lm.on_cpu_bytes)} CPU` : " (all GPU)";
+      r.loaded.textContent = `${lm.model} · ollama · ${GIB(lm.on_gpu_bytes)} GPU${spill}`;
+    } else if (lm) {
+      r.loaded.textContent = `${lm.model} · vllm`;
+    } else {
+      r.loaded.textContent = "no model loaded";
+    }
+    r.ollamaDot.className = "dot ollama-dot" + (l.ollama_up ? " up" : "");
+    r.vllmDot.className = "dot vllm-dot" + (l.vllm_up ? " up" : "");
+  });
+}
+
+async function refreshModels() {
+  for (const lane of LANES) {
+    const p = panels[lane.id];
+    if (!p) continue;
+    const r = p.refs;
+    let d;
+    try { d = await api("/api/models?lane=" + encodeURIComponent(lane.id)); } catch (e) { continue; }
+    r.ollamaList.innerHTML = "";
+    (d.ollama || []).forEach((m) => r.ollamaList.appendChild(modelCard(lane.id, "ollama", m.name, GIB(m.size_bytes), "", m.loaded)));
+    r.ollamaErr.textContent = d.ollama_error || "";
+    r.vllmList.innerHTML = "";
+    (d.vllm || []).forEach((a) => r.vllmList.appendChild(modelCard(lane.id, "vllm", a.alias, `→ ${a.served_name}`, a.status, a.loaded)));
+    r.vllmErr.textContent = d.vllm_error || "";
+  }
+}
+
 // ---- actions ----
-async function doLoad(server, model) {
+async function doLoad(laneId, server, model) {
   if (busy) return;
   busy = true; setButtons();
-  log(`loading ${model} on ${server}…`);
+  log(`loading ${model} on ${server} [${laneId}]…`);
   try {
-    const job = await api("/api/load", { method: "POST", body: JSON.stringify({ server, model }) });
+    const job = await api("/api/load", { method: "POST", body: JSON.stringify({ server, model, lane: laneId }) });
     await pollJob(job.id);
   } catch (e) { log("error: " + e.message, true); }
   busy = false; await refreshAll(); setButtons();
 }
 
-async function doUnload() {
+async function doUnload(laneId) {
   if (busy) return;
-  busy = true; setButtons(); log("unloading / freeing GPU…");
-  try { await api("/api/unload", { method: "POST", body: JSON.stringify({}) }); log("GPU freed", true); }
+  busy = true; setButtons(); log(`unloading / freeing GPU [${laneId}]…`);
+  try { await api("/api/unload", { method: "POST", body: JSON.stringify({ lane: laneId }) }); log("GPU freed", true); }
   catch (e) { log("error: " + e.message, true); }
   busy = false; await refreshAll(); setButtons();
 }
 
-async function doPull() {
-  const name = $("pull-name").value.trim();
+async function doPull(laneId, input) {
+  const name = input.value.trim();
   if (!name || busy) return;
   busy = true; setButtons(); log(`pulling ${name}…`);
   try {
     const job = await api("/api/ollama/pull", { method: "POST", body: JSON.stringify({ model: name }) });
     await pollJob(job.id);
-    $("pull-name").value = "";
+    input.value = "";
   } catch (e) { log("error: " + e.message, true); }
   busy = false; await refreshAll(); setButtons();
+}
+
+async function setDefault(laneId, server, model) {
+  if (busy) return;
+  const cur = laneDefault(laneId);
+  const clearing = cur && cur.server === server && cur.model === model;
+  try {
+    await api(`/api/lanes/${encodeURIComponent(laneId)}/default`, {
+      method: "PUT",
+      body: JSON.stringify(clearing ? { server: "", model: "" } : { server, model }),
+    });
+    LANES = await api("/api/lanes");
+    log(clearing ? `cleared ${laneId} startup default` : `set ${laneId} startup default → ${model} [${server}]`, true);
+    await refreshModels();
+  } catch (e) { log("error: " + e.message, true); }
 }
 
 async function pollJob(id) {
@@ -135,16 +229,11 @@ function setButtons() {
   document.querySelectorAll(".card .btn").forEach((b) => {
     if (b.textContent !== "Loaded") b.disabled = busy;
   });
-  $("unload").disabled = busy;
-  $("pull-btn").disabled = busy;
+  document.querySelectorAll(".lane .unload, .lane .pull-btn").forEach((b) => (b.disabled = busy));
 }
 
 // ---- boot ----
-$("unload").onclick = doUnload;
-$("pull-btn").onclick = doPull;
-$("pull-name").addEventListener("keydown", (e) => { if (e.key === "Enter") doPull(); });
-
-async function refreshAll() { await Promise.all([refreshStatus(), refreshModels()]); }
-refreshAll();
+async function refreshAll() { await refreshStatus(); await refreshModels(); }
+boot();
 setInterval(() => { if (!busy) refreshStatus(); }, 2500);
 setInterval(() => { if (!busy) refreshModels(); }, 12000);

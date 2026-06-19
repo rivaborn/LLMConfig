@@ -6,6 +6,7 @@ changes. Defaults match the documented `Alien-3070-TI` setup.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 
@@ -14,6 +15,28 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 # Repo root = parent of the `llmconfig/` package dir. Used for default data paths.
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PACKAGE_DIR = Path(__file__).resolve().parent
+
+
+@dataclass(frozen=True)
+class LaneConfig:
+    """Everything that pins one inference lane to one GPU. The `Orchestrator` runs
+    one `Lane` per `LaneConfig`; the primary lane is the RTX 3090, the optional
+    companion lane is the RTX 3070 Ti."""
+
+    id: str                       # "primary" | "companion"
+    name: str                     # display label, e.g. "RTX 3090"
+    gpu_uuid: str
+    vram_total_mb: int
+    vram_free_baseline_mb: int
+    ollama_url: str
+    ollama_service_name: str
+    vllm_relay_url: str
+    vllm_serve_script: str
+    vllm_systemd_unit: str
+    registry_path: Path
+    enabled: bool = True
+    default_server: str = ""      # "ollama" | "vllm" | "" — auto-load on startup
+    default_model: str = ""       # Ollama tag or vLLM alias
 
 
 class Settings(BaseSettings):
@@ -42,10 +65,24 @@ class Settings(BaseSettings):
     wsl_distro: str = "Ubuntu-24.04"
     wsl_user: str = "folar"
 
-    # --- GPU ---
+    # --- GPU (primary lane = RTX 3090) ---
     gpu_uuid: str = "GPU-739bece9-8298-7993-f7dd-c8d86cb541f9"  # the RTX 3090
     vram_total_mb: int = 24576
     vram_free_baseline_mb: int = 1500  # "freed" / "maxed" threshold
+
+    # --- companion lane (RTX 3070 Ti) — optional second GPU, off by default ---
+    companion_enabled: bool = False
+    companion_gpu_uuid: str = "GPU-2caf7863-102e-31e5-be4d-5ec860addc78"  # the RTX 3070 Ti
+    companion_vram_total_mb: int = 8192
+    companion_vram_free_baseline_mb: int = 600
+    companion_ollama_url: str = "http://127.0.0.1:11435"        # 2nd Ollama instance
+    companion_ollama_service_name: str = "OllamaCompanion"
+    companion_vllm_relay_url: str = "http://127.0.0.1:11438"    # 2nd socat relay
+    companion_vllm_serve_script: str = "/home/folar/vllm/serve-companion.sh"
+    companion_vllm_systemd_unit: str = "vllm-companion@"
+    companion_registry_path: Path = REPO_ROOT / "data" / "vllm_models_companion.yaml"
+    companion_default_server: str = ""   # "ollama" | "vllm" | "" — auto-load on startup
+    companion_default_model: str = ""    # Ollama tag or vLLM alias
 
     # --- HuggingFace (vLLM downloads) ---
     hf_token: str = ""
@@ -67,6 +104,46 @@ class Settings(BaseSettings):
     def base_url(self) -> str:
         host = "127.0.0.1" if self.llmconfig_host in ("0.0.0.0", "") else self.llmconfig_host
         return f"http://{host}:{self.llmconfig_port}"
+
+    def lanes(self) -> list[LaneConfig]:
+        """The lanes to run: always the primary (RTX 3090); the companion (RTX 3070
+        Ti) when `companion_enabled`."""
+        lanes = [
+            LaneConfig(
+                id="primary",
+                name="RTX 3090",
+                gpu_uuid=self.gpu_uuid,
+                vram_total_mb=self.vram_total_mb,
+                vram_free_baseline_mb=self.vram_free_baseline_mb,
+                ollama_url=self.ollama_url,
+                ollama_service_name=self.ollama_service_name,
+                vllm_relay_url=self.vllm_relay_url,
+                vllm_serve_script=self.vllm_serve_script,
+                vllm_systemd_unit=self.vllm_systemd_unit,
+                registry_path=self.registry_path,
+                enabled=True,
+            ),
+        ]
+        if self.companion_enabled:
+            lanes.append(
+                LaneConfig(
+                    id="companion",
+                    name="RTX 3070 Ti",
+                    gpu_uuid=self.companion_gpu_uuid,
+                    vram_total_mb=self.companion_vram_total_mb,
+                    vram_free_baseline_mb=self.companion_vram_free_baseline_mb,
+                    ollama_url=self.companion_ollama_url,
+                    ollama_service_name=self.companion_ollama_service_name,
+                    vllm_relay_url=self.companion_vllm_relay_url,
+                    vllm_serve_script=self.companion_vllm_serve_script,
+                    vllm_systemd_unit=self.companion_vllm_systemd_unit,
+                    registry_path=self.companion_registry_path,
+                    enabled=True,
+                    default_server=self.companion_default_server,
+                    default_model=self.companion_default_model,
+                )
+            )
+        return lanes
 
 
 @lru_cache

@@ -3,7 +3,7 @@
 Exercises the core guarantees: eviction before load, the VRAM-free gate, and the
 pack-then-spill verification — without touching wsl.exe / nvidia-smi / Ollama.
 """
-import llmconfig.orchestrator as orch_mod
+import llmconfig.lane as lane_mod
 from llmconfig.config import Settings
 from llmconfig.gpu import GpuInfo
 from llmconfig.jobs import JobManager
@@ -116,14 +116,16 @@ def _make(monkeypatch, tmp_path):
     settings = Settings(gpu_uuid="GPU-x", evict_timeout_s=5, poll_interval_s=0.01)
     jobs = JobManager()
     orch = Orchestrator(settings, registry, jobs)
-    orch.ollama = FakeOllama(world)
-    orch.vllm = FakeVllm(world, registry)
-    orch.keepalive = FakeKeepalive()
+    # Arbitration lives on the lane; swap in the fakes there.
+    lane = orch.primary
+    lane.ollama = FakeOllama(world)
+    lane.vllm = FakeVllm(world, registry)
+    lane.keepalive = FakeKeepalive()
 
-    async def fake_query_gpu(s=None):
+    async def fake_query_gpu(s=None, uuid=None):
         return world.gpu()
 
-    monkeypatch.setattr(orch_mod, "query_gpu", fake_query_gpu)
+    monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)
     return world, orch, jobs
 
 
@@ -145,7 +147,7 @@ async def test_load_vllm_evicts_ollama(monkeypatch, tmp_path):
     assert world.vllm_served == "qwen3-coder-30b"
     assert job.result["server"] == "vllm"
     # WSL must be held open or the model dies on the distro's idle-shutdown.
-    assert orch.keepalive.ensure_calls >= 1, "vLLM load must start the WSL keepalive"
+    assert orch.primary.keepalive.ensure_calls >= 1, "vLLM load must start the WSL keepalive"
 
 
 async def test_load_vllm_blocked_alias_refused(monkeypatch, tmp_path):

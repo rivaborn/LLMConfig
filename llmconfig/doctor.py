@@ -1,9 +1,9 @@
 """`llmconfig doctor` — read-only recon that verifies every on-box assumption.
 
-Run it (against the live .40, locally or remotely over Tailscale) to confirm the
-serve.sh path + alias map, the vLLM systemd unit, systemctl-over-wsl, service-
-control rights, the 3090 UUID, and relay/Ollama reachability — i.e. everything
-the plan flagged to confirm once the box is back.
+Run it (against the live .40, locally or remotely over Tailscale) to confirm, per
+GPU lane, the serve.sh path + alias map, the vLLM systemd unit, the Ollama API +
+service, and the GPU UUID; plus the shared WSL plumbing (distro, systemctl --user,
+lingering) and service-control rights.
 """
 from __future__ import annotations
 
@@ -14,9 +14,9 @@ from pydantic import BaseModel
 from . import winsvc
 from .backends.ollama import OllamaBackend
 from .backends.vllm import VllmBackend
-from .config import Settings, get_settings
+from .config import LaneConfig, Settings, get_settings
 from .gpu import query_gpu
-from .registry import Registry, make_registry
+from .registry import DEFAULT_COMPANION_REGISTRY, Registry, make_registry
 from .wsl import run_wsl, user_systemctl
 
 
@@ -39,41 +39,100 @@ class DoctorReport(BaseModel):
         return self
 
 
-async def run_doctor(settings: Settings | None = None, registry: Registry | None = None) -> DoctorReport:
-    settings = settings or get_settings()
-    registry = registry or make_registry(settings)
-    ollama = OllamaBackend(settings)
-    vllm = VllmBackend(settings, registry)
-    checks: list[Check] = []
+def _registry_for(settings: Settings, cfg: LaneConfig, primary: Registry | None) -> Registry:
+    if cfg.id == "primary":
+        return primary or make_registry(settings)
+    return Registry(cfg.registry_path, default_path=DEFAULT_COMPANION_REGISTRY)
 
-    def add(name: str, ok: Optional[bool], detail: str = "") -> None:
-        checks.append(Check(name=name, ok=ok, detail=detail))
+
+async def _check_lane(add, settings: Settings, cfg: LaneConfig, registry: Registry, wsl_ok: bool) -> None:
+    """Per-lane checks, prefixed with the lane id (e.g. `companion.gpu`)."""
+    ollama = OllamaBackend(settings, base_url=cfg.ollama_url, service_name=cfg.ollama_service_name)
+    vllm = VllmBackend(
+        settings,
+        registry,
+        relay_url=cfg.vllm_relay_url,
+        serve_script=cfg.vllm_serve_script,
+        systemd_unit=cfg.vllm_systemd_unit,
+    )
+    p = cfg.id
+
+    # --- GPU (by UUID) ---
+    gpu = await query_gpu(settings, uuid=cfg.gpu_uuid)
+    if gpu.found:
+        add(f"{p}.gpu", True, f"{cfg.name}: {gpu.uuid}: {gpu.used_mb}/{gpu.total_mb} MiB ({gpu.utilization_pct}%)")
+    else:
+        add(f"{p}.gpu", False, gpu.error or f"{cfg.gpu_uuid} not reported by nvidia-smi")
 
     # --- Ollama (Windows-native) ---
     ver = await ollama.version()
     if ver is not None:
         loaded = await ollama.loaded_names()
-        add("ollama.api", True, f"v{ver} at {settings.ollama_url}; loaded: {', '.join(loaded) or 'none'}")
+        add(f"{p}.ollama.api", True, f"v{ver} at {cfg.ollama_url}; loaded: {', '.join(loaded) or 'none'}")
     else:
-        add("ollama.api", False, f"no response at {settings.ollama_url}")
+        add(f"{p}.ollama.api", False, f"no response at {cfg.ollama_url}")
 
     st = await ollama.service_status()
-    add("ollama.service", True if st == winsvc.RUNNING else None,
-        f"status={st} (name={settings.ollama_service_name})")
+    add(f"{p}.ollama.service", True if st == winsvc.RUNNING else None,
+        f"status={st} (name={cfg.ollama_service_name})")
 
+    # --- vLLM (per-lane serve script / unit / relay) ---
+    if wsl_ok:
+        r = await run_wsl(f"test -x {cfg.vllm_serve_script} && echo ok || echo missing",
+                          login=False, timeout=20.0, settings=settings)
+        serve_present = "ok" in r.out
+        add(f"{p}.vllm.serve_script", serve_present,
+            cfg.vllm_serve_script if serve_present else f"{cfg.vllm_serve_script} not found/executable")
+
+        if serve_present:
+            help_res = await vllm.serve_help()
+            help_text = help_res.out
+            managed = [e.alias for e in registry.entries() if e.managed_by == "serve.sh"]
+            missing = [a for a in managed if a not in help_text]
+            if not help_text:
+                add(f"{p}.vllm.aliases", None, f"serve script --help produced no output: {help_res.text()}")
+            elif missing:
+                add(f"{p}.vllm.aliases", None, f"registry aliases not in serve --help: {', '.join(missing)}")
+            else:
+                add(f"{p}.vllm.aliases", True, f"all {len(managed)} registry aliases present in serve --help")
+
+        unit_ok = await vllm.unit_exists("smoke")
+        add(f"{p}.vllm.systemd_unit", True if unit_ok else None,
+            f"{cfg.vllm_systemd_unit}<alias> template installed" if unit_ok
+            else f"unit {cfg.vllm_systemd_unit}<alias> not found — install the lane's vllm unit")
+
+    relay = await vllm.relay_up()
+    if relay:
+        served = await vllm.served()
+        add(f"{p}.vllm.relay", True, f"{cfg.vllm_relay_url} up; serving: {served or 'nothing'}")
+    else:
+        add(f"{p}.vllm.relay", None, f"{cfg.vllm_relay_url} not answering (expected when vLLM is stopped)")
+
+
+async def run_doctor(settings: Settings | None = None, registry: Registry | None = None) -> DoctorReport:
+    settings = settings or get_settings()
+    lane_cfgs = settings.lanes()
+    checks: list[Check] = []
+
+    def add(name: str, ok: Optional[bool], detail: str = "") -> None:
+        checks.append(Check(name=name, ok=ok, detail=detail))
+
+    add("lanes", None, "running: " + ", ".join(f"{c.id} ({c.name})" for c in lane_cfgs))
+
+    # --- distinct GPU UUIDs across lanes (a collision would cross-contend) ---
+    uuids = [c.gpu_uuid for c in lane_cfgs]
+    if len(set(uuids)) != len(uuids):
+        add("lanes.distinct_gpus", False, f"two lanes share a GPU UUID: {uuids}")
+    elif len(lane_cfgs) > 1:
+        add("lanes.distinct_gpus", True, "each lane pins a distinct GPU UUID")
+
+    # --- service-control rights (shared; needed to Start/Restart Ollama services) ---
     elevated = await winsvc.is_elevated()
     add("ollama.service_control", True if elevated else None,
         "running elevated - can Start/Restart-Service" if elevated
         else "NOT elevated - Start/Restart-Service may be access-denied; run the app as admin or grant the service ACL")
 
-    # --- GPU ---
-    gpu = await query_gpu(settings)
-    if gpu.found:
-        add("gpu.3090", True, f"{gpu.uuid}: {gpu.used_mb}/{gpu.total_mb} MiB used ({gpu.utilization_pct}%)")
-    else:
-        add("gpu.3090", False, gpu.error or "nvidia-smi did not report the configured UUID")
-
-    # --- WSL plumbing ---
+    # --- WSL plumbing (shared; one distro hosts every lane's vLLM relay) ---
     r = await run_wsl("echo ok", login=False, timeout=20.0, settings=settings)
     wsl_ok = r.ok and "ok" in r.out
     add("wsl.distro", wsl_ok, f"{settings.wsl_distro} as {settings.wsl_user}" if wsl_ok else (r.text() or "wsl.exe unavailable"))
@@ -91,35 +150,11 @@ async def run_doctor(settings: Settings | None = None, registry: Registry | None
         add("wsl.lingering", True if "Linger=yes" in r.out else None,
             r.out.strip() or "could not read linger state (loginctl)")
 
-        r = await run_wsl(f"test -x {settings.vllm_serve_script} && echo ok || echo missing",
-                          login=False, timeout=20.0, settings=settings)
-        serve_present = "ok" in r.out
-        add("vllm.serve_script", serve_present,
-            settings.vllm_serve_script if serve_present else f"{settings.vllm_serve_script} not found/executable")
+    # --- per-lane checks ---
+    for cfg in lane_cfgs:
+        await _check_lane(add, settings, cfg, _registry_for(settings, cfg, registry), wsl_ok)
 
-        if serve_present:
-            help_res = await vllm.serve_help()
-            help_text = help_res.out
-            managed = [e.alias for e in registry.entries() if e.managed_by == "serve.sh"]
-            missing = [a for a in managed if a not in help_text]
-            if not help_text:
-                add("vllm.aliases", None, f"serve.sh --help produced no output: {help_res.text()}")
-            elif missing:
-                add("vllm.aliases", None, f"registry aliases not in serve.sh --help: {', '.join(missing)}")
-            else:
-                add("vllm.aliases", True, f"all {len(managed)} registry aliases present in serve.sh --help")
-
-        unit_ok = await vllm.unit_exists("smoke")
-        add("vllm.systemd_unit", True if unit_ok else None,
-            f"{settings.vllm_systemd_unit}<alias> template installed" if unit_ok
-            else f"unit {settings.vllm_systemd_unit}<alias> not found — install deploy/vllm@.service")
-
-    # --- vLLM relay ---
-    relay = await vllm.relay_up()
-    if relay:
-        served = await vllm.served()
-        add("vllm.relay", True, f"{settings.vllm_relay_url} up; serving: {served or 'nothing'}")
-    else:
-        add("vllm.relay", None, f"{settings.vllm_relay_url} not answering (expected when vLLM is stopped)")
+    if not settings.companion_enabled:
+        add("companion.enabled", None, "companion lane off (set COMPANION_ENABLED=1 to use the RTX 3070 Ti)")
 
     return DoctorReport(checks=checks).summarize()

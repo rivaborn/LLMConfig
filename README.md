@@ -28,6 +28,11 @@ then loads the target — so it packs 100 % of VRAM before any CPU spill.
 - **Manage** models: pull/delete Ollama models, edit the vLLM alias registry,
   trigger HF downloads.
 - **`doctor`**: read-only recon that checks every on-box assumption.
+- **Companion lane** (optional): drive a second GPU (e.g. the RTX 3070 Ti) as an
+  independent lane that runs its own model — so the 3090 can serve a big vLLM model
+  while the 3070 Ti simultaneously serves a small Ollama/vLLM model, with no
+  cross-lane eviction. Off by default; enable with `COMPANION_ENABLED=1`
+  (setup: [`deploy/README-deploy.md`](deploy/README-deploy.md)).
 
 ## Quickstart (on the box)
 ```powershell
@@ -68,10 +73,11 @@ service name, the vLLM relay URL + serve.sh path + systemd unit, the WSL distro/
 the **3090 UUID**, VRAM thresholds, optional `LLMCONFIG_API_KEY`, and `HF_TOKEN`.
 
 ## REST API
-`GET /api/status` · `GET /api/models` · `GET /api/gpu` · `GET /api/doctor` ·
-`POST /api/load {server,model,force?,max_pack?}` → job · `POST /api/unload {server?}` ·
+`GET /api/status` (incl. per-lane `lanes[]`) · `GET /api/models?lane=` · `GET /api/gpu?lane=` ·
+`GET /api/lanes` · `GET/PUT /api/lanes/{id}/default` · `GET /api/doctor` ·
+`POST /api/load {server,model,lane?,force?,max_pack?}` → job · `POST /api/unload {server?,lane?}` ·
 `GET /api/jobs/{id}` · `POST /api/ollama/pull` · `DELETE /api/ollama/{name}` ·
-`GET/POST/PUT/DELETE /api/vllm/aliases` · `POST /api/vllm/download`. Interactive docs at `/docs`.
+`GET/POST/PUT/DELETE /api/vllm/aliases?lane=` · `POST /api/vllm/download`. Interactive docs at `/docs`.
 
 ## Status
 **Live-verified on `.40` (2026-06-17).** `doctor --local` is green; both paths

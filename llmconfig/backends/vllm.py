@@ -22,18 +22,29 @@ LogCb = Callable[[str], None]
 
 
 class VllmBackend:
-    def __init__(self, settings: Settings, registry: Registry):
+    def __init__(
+        self,
+        settings: Settings,
+        registry: Registry,
+        *,
+        relay_url: str | None = None,
+        serve_script: str | None = None,
+        systemd_unit: str | None = None,
+    ):
         self.s = settings
         self.registry = registry
+        self.relay_url = relay_url or settings.vllm_relay_url
+        self.serve_script = serve_script or settings.vllm_serve_script
+        self.systemd_unit = systemd_unit or settings.vllm_systemd_unit
 
     def _client(self, timeout: float | None = None) -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            base_url=self.s.vllm_relay_url,
+            base_url=self.relay_url,
             timeout=httpx.Timeout(timeout if timeout is not None else self.s.http_timeout_s),
         )
 
     def _unit(self, alias: str) -> str:
-        return f"{self.s.vllm_systemd_unit}{alias}"  # e.g. "vllm@coder30-awq"
+        return f"{self.systemd_unit}{alias}"  # e.g. "vllm@coder30-awq"
 
     # ---- liveness / state ----
     async def served(self) -> Optional[str]:
@@ -80,15 +91,18 @@ class VllmBackend:
         )
 
     async def stop(self) -> None:
-        # Stop any vllm@ instance, then belt-and-suspenders pkill the actual binary.
+        # Stop THIS lane's vllm@ instances (KillMode=mixed kills the unit's whole
+        # cgroup, incl. the vllm child). Then a lane-SCOPED fallback that matches only
+        # this lane's serve script path — never a global `pkill -f venv/bin/vllm`,
+        # which would cross-kill the other lane's vLLM when both GPUs are serving.
         await run_wsl(
-            user_systemctl("stop 'vllm@*' 2>/dev/null; true"),
+            user_systemctl(f"stop '{self.systemd_unit}*' 2>/dev/null; true"),
             login=False,
             timeout=30.0,
             settings=self.s,
         )
         await run_wsl(
-            "pkill -f 'venv/bin/vllm' 2>/dev/null; true",
+            f"pkill -f '{self.serve_script}' 2>/dev/null; true",
             login=False,
             timeout=15.0,
             settings=self.s,
@@ -127,7 +141,7 @@ class VllmBackend:
     # ---- introspection (doctor / catalog refresh) ----
     async def serve_help(self):
         return await run_wsl(
-            f"{self.s.vllm_serve_script} --help",
+            f"{self.serve_script} --help",
             login=True,
             timeout=20.0,
             settings=self.s,

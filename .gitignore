@@ -12,11 +12,15 @@ env/
 
 # Environment / secrets — NEVER commit
 .env
+.env.bak*
 *.local
 
-# Runtime-generated vLLM alias registry (seeded from llmconfig/data/vllm_models.default.yaml).
-# The user edits this copy; the committed seed is the default.
+# Runtime-generated vLLM alias registries (seeded from llmconfig/data/*.default.yaml).
+# The user edits these copies; the committed seeds are the defaults.
 /data/vllm_models.yaml
+/data/vllm_models_companion.yaml
+# Runtime-generated per-lane default-model state (set via UI/CLI).
+/data/lane_defaults.yaml
 
 # Editor / OS
 .vscode/

@@ -57,8 +57,11 @@ def _parse_int(s: str) -> int:
         return 0
 
 
-async def query_gpu(settings: Settings | None = None) -> GpuInfo:
+async def query_gpu(settings: Settings | None = None, uuid: str | None = None) -> GpuInfo:
+    """Query one GPU by UUID. Defaults to the primary card (`settings.gpu_uuid`);
+    pass `uuid` to target another lane's card (e.g. the 3070 Ti companion)."""
     settings = settings or get_settings()
+    target = uuid or settings.gpu_uuid
     r = await _run_smi(GPU_QUERY, settings)
     if not r.ok:
         return GpuInfo(found=False, error=r.text() or "nvidia-smi failed")
@@ -68,16 +71,16 @@ async def query_gpu(settings: Settings | None = None) -> GpuInfo:
         parts = [p.strip() for p in line.split(",")]
         if len(parts) < 4:
             continue
-        uuid, total, used, free = parts[0], _parse_int(parts[1]), _parse_int(parts[2]), _parse_int(parts[3])
-        seen.append(uuid)
-        if uuid == settings.gpu_uuid:
-            info = GpuInfo(found=True, uuid=uuid, total_mb=total, used_mb=used, free_mb=free)
+        u, total, used, free = parts[0], _parse_int(parts[1]), _parse_int(parts[2]), _parse_int(parts[3])
+        seen.append(u)
+        if u == target:
+            info = GpuInfo(found=True, uuid=u, total_mb=total, used_mb=used, free_mb=free)
             info.processes = await _query_processes(settings)
             return info
 
     return GpuInfo(
         found=False,
-        error=f"GPU {settings.gpu_uuid} not present. Visible UUIDs: {', '.join(seen) or 'none'}",
+        error=f"GPU {target} not present. Visible UUIDs: {', '.join(seen) or 'none'}",
     )
 
 

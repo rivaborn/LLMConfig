@@ -29,10 +29,26 @@ header {
 .keybox summary { cursor: pointer; list-style: none; font-size: 18px; }
 .keybox input { background: var(--panel2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
 
-main { display: grid; grid-template-columns: 1fr 1fr 320px; gap: 16px; padding: 16px; align-items: start; }
+main { display: grid; grid-template-columns: 1fr 320px; gap: 16px; padding: 16px; align-items: start; }
 @media (max-width: 980px) { main { grid-template-columns: 1fr; } }
-.col h2, .activity h2 { margin: 0 0 10px; font-size: 16px; }
+.col h2, .col h3, .activity h2 { margin: 0 0 10px; font-size: 15px; }
 .hint { color: var(--muted); margin: 0 0 10px; font-size: 12px; }
+.header-hint { flex: 1; min-width: 200px; }
+
+/* per-GPU lane panels */
+.lanes { display: flex; flex-direction: column; gap: 16px; }
+.lane { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+.lane-head {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  margin-bottom: 12px; padding-bottom: 12px; border-bottom: 1px solid var(--line);
+}
+.lane-name { font-size: 16px; font-weight: 700; }
+.lane-head .loaded { flex: 1; min-width: 120px; }
+.lane-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+@media (max-width: 720px) { .lane-cols { grid-template-columns: 1fr; } }
+.actions { display: flex; align-items: center; gap: 6px; }
+.star { background: var(--panel2); color: var(--muted); padding: 7px 9px; }
+.star.on { color: var(--warn); }
 .dot { display: inline-block; width: 9px; height: 9px; border-radius: 50%; background: var(--bad); }
 .dot.up { background: var(--ok); }
 .list { display: flex; flex-direction: column; gap: 8px; }

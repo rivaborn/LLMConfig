@@ -115,7 +115,25 @@ class LoadedModel(BaseModel):
     gpu_utilization_pct: float = 0.0
 
 
+class LaneStatus(BaseModel):
+    """Per-GPU lane state. The primary lane is the RTX 3090; an optional companion
+    lane is the RTX 3070 Ti. Each lane independently arbitrates Ollama-XOR-vLLM."""
+
+    id: str
+    name: str
+    enabled: bool = True
+    owner: Owner
+    ollama_up: bool
+    vllm_up: bool
+    loaded: Optional[LoadedModel] = None
+    gpu: GpuOut
+    swap_in_progress: bool = False
+    active_job_id: Optional[str] = None
+
+
 class StatusResponse(BaseModel):
+    # Top-level fields mirror the PRIMARY lane (backward compatible); `lanes` carries
+    # every lane (primary + companion).
     owner: Owner
     ollama_up: bool
     vllm_up: bool
@@ -124,6 +142,7 @@ class StatusResponse(BaseModel):
     swap_in_progress: bool = False
     active_job_id: Optional[str] = None
     message: str = ""
+    lanes: list[LaneStatus] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -132,6 +151,7 @@ class StatusResponse(BaseModel):
 class LoadRequest(BaseModel):
     server: ServerName
     model: str  # Ollama tag, or vLLM serve.sh alias
+    lane: str = "primary"      # which GPU lane: "primary" (3090) | "companion" (3070 Ti)
     force: bool = False        # reload even if already the active model
     max_pack: bool = False     # push num_gpu to fill VRAM before spilling (Ollama)
     keep_alive: int = -1       # Ollama keep_alive; -1 = pin until swapped
@@ -139,6 +159,7 @@ class LoadRequest(BaseModel):
 
 class UnloadRequest(BaseModel):
     server: Optional[ServerName] = None  # None = free whatever holds the GPU
+    lane: str = "primary"                # which GPU lane to free
 
 
 # --------------------------------------------------------------------------- #

@@ -26,6 +26,24 @@ async def test_query_gpu_matches_by_uuid(monkeypatch):
     assert info.processes[0].name == "ollama.exe" and info.processes[0].used_mb == 1200
 
 
+async def test_query_gpu_selects_explicit_uuid(monkeypatch):
+    """Passing uuid= targets the companion card even when settings.gpu_uuid is the 3090."""
+    companion = "GPU-2caf7863-102e-31e5-be4d-5ec860addc78"
+
+    async def fake_run_argv(argv, timeout=15.0):
+        joined = " ".join(argv)
+        if "--query-gpu" in joined:
+            return CmdResult(0, f"{companion}, 8192, 50, 8142\n{UUID}, 24576, 1234, 23342\n", "")
+        if "--query-compute-apps" in joined:
+            return CmdResult(0, "", "")
+        return CmdResult(127, "", "no")
+
+    monkeypatch.setattr(gpu, "run_argv", fake_run_argv)
+    info = await gpu.query_gpu(Settings(gpu_uuid=UUID), uuid=companion)
+    assert info.found
+    assert info.uuid == companion and info.total_mb == 8192 and info.used_mb == 50
+
+
 async def test_query_gpu_missing_uuid(monkeypatch):
     async def fake_run_argv(argv, timeout=15.0):
         if "--query-gpu" in " ".join(argv):

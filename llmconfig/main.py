@@ -41,6 +41,8 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
+        # Auto-load each lane's configured default model (fire-and-forget Jobs).
+        orch.autoload_defaults()
         yield
         # Release the WSL keepalive so the distro can idle-shut-down cleanly when
         # the control app stops (an already-loaded vLLM model goes with it).
@@ -58,6 +60,12 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=401, detail="invalid or missing X-API-Key")
 
     write = [Depends(require_key)]
+
+    def _lane(lane_id: str):
+        try:
+            return orch.lane(lane_id)
+        except KeyError as e:
+            raise HTTPException(status_code=400, detail=str(e))
 
     if (WEB_DIR / "static").is_dir():
         app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
@@ -77,21 +85,29 @@ def create_app() -> FastAPI:
         return await orch.status()
 
     @app.get("/api/models", response_model=ModelsResponse)
-    async def api_models() -> ModelsResponse:
+    async def api_models(lane: str = "primary") -> ModelsResponse:
+        ln = _lane(lane)
         resp = ModelsResponse()
         try:
-            resp.ollama = await orch.ollama.list_models()
+            resp.ollama = await ln.ollama.list_models()
         except Exception as e:
             resp.ollama_error = f"{type(e).__name__}: {e}"
         try:
-            resp.vllm = await orch.vllm.list_aliases()
+            resp.vllm = await ln.vllm.list_aliases()
         except Exception as e:
             resp.vllm_error = f"{type(e).__name__}: {e}"
         return resp
 
     @app.get("/api/gpu", response_model=GpuOut)
-    async def api_gpu() -> GpuOut:
-        return GpuOut.from_info(await query_gpu(settings))
+    async def api_gpu(lane: str = "primary") -> GpuOut:
+        return GpuOut.from_info(await query_gpu(settings, uuid=_lane(lane).cfg.gpu_uuid))
+
+    @app.get("/api/lanes")
+    async def api_lanes() -> list[dict]:
+        return [
+            {"id": cfg.id, "name": cfg.name, "enabled": cfg.enabled, "default": orch.default_for(cfg.id)}
+            for cfg in settings.lanes()
+        ]
 
     @app.get("/api/jobs", response_model=list[Job])
     async def api_jobs() -> list[Job]:
@@ -110,8 +126,13 @@ def create_app() -> FastAPI:
         return report.model_dump()
 
     @app.get("/api/vllm/aliases", response_model=list[VllmAliasEntry])
-    async def api_aliases() -> list[VllmAliasEntry]:
-        return registry.entries()
+    async def api_aliases(lane: str = "primary") -> list[VllmAliasEntry]:
+        return _lane(lane).registry.entries()
+
+    @app.get("/api/lanes/{lane_id}/default")
+    async def api_lane_default(lane_id: str) -> dict:
+        _lane(lane_id)  # validate
+        return {"lane": lane_id, "default": orch.default_for(lane_id)}
 
     # ------------------------------------------------------------------ #
     # Write endpoints (X-API-Key when configured)
@@ -152,21 +173,34 @@ def create_app() -> FastAPI:
         return {"deleted": name}
 
     @app.post("/api/vllm/aliases", response_model=VllmAliasEntry, dependencies=write)
-    async def api_alias_create(entry: VllmAliasEntry) -> VllmAliasEntry:
-        registry.upsert(entry)
+    async def api_alias_create(entry: VllmAliasEntry, lane: str = "primary") -> VllmAliasEntry:
+        _lane(lane).registry.upsert(entry)
         return entry
 
     @app.put("/api/vllm/aliases/{alias}", response_model=VllmAliasEntry, dependencies=write)
-    async def api_alias_upsert(alias: str, entry: VllmAliasEntry) -> VllmAliasEntry:
+    async def api_alias_upsert(alias: str, entry: VllmAliasEntry, lane: str = "primary") -> VllmAliasEntry:
         entry.alias = alias
-        registry.upsert(entry)
+        _lane(lane).registry.upsert(entry)
         return entry
 
     @app.delete("/api/vllm/aliases/{alias}", dependencies=write)
-    async def api_alias_delete(alias: str) -> dict:
-        if not registry.remove(alias):
+    async def api_alias_delete(alias: str, lane: str = "primary") -> dict:
+        if not _lane(lane).registry.remove(alias):
             raise HTTPException(status_code=404, detail="alias not found")
         return {"deleted": alias}
+
+    @app.put("/api/lanes/{lane_id}/default", dependencies=write)
+    async def api_lane_default_set(lane_id: str, body: dict) -> dict:
+        _lane(lane_id)  # validate
+        server = (body.get("server") or "").strip()
+        model = (body.get("model") or "").strip()
+        if not model:
+            orch.defaults.clear(lane_id)
+        elif server not in ("ollama", "vllm"):
+            raise HTTPException(status_code=400, detail="server must be 'ollama' or 'vllm'")
+        else:
+            orch.defaults.set(lane_id, server, model)
+        return {"lane": lane_id, "default": orch.default_for(lane_id)}
 
     @app.post("/api/vllm/download", response_model=Job, dependencies=write)
     async def api_vllm_download(body: dict) -> Job:

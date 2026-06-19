@@ -16,12 +16,20 @@ from ..schemas import OllamaModel
 
 
 class OllamaBackend:
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        base_url: str | None = None,
+        service_name: str | None = None,
+    ):
         self.s = settings
+        self.base_url = base_url or settings.ollama_url
+        self.service_name = service_name or settings.ollama_service_name
 
     def _client(self, timeout: float | None = None) -> httpx.AsyncClient:
         return httpx.AsyncClient(
-            base_url=self.s.ollama_url,
+            base_url=self.base_url,
             timeout=httpx.Timeout(timeout if timeout is not None else self.s.http_timeout_s),
         )
 
@@ -119,14 +127,14 @@ class OllamaBackend:
 
     # ---- service control ----
     async def service_status(self) -> str:
-        return await winsvc.service_status(self.s.ollama_service_name)
+        return await winsvc.service_status(self.service_name)
 
     async def ensure_running(self, wait_s: float = 20.0) -> bool:
         if await self.up():
             return True
         st = await self.service_status()
         if st != winsvc.RUNNING:
-            await winsvc.start_service(self.s.ollama_service_name)
+            await winsvc.start_service(self.service_name)
         # poll the API rather than trusting the service state alone
         import asyncio
         import time
@@ -139,12 +147,12 @@ class OllamaBackend:
         return await self.up()
 
     async def restart(self) -> bool:
-        r = await winsvc.restart_service(self.s.ollama_service_name)
+        r = await winsvc.restart_service(self.service_name)
         return r.ok
 
     # ---- model management ----
     async def pull(self, model: str, on_event: Callable[[dict], None] | None = None) -> None:
-        async with httpx.AsyncClient(base_url=self.s.ollama_url, timeout=None) as c:
+        async with httpx.AsyncClient(base_url=self.base_url, timeout=None) as c:
             async with c.stream("POST", "/api/pull", json={"model": model, "stream": True}) as resp:
                 resp.raise_for_status()
                 async for line in resp.aiter_lines():

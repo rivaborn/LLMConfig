@@ -1,0 +1,22 @@
+[Unit]
+Description=vLLM (companion lane / RTX 3070 Ti) serving serve-companion.sh alias %i (managed by LLMConfig)
+After=default.target
+
+[Service]
+Type=simple
+# Companion lane = the RTX 3070 Ti (8 GB). CUDA_VISIBLE_DEVICES pins that card by
+# UUID so this instance can NEVER land on the 3090; serve-companion.sh should also
+# self-pin (belt-and-suspenders) and use a lower --gpu-memory-utilization + small
+# models that fit 8 GB. %i is the serve-companion.sh alias (e.g. qwen3-4b).
+Environment=CUDA_VISIBLE_DEVICES=GPU-2caf7863-102e-31e5-be4d-5ec860addc78
+ExecStart=/bin/bash /home/folar/vllm/serve-companion.sh %i
+# vLLM holds VRAM for the whole process lifetime; a failed load should NOT
+# auto-restart (it would thrash the GPU). LLMConfig drives start/stop explicitly.
+Restart=no
+# Readiness is polled by LLMConfig via the companion relay, not by systemd.
+TimeoutStartSec=0
+KillSignal=SIGINT
+KillMode=mixed
+
+[Install]
+WantedBy=default.target

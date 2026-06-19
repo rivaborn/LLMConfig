@@ -1,0 +1,33 @@
+# Default vLLM alias catalog for the COMPANION lane (RTX 3070 Ti, 8 GB).
+# Seeded into ./data/vllm_models_companion.yaml on first run. These aliases must
+# mirror the `serve-companion.sh` alias table on the box (pins the 3070 Ti UUID,
+# lower --gpu-memory-utilization). Keep models small — 8 GB only fits ~3-4B-class
+# AWQ models, embedders, and tiny sanity checks. `served_name` is what /v1/models
+# reports. Edit the generated ./data/vllm_models_companion.yaml (this is the default).
+aliases:
+  - alias: smoke
+    hf_repo: Qwen/Qwen2.5-0.5B-Instruct
+    served_name: smoke
+    mode: compile
+    status: unverified
+    notes: Companion sanity check (~1 GB). Verify once serve-companion.sh is on the box
+    load_timeout_s: 120
+    managed_by: serve.sh
+
+  - alias: qwen3-4b
+    hf_repo: Qwen/Qwen3-4B-AWQ
+    served_name: qwen3-4b
+    mode: compile
+    status: unverified
+    notes: Small chat; AWQ-INT4 (~4-5 GB incl. KV) — daily companion model
+    load_timeout_s: 180
+    managed_by: serve.sh
+
+  - alias: embed
+    hf_repo: BAAI/bge-m3
+    served_name: bge-m3
+    mode: eager
+    status: unverified
+    notes: Embeddings (vLLM --task embed). Always-on retrieval companion (~2 GB)
+    load_timeout_s: 120
+    managed_by: serve.sh

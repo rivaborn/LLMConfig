@@ -40,6 +40,61 @@ powershell -ExecutionPolicy Bypass -File deploy\install-service.ps1
 
 UI: `http://192.168.1.40:11430/` · API docs: `…/docs`
 
+## 5. (Optional) Companion lane — the RTX 3070 Ti
+
+A second, independent lane that runs its own small model on the 3070 Ti (8 GB) while
+the 3090 keeps doing its own thing. Each lane arbitrates Ollama⇄vLLM on its own card;
+they never evict each other.
+
+**a. Second Ollama instance (Windows side)** — pinned to the 3070 Ti, on port 11435,
+sharing the primary model store:
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\install-companion.ps1
+```
+
+**b. Enable the lane** in `.env`, then verify:
+```powershell
+# .env:  COMPANION_ENABLED=true
+.\.venv\Scripts\llmconfig doctor --local      # companion.gpu + companion.ollama.* should pass
+```
+
+**c. (Optional) Companion vLLM (WSL side)** — only if you want vLLM (not just Ollama)
+on the 3070 Ti. Mirror the primary vLLM setup with a 3070 Ti-pinned variant:
+```bash
+# inside WSL: wsl -d Ubuntu-24.04 -u folar
+# 1) serve-companion.sh — like serve.sh but pins the 3070 Ti and uses a lower
+#    --gpu-memory-utilization + small (≤8 GB) models; serves on an internal port (e.g. 11439).
+#    Its alias table must match llmconfig/data/vllm_models_companion.default.yaml.
+# 2) a 2nd socat relay: 127.0.0.1:11438  →  the companion vLLM internal port (11439).
+# 3) install the unit:
+cp /mnt/c/Coding/rivaborn/LLMConfig/deploy/vllm-companion@.service ~/.config/systemd/user/
+systemctl --user daemon-reload
+```
+
+**d. Pick what runs on it.** Load on demand from the UI/CLI, or set a sticky default
+that auto-loads on startup:
+```bash
+llmconfig load --lane companion ollama qwen3:4b      # load now
+llmconfig companion-default ollama qwen3:4b          # auto-load on every startup
+llmconfig status                                     # shows both lanes
+```
+
+> **GPU pinning (verified live on `.40`):**
+> - **Ollama needs a device *index*, not a UUID.** Ollama's `CUDA_VISIBLE_DEVICES`
+>   does *not* resolve `GPU-<uuid>` — given a UUID it discovers no GPU and silently
+>   runs on CPU (`library=cpu`, `total_vram=0 B` in its log). `install-companion.ps1`
+>   keeps the UUID as the source of truth but translates it to an index under
+>   `CUDA_DEVICE_ORDER=PCI_BUS_ID` (so indices match `nvidia-smi`). vLLM/PyTorch *do*
+>   accept the UUID, so `vllm-companion@.service` pins by UUID.
+> - **This box already pins to the 3090 via a User-scope `CUDA_VISIBLE_DEVICES=1`**
+>   (PCI_BUS_ID order → index 1 = the 3090). That's the de-facto "primary pinned to
+>   3090". The companion NSSM service runs as LocalSystem (does *not* inherit the User
+>   env) and sets the 3070 Ti index explicitly, so it lands on the right card. Never
+>   widen that pin to a Machine/global var — it would leak into the companion.
+> - After install, confirm offload is real: load a small model on the companion and
+>   check `nvidia-smi` shows its VRAM rise on the 3070 Ti (and the service log does
+>   *not* say `library=cpu`).
+
 ## Notes
 - If `LLMCONFIG_API_KEY` is set in `.env`, write ops require the `X-API-Key` header (the UI has a field; the CLI reads `$LLMCONFIG_API_KEY`).
 - The app must run with rights to control the `ollama` service — NSSM's LocalSystem or the elevated scheduled task covers this; a plain user shell may hit "access denied" on `Restart-Service`.

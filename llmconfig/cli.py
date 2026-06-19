@@ -71,13 +71,14 @@ def status() -> None:
 
 
 @app.command()
-def models() -> None:
+def models(lane: str = typer.Option("primary", "--lane", help="primary (3090) | companion (3070 Ti)")) -> None:
     """List available Ollama models and vLLM aliases."""
     try:
         with _client() as c:
-            d = c.get("/api/models").json()
+            d = c.get("/api/models", params={"lane": lane}).json()
     except httpx.HTTPError as e:
         _bail(e)
+    typer.secho(f"[lane: {lane}]", fg="bright_black")
     typer.secho("Ollama:", bold=True)
     for m in d.get("ollama", []):
         mark = "●" if m["loaded"] else " "
@@ -93,11 +94,11 @@ def models() -> None:
 
 
 @app.command()
-def gpu() -> None:
-    """Show nvidia-smi state for the configured GPU."""
+def gpu(lane: str = typer.Option("primary", "--lane", help="primary (3090) | companion (3070 Ti)")) -> None:
+    """Show nvidia-smi state for a lane's GPU."""
     try:
         with _client() as c:
-            d = c.get("/api/gpu").json()
+            d = c.get("/api/gpu", params={"lane": lane}).json()
     except httpx.HTTPError as e:
         _bail(e)
     if not d["found"]:
@@ -112,10 +113,11 @@ def gpu() -> None:
 def load(
     server: str = typer.Argument(..., help="ollama | vllm"),
     model: str = typer.Argument(..., help="Ollama tag or vLLM serve.sh alias"),
+    lane: str = typer.Option("primary", "--lane", help="primary (3090) | companion (3070 Ti)"),
     force: bool = typer.Option(False, "--force", help="reload even if already active"),
     max_pack: bool = typer.Option(False, "--max-pack", help="fill VRAM (num_gpu) before spilling (Ollama)"),
 ) -> None:
-    """Load a model on a server, evicting everything else from the GPU first."""
+    """Load a model on a server, evicting everything else from that lane's GPU first."""
     if server not in ("ollama", "vllm"):
         typer.secho("server must be 'ollama' or 'vllm'", fg="red")
         raise typer.Exit(2)
@@ -123,7 +125,7 @@ def load(
         with _client() as c:
             job = c.post(
                 "/api/load",
-                json={"server": server, "model": model, "force": force, "max_pack": max_pack},
+                json={"server": server, "model": model, "lane": lane, "force": force, "max_pack": max_pack},
             ).json()
     except httpx.HTTPError as e:
         _bail(e)
@@ -131,14 +133,39 @@ def load(
 
 
 @app.command()
-def unload(server: Optional[str] = typer.Option(None, "--server", help="ollama | vllm (default: whatever holds the GPU)")) -> None:
-    """Free the GPU."""
+def unload(
+    server: Optional[str] = typer.Option(None, "--server", help="ollama | vllm (default: whatever holds the GPU)"),
+    lane: str = typer.Option("primary", "--lane", help="primary (3090) | companion (3070 Ti)"),
+) -> None:
+    """Free a lane's GPU."""
     try:
         with _client() as c:
-            d = c.post("/api/unload", json={"server": server}).json()
+            d = c.post("/api/unload", json={"server": server, "lane": lane}).json()
     except httpx.HTTPError as e:
         _bail(e)
     _print_status(d)
+
+
+@app.command(name="companion-default")
+def companion_default(
+    server: Optional[str] = typer.Argument(None, help="ollama | vllm (omit to show current)"),
+    model: Optional[str] = typer.Argument(None, help="Ollama tag or vLLM alias (empty clears)"),
+    lane: str = typer.Option("companion", "--lane", help="lane to configure"),
+) -> None:
+    """Show or set a lane's default model (auto-loads on startup)."""
+    try:
+        with _client() as c:
+            if server is None:
+                d = c.get(f"/api/lanes/{lane}/default").json()
+            else:
+                d = c.put(f"/api/lanes/{lane}/default", json={"server": server, "model": model or ""}).json()
+    except httpx.HTTPError as e:
+        _bail(e)
+    dflt = d.get("default")
+    if dflt:
+        typer.echo(f"{lane} default: {dflt['model']} [{dflt['server']}]")
+    else:
+        typer.echo(f"{lane} default: none")
 
 
 @app.command()
@@ -178,27 +205,37 @@ def doctor(local: bool = typer.Option(False, "--local", help="run in-process ins
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
-def _print_status(d: dict) -> None:
-    owner = d["owner"]
+def _print_lane(l: dict) -> None:
+    owner = l["owner"]
     color = {"free": "green", "ollama": "cyan", "vllm": "magenta", "unknown": "yellow"}.get(owner, "white")
-    typer.secho(f"owner: {owner}", fg=color, bold=True)
-    g = d["gpu"]
+    label = f"{l.get('id', 'primary')}" + (f" / {l['name']}" if l.get("name") else "")
+    typer.secho(f"[{label}] owner: {owner}", fg=color, bold=True)
+    g = l["gpu"]
     if g["found"]:
-        typer.echo(f"gpu:   {g['used_mb']}/{g['total_mb']} MiB ({g['utilization_pct']}%)")
+        typer.echo(f"  gpu:   {g['used_mb']}/{g['total_mb']} MiB ({g['utilization_pct']}%)")
     else:
-        typer.echo(f"gpu:   n/a ({g.get('error', '')})")
-    lm = d.get("loaded")
+        typer.echo(f"  gpu:   n/a ({g.get('error', '')})")
+    lm = l.get("loaded")
     if lm:
         if lm["server"] == "ollama":
             spill = f", {_gib(lm['on_cpu_bytes'])} on CPU" if lm["spilled"] else " (fully on GPU)"
-            typer.echo(f"model: {lm['model']} [ollama] {_gib(lm['on_gpu_bytes'])} on GPU{spill}")
+            typer.echo(f"  model: {lm['model']} [ollama] {_gib(lm['on_gpu_bytes'])} on GPU{spill}")
         else:
-            typer.echo(f"model: {lm['model']} [vllm]")
+            typer.echo(f"  model: {lm['model']} [vllm]")
     else:
-        typer.echo("model: none")
-    if d.get("swap_in_progress"):
-        typer.secho(f"swap in progress (job {d.get('active_job_id')})", fg="yellow")
-    typer.echo(f"ollama_up={d['ollama_up']}  vllm_up={d['vllm_up']}")
+        typer.echo("  model: none")
+    if l.get("swap_in_progress"):
+        typer.secho(f"  swap in progress (job {l.get('active_job_id')})", fg="yellow")
+    typer.echo(f"  ollama_up={l['ollama_up']}  vllm_up={l['vllm_up']}")
+
+
+def _print_status(d: dict) -> None:
+    lanes = d.get("lanes")
+    if lanes:
+        for l in lanes:
+            _print_lane(l)
+    else:  # legacy single-lane response shape
+        _print_lane({**d, "id": "primary"})
 
 
 def _poll_job(jid: str) -> None:

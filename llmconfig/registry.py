@@ -15,11 +15,13 @@ from .config import PACKAGE_DIR, Settings, get_settings
 from .schemas import VllmAliasEntry
 
 DEFAULT_REGISTRY = PACKAGE_DIR / "data" / "vllm_models.default.yaml"
+DEFAULT_COMPANION_REGISTRY = PACKAGE_DIR / "data" / "vllm_models_companion.default.yaml"
 
 
 class Registry:
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, default_path: Path | None = None):
         self.path = path
+        self.default_path = default_path or DEFAULT_REGISTRY
         self._entries: dict[str, VllmAliasEntry] = {}
         self.load()
 
@@ -35,7 +37,7 @@ class Registry:
 
     def _seed(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(DEFAULT_REGISTRY, self.path)
+        shutil.copyfile(self.default_path, self.path)
 
     def save(self) -> None:
         data = {"aliases": [e.model_dump() for e in self._entries.values()]}
