@@ -61,13 +61,22 @@ class Lane:
     # ------------------------------------------------------------------ #
     # Status
     # ------------------------------------------------------------------ #
-    async def status(self) -> LaneStatus:
-        served, ollama_loaded, gpu, ollama_up = await asyncio.gather(
-            self.vllm.served(),
-            self.ollama.loaded(),
-            self._gpu(),
-            self.ollama.up(),
-        )
+    async def status(self, gpu: GpuInfo | None = None) -> LaneStatus:
+        # `gpu` may be supplied by the Orchestrator (one nvidia-smi shared across
+        # lanes); fetch this lane's card only when called standalone.
+        if gpu is None:
+            served, ollama_loaded, ollama_up, gpu = await asyncio.gather(
+                self.vllm.served(),
+                self.ollama.loaded(),
+                self.ollama.up(),
+                self._gpu(),
+            )
+        else:
+            served, ollama_loaded, ollama_up = await asyncio.gather(
+                self.vllm.served(),
+                self.ollama.loaded(),
+                self.ollama.up(),
+            )
 
         loaded: Optional[LoadedModel] = None
         if served:

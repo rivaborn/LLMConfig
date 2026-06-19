@@ -4,6 +4,7 @@ Exercises the core guarantees: eviction before load, the VRAM-free gate, and the
 pack-then-spill verification — without touching wsl.exe / nvidia-smi / Ollama.
 """
 import llmconfig.lane as lane_mod
+import llmconfig.orchestrator as orch_mod
 from llmconfig.config import Settings
 from llmconfig.gpu import GpuInfo
 from llmconfig.jobs import JobManager
@@ -113,7 +114,7 @@ class FakeKeepalive:
 def _make(monkeypatch, tmp_path):
     world = World()
     registry = Registry(tmp_path / "reg.yaml")
-    settings = Settings(gpu_uuid="GPU-x", evict_timeout_s=5, poll_interval_s=0.01)
+    settings = Settings(_env_file=None, gpu_uuid="GPU-x", evict_timeout_s=5, poll_interval_s=0.01)
     jobs = JobManager()
     orch = Orchestrator(settings, registry, jobs)
     # Arbitration lives on the lane; swap in the fakes there.
@@ -125,7 +126,11 @@ def _make(monkeypatch, tmp_path):
     async def fake_query_gpu(s=None, uuid=None):
         return world.gpu()
 
+    async def fake_query_all(s=None):
+        return {"GPU-x": world.gpu()}
+
     monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)
+    monkeypatch.setattr(orch_mod, "query_all_gpus", fake_query_all)
     return world, orch, jobs
 
 

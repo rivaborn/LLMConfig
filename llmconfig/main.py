@@ -47,6 +47,7 @@ def create_app() -> FastAPI:
         # Release the WSL keepalive so the distro can idle-shut-down cleanly when
         # the control app stops (an already-loaded vLLM model goes with it).
         orch.keepalive.stop()
+        await orch.aclose()  # close pooled HTTP clients
 
     app = FastAPI(title="LLMConfig", version=__version__, lifespan=lifespan,
                   description="GPU-arbitrated control plane for Ollama + vLLM.")

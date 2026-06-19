@@ -26,20 +26,30 @@ class OllamaBackend:
         self.s = settings
         self.base_url = base_url or settings.ollama_url
         self.service_name = service_name or settings.ollama_service_name
+        self._http: httpx.AsyncClient | None = None
 
-    def _client(self, timeout: float | None = None) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            base_url=self.base_url,
-            timeout=httpx.Timeout(timeout if timeout is not None else self.s.http_timeout_s),
-        )
+    def _client(self) -> httpx.AsyncClient:
+        """A long-lived, connection-pooling client reused across calls (so repeated
+        /api/ps, /api/version, etc. don't pay TCP setup every time). Per-request
+        timeouts are passed at the call site; the client default is http_timeout_s."""
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(
+                base_url=self.base_url,
+                timeout=httpx.Timeout(self.s.http_timeout_s),
+            )
+        return self._http
+
+    async def aclose(self) -> None:
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
+        self._http = None
 
     # ---- liveness ----
     async def version(self) -> Optional[str]:
         try:
-            async with self._client() as c:
-                r = await c.get("/api/version")
-                r.raise_for_status()
-                return r.json().get("version", "")
+            r = await self._client().get("/api/version")
+            r.raise_for_status()
+            return r.json().get("version", "")
         except httpx.HTTPError:
             return None
 
@@ -49,18 +59,16 @@ class OllamaBackend:
     # ---- catalog / state ----
     async def _ps_raw(self) -> list[dict]:
         try:
-            async with self._client() as c:
-                r = await c.get("/api/ps")
-                r.raise_for_status()
-                return r.json().get("models", []) or []
+            r = await self._client().get("/api/ps")
+            r.raise_for_status()
+            return r.json().get("models", []) or []
         except httpx.HTTPError:
             return []
 
     async def list_models(self) -> list[OllamaModel]:
-        async with self._client() as c:
-            r = await c.get("/api/tags")
-            r.raise_for_status()
-            tags = r.json().get("models", []) or []
+        r = await self._client().get("/api/tags")
+        r.raise_for_status()
+        tags = r.json().get("models", []) or []
         loaded = {m.get("name", ""): m for m in await self._ps_raw()}
         out: list[OllamaModel] = []
         for m in tags:
@@ -106,15 +114,15 @@ class OllamaBackend:
         body: dict = {"model": model, "keep_alive": keep_alive, "stream": False}
         if num_gpu is not None:
             body["options"] = {"num_gpu": num_gpu}
-        async with self._client(timeout=timeout) as c:
-            r = await c.post("/api/generate", json=body)
-            r.raise_for_status()
-            return r.json()
+        r = await self._client().post("/api/generate", json=body, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
 
     async def unload(self, model: str) -> None:
-        async with self._client() as c:
-            r = await c.post("/api/generate", json={"model": model, "keep_alive": 0, "stream": False})
-            r.raise_for_status()
+        r = await self._client().post(
+            "/api/generate", json={"model": model, "keep_alive": 0, "stream": False}
+        )
+        r.raise_for_status()
 
     async def unload_all(self) -> list[str]:
         names = await self.loaded_names()
@@ -152,6 +160,8 @@ class OllamaBackend:
 
     # ---- model management ----
     async def pull(self, model: str, on_event: Callable[[dict], None] | None = None) -> None:
+        # Dedicated client: pulls stream for minutes (timeout=None), so they don't share
+        # the pooled client's default timeout.
         async with httpx.AsyncClient(base_url=self.base_url, timeout=None) as c:
             async with c.stream("POST", "/api/pull", json={"model": model, "stream": True}) as resp:
                 resp.raise_for_status()
@@ -168,15 +178,13 @@ class OllamaBackend:
                         raise RuntimeError(evt["error"])
 
     async def delete(self, model: str) -> None:
-        async with self._client() as c:
-            r = await c.request("DELETE", "/api/delete", json={"model": model})
-            r.raise_for_status()
+        r = await self._client().request("DELETE", "/api/delete", json={"model": model})
+        r.raise_for_status()
 
     async def show(self, model: str) -> dict:
-        async with self._client() as c:
-            r = await c.post("/api/show", json={"model": model})
-            r.raise_for_status()
-            return r.json()
+        r = await self._client().post("/api/show", json={"model": model})
+        r.raise_for_status()
+        return r.json()
 
     async def block_count(self, model: str) -> int:
         """Total transformer layers for the model (for max-pack num_gpu math). 0 if unknown."""

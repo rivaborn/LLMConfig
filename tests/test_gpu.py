@@ -16,7 +16,7 @@ async def test_query_gpu_matches_by_uuid(monkeypatch):
         return CmdResult(127, "", "no")
 
     monkeypatch.setattr(gpu, "run_argv", fake_run_argv)
-    info = await gpu.query_gpu(Settings(gpu_uuid=UUID))
+    info = await gpu.query_gpu(Settings(_env_file=None, gpu_uuid=UUID))
 
     assert info.found
     assert info.total_mb == 24576 and info.used_mb == 1234 and info.free_mb == 23342
@@ -39,7 +39,7 @@ async def test_query_gpu_selects_explicit_uuid(monkeypatch):
         return CmdResult(127, "", "no")
 
     monkeypatch.setattr(gpu, "run_argv", fake_run_argv)
-    info = await gpu.query_gpu(Settings(gpu_uuid=UUID), uuid=companion)
+    info = await gpu.query_gpu(Settings(_env_file=None, gpu_uuid=UUID), uuid=companion)
     assert info.found
     assert info.uuid == companion and info.total_mb == 8192 and info.used_mb == 50
 
@@ -51,6 +51,6 @@ async def test_query_gpu_missing_uuid(monkeypatch):
         return CmdResult(0, "", "")
 
     monkeypatch.setattr(gpu, "run_argv", fake_run_argv)
-    info = await gpu.query_gpu(Settings(gpu_uuid=UUID))
+    info = await gpu.query_gpu(Settings(_env_file=None, gpu_uuid=UUID))
     assert not info.found
     assert "not present" in info.error

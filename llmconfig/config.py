@@ -92,6 +92,10 @@ class Settings(BaseSettings):
 
     # --- timeouts / tuning (seconds) ---
     http_timeout_s: float = 10.0
+    # Liveness probe to the (WSL) vLLM relay. When the relay is down, WSL2
+    # localhost-forwarding blackholes the SYN (no RST), so the probe hangs ~2.4s;
+    # cap it so /api/status stays snappy. The relay answers in ms when it's up.
+    vllm_probe_timeout_s: float = 1.0
     evict_timeout_s: float = 45.0
     poll_interval_s: float = 2.0
     default_vllm_load_timeout_s: int = 240

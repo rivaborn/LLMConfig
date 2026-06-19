@@ -113,6 +113,7 @@ class FakeKeepalive:
 
 def _make(monkeypatch, tmp_path):
     s = Settings(
+        _env_file=None,
         gpu_uuid="GPU-P",
         companion_enabled=True,
         companion_gpu_uuid="GPU-C",
@@ -213,6 +214,7 @@ async def test_vllm_stop_is_lane_scoped(monkeypatch, tmp_path):
 
 async def test_autoload_fires_configured_default(monkeypatch, tmp_path):
     s = Settings(
+        _env_file=None,
         gpu_uuid="GPU-P",
         companion_enabled=True,
         companion_gpu_uuid="GPU-C",

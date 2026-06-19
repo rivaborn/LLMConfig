@@ -84,6 +84,29 @@ async def query_gpu(settings: Settings | None = None, uuid: str | None = None) -
     )
 
 
+async def query_all_gpus(settings: Settings | None = None) -> dict[str, GpuInfo]:
+    """One nvidia-smi for every visible GPU's memory, keyed by UUID — the fast path
+    for multi-lane status (no nvidia-smi per lane). No per-process detail; use
+    `query_gpu` when that's needed (e.g. the /api/gpu endpoint)."""
+    settings = settings or get_settings()
+    r = await _run_smi(GPU_QUERY, settings)
+    if not r.ok:
+        return {}
+    out: dict[str, GpuInfo] = {}
+    for line in r.out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 4:
+            continue
+        out[parts[0]] = GpuInfo(
+            found=True,
+            uuid=parts[0],
+            total_mb=_parse_int(parts[1]),
+            used_mb=_parse_int(parts[2]),
+            free_mb=_parse_int(parts[3]),
+        )
+    return out
+
+
 async def _query_processes(settings: Settings) -> list[GpuProcess]:
     r = await _run_smi(APPS_QUERY, settings)
     if not r.ok:

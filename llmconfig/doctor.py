@@ -108,6 +108,10 @@ async def _check_lane(add, settings: Settings, cfg: LaneConfig, registry: Regist
     else:
         add(f"{p}.vllm.relay", None, f"{cfg.vllm_relay_url} not answering (expected when vLLM is stopped)")
 
+    # ad-hoc backends: release their pooled clients (doctor may run per API request)
+    await ollama.aclose()
+    await vllm.aclose()
+
 
 async def run_doctor(settings: Settings | None = None, registry: Registry | None = None) -> DoctorReport:
     settings = settings or get_settings()

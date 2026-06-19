@@ -36,12 +36,23 @@ class VllmBackend:
         self.relay_url = relay_url or settings.vllm_relay_url
         self.serve_script = serve_script or settings.vllm_serve_script
         self.systemd_unit = systemd_unit or settings.vllm_systemd_unit
+        self._http: httpx.AsyncClient | None = None
 
-    def _client(self, timeout: float | None = None) -> httpx.AsyncClient:
-        return httpx.AsyncClient(
-            base_url=self.relay_url,
-            timeout=httpx.Timeout(timeout if timeout is not None else self.s.http_timeout_s),
-        )
+    def _client(self) -> httpx.AsyncClient:
+        """Long-lived, connection-pooling client reused across calls. Per-request
+        timeouts are passed at the call site (the relay liveness probes use the short
+        vllm_probe_timeout_s)."""
+        if self._http is None or self._http.is_closed:
+            self._http = httpx.AsyncClient(
+                base_url=self.relay_url,
+                timeout=httpx.Timeout(self.s.http_timeout_s),
+            )
+        return self._http
+
+    async def aclose(self) -> None:
+        if self._http is not None and not self._http.is_closed:
+            await self._http.aclose()
+        self._http = None
 
     def _unit(self, alias: str) -> str:
         return f"{self.systemd_unit}{alias}"  # e.g. "vllm@coder30-awq"
@@ -50,11 +61,10 @@ class VllmBackend:
     async def served(self) -> Optional[str]:
         """The currently-served model name (from the relay), or None if vLLM is down."""
         try:
-            async with self._client() as c:
-                r = await c.get("/v1/models")
-                r.raise_for_status()
-                data = r.json().get("data", []) or []
-                return data[0].get("id") if data else None
+            r = await self._client().get("/v1/models", timeout=self.s.vllm_probe_timeout_s)
+            r.raise_for_status()
+            data = r.json().get("data", []) or []
+            return data[0].get("id") if data else None
         except (httpx.HTTPError, KeyError, IndexError, ValueError):
             return None
 
@@ -64,9 +74,8 @@ class VllmBackend:
     async def relay_up(self) -> bool:
         """True if the socat relay answers at all (even with nothing served)."""
         try:
-            async with self._client() as c:
-                r = await c.get("/v1/models")
-                return r.status_code == 200
+            r = await self._client().get("/v1/models", timeout=self.s.vllm_probe_timeout_s)
+            return r.status_code == 200
         except httpx.HTTPError:
             return False
 

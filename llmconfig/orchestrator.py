@@ -14,6 +14,7 @@ from .backends.ollama import OllamaBackend
 from .backends.vllm import VllmBackend
 from .config import Settings
 from .jobs import JobManager
+from .gpu import GpuInfo, query_all_gpus
 from .lane import Lane
 from .lane_state import LaneDefaults
 from .registry import DEFAULT_COMPANION_REGISTRY, Registry
@@ -58,8 +59,16 @@ class Orchestrator:
 
     # ---- status (aggregate) ----
     async def status(self) -> StatusResponse:
+        gpus = await query_all_gpus(self.s)  # one nvidia-smi for every lane's card
+
+        async def _lane_status(lane: Lane) -> LaneStatus:
+            gpu = gpus.get(lane.cfg.gpu_uuid) or GpuInfo(
+                found=False, uuid=lane.cfg.gpu_uuid, error=f"GPU {lane.cfg.gpu_uuid} not present"
+            )
+            return await lane.status(gpu=gpu)
+
         lane_statuses: list[LaneStatus] = list(
-            await asyncio.gather(*(lane.status() for lane in self.lanes.values()))
+            await asyncio.gather(*(_lane_status(lane) for lane in self.lanes.values()))
         )
         primary = next((s for s in lane_statuses if s.id == "primary"), lane_statuses[0])
         return StatusResponse(
@@ -104,3 +113,9 @@ class Orchestrator:
             req = LoadRequest(server=d["server"], model=d["model"], lane=cfg.id)
             jobs.append(self.lane(cfg.id).load(req))
         return jobs
+
+    async def aclose(self) -> None:
+        """Close every lane's pooled HTTP clients (call on app shutdown)."""
+        for lane in self.lanes.values():
+            await lane.ollama.aclose()
+            await lane.vllm.aclose()
