@@ -64,8 +64,8 @@ Full deployment (systemd unit, Windows service, firewall): see
         └───────────┬────────────┘
               Orchestrator  ── nvidia-smi (3090 by UUID) ── eviction-wait gate
 ```
-Layout: `llmconfig/{config,wsl,winsvc,gpu,proc,registry,jobs,orchestrator,doctor,main,cli}.py`,
-`llmconfig/backends/{ollama,vllm}.py`, `llmconfig/web/`, `llmconfig/data/vllm_models.default.yaml`.
+Layout: `llmconfig/{config,wsl,winsvc,gpu,proc,registry,jobs,lane,lane_state,orchestrator,openai_gateway,doctor,main,cli}.py`,
+`llmconfig/backends/{ollama,vllm}.py`, `llmconfig/web/`, `llmconfig/data/vllm_models*.default.yaml`.
 
 ## Configuration
 All box-specific values live in `.env` (see `.env.example`): ports, the Ollama
@@ -78,6 +78,22 @@ the **3090 UUID**, VRAM thresholds, optional `LLMCONFIG_API_KEY`, and `HF_TOKEN`
 `POST /api/load {server,model,lane?,force?,max_pack?}` → job · `POST /api/unload {server?,lane?}` ·
 `GET /api/jobs/{id}` · `POST /api/ollama/pull` · `DELETE /api/ollama/{name}` ·
 `GET/POST/PUT/DELETE /api/vllm/aliases?lane=` · `POST /api/vllm/download`. Interactive docs at `/docs`.
+
+## OpenAI gateway (`/v1`) — auto-load on first request
+An OpenAI-compatible gateway so a client (e.g. opencode's `/model` picker, which has
+no selection-time hook) can switch models with **no manual `/swap`**: the first
+request for a model triggers the load. Point a provider's `baseURL` at
+`http://192.168.1.40:11430/v1`.
+
+`GET /v1/models` · `POST /v1/chat/completions` · `POST /v1/completions`. The lane is
+the `X-LLM-Lane` header (`primary` default, `companion` = the 3070 Ti). Flow:
+resolve `model` → a vLLM `served_name` (e.g. `qwen3-coder-30b`) or an Ollama tag
+(e.g. `qwen3-coder:30b`) → if already loaded, forward; else `POST /api/load` and, on
+a **streaming** request, relay the load progress as chat chunks before forwarding the
+real completion. No new arbitration — it reuses the per-lane lock / eviction /
+WSL-keepalive of `/api/load`. Concurrent identical loads coalesce onto one job; a
+non-stream request that arrives mid-load of a *different* model returns an empty 200
+(so title-gen never blocks for minutes). LAN-only, like the other endpoints.
 
 ## Status
 **Live-verified on `.40` (2026-06-17).** `doctor --local` is green; both paths

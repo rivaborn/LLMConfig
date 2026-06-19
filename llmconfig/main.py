@@ -17,6 +17,7 @@ from . import doctor as doctor_mod
 from .config import PACKAGE_DIR, get_settings
 from .gpu import query_gpu
 from .jobs import JobManager
+from .openai_gateway import OpenAIGateway, build_gateway_router
 from .orchestrator import Orchestrator
 from .registry import make_registry
 from .schemas import (
@@ -38,6 +39,7 @@ def create_app() -> FastAPI:
     registry = make_registry(settings)
     jobs = JobManager()
     orch = Orchestrator(settings, registry, jobs)
+    gateway = OpenAIGateway(orch, jobs, settings)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -47,6 +49,7 @@ def create_app() -> FastAPI:
         # Release the WSL keepalive so the distro can idle-shut-down cleanly when
         # the control app stops (an already-loaded vLLM model goes with it).
         orch.keepalive.stop()
+        await gateway.aclose()  # close the /v1 forwarding client
         await orch.aclose()  # close pooled HTTP clients
 
     app = FastAPI(title="LLMConfig", version=__version__, lifespan=lifespan,
@@ -55,6 +58,7 @@ def create_app() -> FastAPI:
     app.state.registry = registry
     app.state.jobs = jobs
     app.state.orch = orch
+    app.state.gateway = gateway
 
     async def require_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         if settings.auth_enabled and x_api_key != settings.llmconfig_api_key:
@@ -219,6 +223,13 @@ def create_app() -> FastAPI:
             return {"repo": repo, "output": r.out[-500:]}
 
         return jobs.start(job, run)
+
+    # ------------------------------------------------------------------ #
+    # OpenAI-compatible /v1 gateway (auto-loads on first request, then proxies).
+    # opencode points each provider's baseURL here; the picked model triggers the
+    # load. LAN inference path — open like the other read/proxy endpoints.
+    # ------------------------------------------------------------------ #
+    app.include_router(build_gateway_router(gateway))
 
     return app
 

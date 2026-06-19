@@ -111,6 +111,18 @@ llmconfig status                                     # shows both lanes
 >   check `nvidia-smi` shows its VRAM rise on the 3070 Ti (and the service log does
 >   *not* say `library=cpu`).
 
+## OpenAI `/v1` gateway (auto-load on first request)
+LLMConfig serves an OpenAI-compatible gateway at `http://192.168.1.40:11430/v1`
+(`/v1/models`, `/v1/chat/completions`, `/v1/completions`). A client points a
+provider's `baseURL` there; the model it picks (a vLLM `served_name` or an Ollama
+tag) is loaded on the first request — no manual `/swap`. Lane = the `X-LLM-Lane`
+header (`primary` default; `companion` → the 3070 Ti). Streaming requests get the
+load progress relayed as chat chunks before the real completion. It just calls the
+existing `/api/load`, so no extra setup — but the running app must be **restarted**
+to pick up a new gateway build (the always-on service: re-run `install-service.ps1`
+or restart the scheduled task). The opencode provider rewire lives in
+`rivaborn/opencode-config`.
+
 ## Notes
 - If `LLMCONFIG_API_KEY` is set in `.env`, write ops require the `X-API-Key` header (the UI has a field; the CLI reads `$LLMCONFIG_API_KEY`).
 - The app must run with rights to control the `ollama` service — NSSM's LocalSystem or the elevated scheduled task covers this; a plain user shell may hit "access denied" on `Restart-Service`.
