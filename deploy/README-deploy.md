@@ -19,13 +19,13 @@ cp /mnt/c/Coding/rivaborn/LLMConfig/deploy/vllm@.service ~/.config/systemd/user/
 # serve.sh is vendored at deploy/serve.sh (the box's working launcher: per-alias vLLM
 # args + the torch-based 3090 GPU resolution). Deploy it to ~/vllm/serve.sh:
 mkdir -p ~/vllm && cp /mnt/c/Coding/rivaborn/LLMConfig/deploy/serve.sh ~/vllm/serve.sh && chmod +x ~/vllm/serve.sh
+cp -r /mnt/c/Coding/rivaborn/LLMConfig/deploy/templates ~/vllm/templates   # chat templates serve.sh references
 systemctl --user daemon-reload
 # lingering should already be enabled (the vllm-relay unit needs it):
 loginctl enable-linger folar
 ```
-> `serve.sh` is vendored in `deploy/serve.sh`; edit `ExecStart` in `vllm@.service` if you place it
-> somewhere other than `/home/folar/vllm/serve.sh`. Its chat-template files (`~/vllm/templates/*.jinja`)
-> are box-side and **not** vendored — copy them over too.
+> `serve.sh` and its chat templates (`deploy/templates/*.jinja`) are vendored; edit `ExecStart` in
+> `vllm@.service` if you place `serve.sh` somewhere other than `/home/folar/vllm/serve.sh`.
 
 ## 3. Verify the box matches expectations
 ```powershell
