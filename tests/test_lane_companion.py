@@ -7,6 +7,7 @@ from llmconfig.backends.vllm import VllmBackend
 from llmconfig.config import Settings
 from llmconfig.gpu import GpuInfo
 from llmconfig.jobs import JobManager
+from llmconfig.lane_state import LaneDefaults
 from llmconfig.orchestrator import Orchestrator
 from llmconfig.proc import CmdResult
 from llmconfig.registry import Registry
@@ -124,6 +125,7 @@ def _make(monkeypatch, tmp_path):
     )
     jobs = JobManager()
     orch = Orchestrator(s, Registry(s.registry_path), jobs)
+    orch.defaults = LaneDefaults(s, path=tmp_path / "ld.yaml")  # isolate from repo data/lane_defaults.yaml
     wp, wc = World(), World()
     for lane, w in ((orch.primary, wp), (orch.lane("companion"), wc)):
         lane.ollama = FakeOllama(w)
@@ -227,6 +229,7 @@ async def test_autoload_fires_configured_default(monkeypatch, tmp_path):
     )
     jobs = JobManager()
     orch = Orchestrator(s, Registry(s.registry_path), jobs)
+    orch.defaults = LaneDefaults(s, path=tmp_path / "ld.yaml")  # isolate from repo data/lane_defaults.yaml
     wp, wc = World(), World()
     for lane, w in ((orch.primary, wp), (orch.lane("companion"), wc)):
         lane.ollama = FakeOllama(w)

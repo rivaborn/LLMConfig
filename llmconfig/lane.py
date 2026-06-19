@@ -196,8 +196,17 @@ class Lane:
             served_target, timeout, on_log=lambda l: self.jobs.log(job, l), alias=alias
         )
         if not ok:
+            # A heavy `mode: compile` alias can report ready a beat after its per-alias
+            # deadline; re-check briefly before failing, so we don't fail — and have the
+            # load torn down downstream — a vLLM that actually came up.
+            self.jobs.log(job, f"readiness wait hit {int(timeout)}s; grace re-check ({self.s.vllm_ready_grace_s}s)…")
+            ok = await self.vllm.wait_ready(served_target, float(self.s.vllm_ready_grace_s), alias=alias)
+        if not ok:
             tail = await self.vllm.journal_tail(alias, n=25)
-            raise RuntimeError(f"vLLM did not become ready for '{alias}' within {int(timeout)}s.\n{tail}")
+            raise RuntimeError(
+                f"vLLM did not become ready for '{alias}' within {int(timeout)}s "
+                f"(+{self.s.vllm_ready_grace_s}s grace).\n{tail}"
+            )
 
         gpu = await self._gpu()
         self.jobs.log(job, f"vLLM serving {served_target} (GPU {gpu.utilization_pct}% used)")

@@ -99,6 +99,8 @@ class Settings(BaseSettings):
     evict_timeout_s: float = 45.0
     poll_interval_s: float = 2.0
     default_vllm_load_timeout_s: int = 240
+    vllm_ready_grace_s: int = 30  # readiness re-check after a load's per-alias timeout, so a
+                                  # vLLM that came up just past the deadline isn't failed/torn down
 
     @property
     def auth_enabled(self) -> bool:

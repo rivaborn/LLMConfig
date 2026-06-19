@@ -46,7 +46,7 @@ aliases:
     mode: compile
     status: ok
     notes: Mamba hybrid; util 0.93
-    load_timeout_s: 180
+    load_timeout_s: 300
     managed_by: serve.sh
 
   - alias: q3-32b
@@ -55,7 +55,7 @@ aliases:
     mode: compile
     status: ok
     notes: Dense 32B; tool-calls verified (hermes)
-    load_timeout_s: 180
+    load_timeout_s: 300
     managed_by: serve.sh
 
   - alias: coder32
@@ -64,7 +64,7 @@ aliases:
     mode: compile
     status: ok
     notes: Daily heavy coder; tool-calls unreliable (Qwen2.5-Coder)
-    load_timeout_s: 180
+    load_timeout_s: 300
     managed_by: serve.sh
 
   - alias: vl32
@@ -91,7 +91,7 @@ aliases:
     mode: compile
     status: ok
     notes: BASELINE daily coder. AWQ-INT4, FP8 KV, 65536 ctx. Tool-calls verified e2e
-    load_timeout_s: 180
+    load_timeout_s: 300
     managed_by: serve.sh
 
   - alias: coder30-fp8
