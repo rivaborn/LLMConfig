@@ -27,6 +27,15 @@ loginctl enable-linger folar
 > `serve.sh` and its chat templates (`deploy/templates/*.jinja`) are vendored; edit `ExecStart` in
 > `vllm@.service` if you place `serve.sh` somewhere other than `/home/folar/vllm/serve.sh`.
 
+> **Per-alias context (FP8-KV recipe).** Each alias' `--max-model-len` is tuned in `serve.sh`. To
+> raise one, mirror `coder30-awq`: add `--kv-cache-dtype fp8` (halves KV/token; **not** `gemma4` —
+> FP8 KV is incompatible on Ampere+compressed-tensors), keep `--gpu-memory-utilization 0.93` (the
+> headless 3090 ceiling), and set `--max-model-len` to the largest clean tier the KV budget holds
+> (vLLM logs `GPU KV cache size: N tokens` at startup; the value can't exceed N for one sequence) and
+> that stays within the model's native RoPE cap (going past it needs `--rope-scaling`/YaRN — RoPE-NaN
+> risk). After bumping a context, redeploy serve.sh and tell the opencode-config session the new
+> served value so it re-syncs `context = served − output`.
+
 ## 3. Verify the box matches expectations
 ```powershell
 .\.venv\Scripts\llmconfig doctor --local
@@ -110,6 +119,27 @@ llmconfig status                                     # shows both lanes
 > - After install, confirm offload is real: load a small model on the companion and
 >   check `nvidia-smi` shows its VRAM rise on the 3070 Ti (and the service log does
 >   *not* say `library=cpu`).
+
+## Ollama context length
+
+Ollama defaults to a small **`OLLAMA_CONTEXT_LENGTH=4096`** and **silently truncates**
+every model to it — including opencode's default `ollama/qwen3-coder:30b`, whose
+baseline prompt (~24.5k tokens) gets cut to 4k. Raise it so the served context clears
+that.
+
+- **Primary `Ollama` service** is configured **manually** (no repo script installs it).
+  It's an NSSM service, so set the var in its `AppEnvironmentExtra`, preserving the
+  existing vars, then restart:
+  ```powershell
+  nssm get Ollama AppEnvironmentExtra        # note the current vars (OLLAMA_HOST, CUDA_*, OLLAMA_MODELS)
+  nssm set Ollama AppEnvironmentExtra "OLLAMA_HOST=0.0.0.0:11434" "CUDA_DEVICE_ORDER=PCI_BUS_ID" `
+      "CUDA_VISIBLE_DEVICES=<3090-index>" "OLLAMA_MODELS=<store>" "OLLAMA_CONTEXT_LENGTH=32768"
+  Restart-Service Ollama
+  ```
+  (List every var the service already had — `nssm set AppEnvironmentExtra` replaces the
+  whole block.) Bigger contexts cost more KV per Ollama load, applied to **all** models.
+- **`OllamaCompanion`** picks this up from `install-companion.ps1` automatically
+  (`-OllamaContextLength`, default `32768`); re-run that installer to change it.
 
 ## OpenAI `/v1` gateway (auto-load on first request)
 LLMConfig serves an OpenAI-compatible gateway at `http://192.168.1.40:11430/v1`

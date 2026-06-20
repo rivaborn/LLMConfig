@@ -42,6 +42,7 @@ param(
     [int]$GpuIndex = -1,            # override; otherwise derived from $GpuUuid
     [string]$OllamaExe = "",
     [string]$ModelsDir = "",
+    [int]$OllamaContextLength = 32768,  # OLLAMA_CONTEXT_LENGTH: default ctx for every model on this instance
     [switch]$KeepTrayApp,           # by default, stop + disable the Ollama tray/updater
     [switch]$OnBoxOnly             # bind 127.0.0.1 (no LAN/firewall); default is LAN 0.0.0.0 + firewall
 )
@@ -101,6 +102,7 @@ Write-Host "ollama.exe : $OllamaExe"
 Write-Host "models dir : $ModelsDir  (shared with the primary instance)"
 Write-Host "GPU pin    : index $GpuIndex  (= $GpuUuid, PCI_BUS_ID order)"
 Write-Host "listen     : ${BindHost}:$Port  $(if ($OnBoxOnly) {'(on-box only)'} else {'(LAN + firewall)'})"
+Write-Host "ctx length : $OllamaContextLength  (OLLAMA_CONTEXT_LENGTH)"
 
 if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
     Write-Host "Service '$ServiceName' already exists - reconfiguring."
@@ -111,11 +113,14 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
 & $nssm set $ServiceName AppDirectory (Split-Path $OllamaExe)
 & $nssm set $ServiceName Start SERVICE_AUTO_START
 & $nssm set $ServiceName DisplayName "Ollama (companion, RTX 3070 Ti)"
+# OLLAMA_CONTEXT_LENGTH raises the default served context (Ollama defaults to a small
+# 4096 that silently truncates big-context prompts, e.g. opencode's ~24.5k baseline).
 & $nssm set $ServiceName AppEnvironmentExtra `
     "OLLAMA_HOST=${BindHost}:$Port" `
     "CUDA_DEVICE_ORDER=PCI_BUS_ID" `
     "CUDA_VISIBLE_DEVICES=$GpuIndex" `
-    "OLLAMA_MODELS=$ModelsDir"
+    "OLLAMA_MODELS=$ModelsDir" `
+    "OLLAMA_CONTEXT_LENGTH=$OllamaContextLength"
 & $nssm start $ServiceName
 Write-Host "Started '$ServiceName' (Ollama on ${BindHost}:$Port pinned to GPU index $GpuIndex / the 3070 Ti)."
 

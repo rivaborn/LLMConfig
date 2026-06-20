@@ -67,12 +67,18 @@ case "$ALIAS" in
       --gpu-memory-utilization 0.50
     ;;
   vl7)
+    # FP8-KV context rollout (2026-06-19): tiny KV/token (32768 needs only ~0.88 GiB),
+    # but FP16 7B weights + vision encoder + compile workspace left just 0.28 GiB at
+    # util 0.85. Raise util to 0.92 and --enforce-eager (frees the compile workspace)
+    # → ~2+ GiB KV, 32768 fits easily. Qwen2.5-VL native 32768 cap (no YaRN) is the max.
     exec vllm serve Qwen/Qwen2.5-VL-7B-Instruct \
       --host "$HOST" \
       --port "$PORT" \
       --served-model-name qwen2.5-vl-7b \
-      --max-model-len 16384 \
-      --gpu-memory-utilization 0.85 \
+      --max-model-len 32768 \
+      --gpu-memory-utilization 0.92 \
+      --kv-cache-dtype fp8 \
+      --enforce-eager \
       --limit-mm-per-prompt '{"image":4}' \
       --enable-auto-tool-choice --tool-call-parser hermes
     ;;
@@ -123,28 +129,44 @@ case "$ALIAS" in
     # Qwen3.5-27B is hybrid (attention + Mamba layers) and stealth-multimodal.
     # Mamba state eats GPU workspace, so we additionally cap max-num-seqs=1
     # and drop prefix caching (which forces 'align' Mamba mode with overhead).
-    # 0.93 needed for torch.compile workspace (0.90 was enough with eager).
+    # FP8-KV context rollout (2026-06-19). Mamba-hybrid → tiny attention KV/token:
+    # 65536 needs only ~2.15 GiB KV. But torch.compile workspace left just 0.12 GiB
+    # at util 0.93, so the load failed. --enforce-eager frees that workspace, leaving
+    # GBs for KV — 65536 fits easily, no CPU offload needed. (Eager is also already
+    # noted as needing less util than compile here.) Verified with a ~58K canary.
     exec vllm serve QuantTrio/Qwen3.5-27B-AWQ \
       --host "$HOST" \
       --port "$PORT" \
       --served-model-name qwen3.5-27b \
-      --max-model-len 4096 \
+      --max-model-len 65536 \
       --max-num-batched-tokens 2048 \
       --max-num-seqs 1 \
       --gpu-memory-utilization 0.93 \
+      --kv-cache-dtype fp8 \
+      --enforce-eager \
       --limit-mm-per-prompt '{"image":0,"video":0}' \
       --enable-auto-tool-choice --tool-call-parser qwen3_xml
     ;;
   q3-32b)
-    # 32B AWQ + Mamba/hybrid headroom. Tight on 24 GB → cap to single seq.
+    # Dense 32B AWQ (~19 GB weights, ~128 KB/token KV even at FP8 — the tightest).
+    # FP8-KV context rollout (2026-06-19). Measured on this box (24 GB, headless):
+    #   compile+0.93        → 1.82 GiB KV (max len ~14.9K)
+    #   eager+0.94          → 3.20 GiB KV (max len ~26.2K) — still short of 32768
+    #   eager+0.94 +offload2→ 5.81 GiB KV → fits Qwen3's native 40960 (needs 5.0 GiB)
+    # So: --enforce-eager (frees CUDA-graph workspace; also required for cpu-offload,
+    # whose uva.py isn't Dynamo-traceable) + --cpu-offload-gb 2 → 40960 (native cap).
+    # Offload trades a little latency for the context.
     exec vllm serve Qwen/Qwen3-32B-AWQ \
       --host "$HOST" \
       --port "$PORT" \
       --served-model-name qwen3-32b \
-      --max-model-len 4096 \
+      --max-model-len 40960 \
       --max-num-batched-tokens 2048 \
       --max-num-seqs 1 \
-      --gpu-memory-utilization 0.93 \
+      --gpu-memory-utilization 0.94 \
+      --kv-cache-dtype fp8 \
+      --enforce-eager \
+      --cpu-offload-gb 2 \
       --limit-mm-per-prompt '{"image":0,"video":0}' \
       --enable-auto-tool-choice --tool-call-parser hermes \
       --chat-template /home/folar/vllm/templates/tool_chat_template_hermes.jinja
@@ -168,14 +190,23 @@ case "$ALIAS" in
       --enable-auto-tool-choice --tool-call-parser hermes
     ;;
   coder32)
+    # Dense 32B AWQ (~19 GB weights) — same tight KV budget as q3-32b. Qwen2.5 native
+    # max_position_embeddings=32768 with no YaRN → 32768 is the architectural ceiling
+    # (do NOT extend past 32K, RoPE-NaN risk). FP8-KV context rollout (2026-06-19):
+    # --kv-cache-dtype fp8 + --enforce-eager (frees CUDA-graph workspace; also required
+    # for cpu-offload) + --cpu-offload-gb 2 to clear 32768 (eager+0.94 alone left only
+    # ~26K; offload 2 buys ~5.8 GiB KV — see q3-32b measurements).
     exec vllm serve Qwen/Qwen2.5-Coder-32B-Instruct-AWQ \
       --host "$HOST" \
       --port "$PORT" \
       --served-model-name qwen2.5-coder-32b \
-      --max-model-len 4096 \
+      --max-model-len 32768 \
       --max-num-batched-tokens 2048 \
       --max-num-seqs 1 \
-      --gpu-memory-utilization 0.93 \
+      --gpu-memory-utilization 0.94 \
+      --kv-cache-dtype fp8 \
+      --enforce-eager \
+      --cpu-offload-gb 2 \
       --limit-mm-per-prompt '{"image":0,"video":0}' \
       --enable-auto-tool-choice --tool-call-parser hermes \
       --chat-template /home/folar/vllm/templates/tool_chat_template_hermes.jinja
