@@ -170,10 +170,16 @@ async def test_models_lists_vllm_served_names_and_ollama_tags(monkeypatch, tmp_p
     async with _client(app) as c:
         r = await c.get("/v1/models")
     assert r.status_code == 200
-    ids = {m["id"] for m in r.json()["data"]}
+    data = r.json()["data"]
+    ids = {m["id"] for m in data}
     assert "qwen3-coder-30b" in ids   # a vLLM served_name (from the seeded registry)
     assert "qwen3-coder:30b" in ids   # an Ollama tag
-    assert all(m["owned_by"] == "llmconfig" for m in r.json()["data"])
+    assert all(m["owned_by"] == "llmconfig" for m in data)
+    # each entry carries a backend-tagged `name`; `id` stays the canonical handle
+    by_id = {m["id"]: m for m in data}
+    assert by_id["qwen3-coder-30b"]["name"] == "qwen3-coder-30b  (vLLM)"
+    assert by_id["qwen3-coder:30b"]["name"] == "qwen3-coder:30b  (Ollama)"
+    assert all("(vLLM)" in m["name"] or "(Ollama)" in m["name"] for m in data)
 
 
 async def test_unknown_model_404(monkeypatch, tmp_path):

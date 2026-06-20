@@ -306,21 +306,26 @@ class OpenAIGateway:
 
     async def models(self, request: Request) -> dict:
         lane = self.lane(request.headers.get("x-llm-lane") or "primary")
-        ids: list[str] = []
+        # Track the backend each id came from (the gateway's own source of truth), so
+        # the display `name` is tagged from that — not guessed from the id convention.
+        tagged: list[tuple[str, str]] = []  # (id, backend label)
         for e in lane.registry.entries():
-            ids.append(e.served_name or e.alias)
+            tagged.append((e.served_name or e.alias, "vLLM"))
         try:
             for m in await lane.ollama.list_models():
                 if m.name:
-                    ids.append(m.name)
+                    tagged.append((m.name, "Ollama"))
         except Exception:
             pass
         seen: set[str] = set()
         data = []
-        for i in ids:
-            if i and i not in seen:
-                seen.add(i)
-                data.append({"id": i, "object": "model", "owned_by": "llmconfig"})
+        for mid, label in tagged:
+            if mid and mid not in seen:
+                seen.add(mid)
+                # `id` stays the canonical handle the resolver/opencode match on; `name`
+                # is purely additive (Open WebUI uses it for the picker label).
+                data.append({"id": mid, "name": f"{mid}  ({label})",
+                             "object": "model", "owned_by": "llmconfig"})
         return {"object": "list", "data": data}
 
 
