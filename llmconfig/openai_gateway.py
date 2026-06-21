@@ -72,8 +72,7 @@ class OpenAIGateway:
         """
         if not model:
             return None
-        # vLLM: match the served_name; prefer a non-blocked alias when several share it
-        # (e.g. coder30-awq + coder30-fp8 both serve "qwen3-coder-30b").
+        # vLLM: match the served_name; prefer a non-blocked alias if several ever share one.
         match: Optional[str] = None
         for e in lane.registry.entries():
             if (e.served_name or e.alias) == model:

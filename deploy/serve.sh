@@ -211,24 +211,6 @@ case "$ALIAS" in
       --enable-auto-tool-choice --tool-call-parser hermes \
       --chat-template /home/folar/vllm/templates/tool_chat_template_hermes.jinja
     ;;
-  coder30-fp8)
-    # KNOWN-BROKEN on vLLM 0.20.2 + cu130: FP8 weights + --cpu-offload-gb hits
-    # "RuntimeError: b_scales is not on GPU". Use `coder30-awq` instead (fits
-    # without offload) or wait for a vLLM upgrade.
-    # --enforce-eager required because cpu-offload uva.py is not Dynamo-traceable.
-    exec vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
-      --host "$HOST" \
-      --port "$PORT" \
-      --served-model-name qwen3-coder-30b \
-      --max-model-len 4096 \
-      --max-num-batched-tokens 2048 \
-      --gpu-memory-utilization 0.85 \
-      --cpu-offload-gb 10 \
-      --enable-prefix-caching \
-      --enforce-eager \
-      --enable-auto-tool-choice --tool-call-parser qwen3_coder \
-      --chat-template /home/folar/vllm/templates/tool_chat_template_qwen3coder.jinja
-    ;;
   coder30-awq)
     # Recommended path for Qwen3-Coder-30B.
     # FP8-KV rollout Stage B (2026-05-14): --kv-cache-dtype fp8 halves KV per
@@ -249,55 +231,76 @@ case "$ALIAS" in
       --chat-template /home/folar/vllm/templates/tool_chat_template_qwen3coder.jinja
     ;;
   q36-27b)
-    # 27B dense FP8 ~21 GB on GPU + ~8 GB CPU offload. Same FP8+offload
-    # caveat as coder30-fp8 — may hit "b_scales is not on GPU".
-    # --enforce-eager required because cpu-offload uva.py is not Dynamo-traceable.
-    exec vllm serve Qwen/Qwen3.6-27B-FP8 \
+    # Qwen3.6-27B-AWQ — SAME architecture as q35-27b (model_type qwen3_5: Mamba-hybrid
+    # full+linear attention, head_dim 256, 262144 native, stealth-multimodal). AWQ-INT4
+    # ~20.4 GiB weights. Tiny attention KV (only full-attn layers cache) → high context
+    # is cheap; the binding limit is weights. --kv-cache-dtype fp8 + --enforce-eager
+    # (frees compile workspace; also required for any cpu-offload). MM MUST be disabled
+    # or the video profile-run OOMs WSL (see gemma4). Add --cpu-offload-gb 2 only to push
+    # past what fits no-offload. Pivoted from Qwen3.6-27B-FP8 (vLLM 0.20.2 FP8+cpu-offload
+    # b_scales bug). max-model-len tuned live. (2026-06-20)
+    exec vllm serve QuantTrio/Qwen3.6-27B-AWQ \
       --host "$HOST" \
       --port "$PORT" \
       --served-model-name qwen3.6-27b \
-      --max-model-len 4096 \
+      --max-model-len 65536 \
       --max-num-batched-tokens 2048 \
-      --gpu-memory-utilization 0.88 \
-      --cpu-offload-gb 8 \
-      --enable-prefix-caching \
+      --max-num-seqs 1 \
+      --gpu-memory-utilization 0.93 \
+      --kv-cache-dtype fp8 \
       --enforce-eager \
+      --limit-mm-per-prompt '{"image":0,"video":0}' \
       --enable-auto-tool-choice --tool-call-parser qwen3_xml
     ;;
   q36-moe)
-    # 35B-A3B MoE FP8 ~36 GB → offload 16 GB. Only 3B active so offload cost
-    # is small compared to a dense model. Same FP8+offload caveat.
-    # --enforce-eager required because cpu-offload uva.py is not Dynamo-traceable.
-    exec vllm serve Qwen/Qwen3.6-35B-A3B-FP8 \
+    # Qwen3.6-35B-A3B-AWQ — MoE (256 experts / 8 active) on the qwen3_5_moe arch
+    # (Mamba-hybrid, head_dim 256, 262144 native, stealth-multimodal). AWQ-INT4
+    # ~23.7 GiB weights EXCEEDS the ~22.5 GiB free, so --cpu-offload-gb is REQUIRED
+    # just to fit (and --enforce-eager is required for cpu-offload). Tiny attention KV
+    # → high context once it fits. MM disabled (video OOM). Pivoted from
+    # Qwen3.6-35B-A3B-FP8 (FP8+offload b_scales bug). 2026-06-20: AWQ-MoE LOADS on WSL
+    # (no b_scales — that's FP8/NVFP4 only) and KV is tiny (374K-token pool, 131072 free).
+    # BUT the 23.7 GiB weights exceed 24 GB so cpu-offload is forced, and MoE expert
+    # offload over PCIe gives only ~0.2-0.6 tok/s (offload 6 → 0.2, offload 3 → 0.59) —
+    # UNUSABLE on a single 24 GB GPU. Registry status=blocked (load with force=true to
+    # experiment); needs a 2nd GPU or a non-MoE model. offload 3 is the least-bad config.
+    exec vllm serve QuantTrio/Qwen3.6-35B-A3B-AWQ \
       --host "$HOST" \
       --port "$PORT" \
       --served-model-name qwen3.6-moe \
-      --max-model-len 4096 \
+      --max-model-len 131072 \
       --max-num-batched-tokens 2048 \
-      --gpu-memory-utilization 0.88 \
-      --cpu-offload-gb 16 \
-      --enable-prefix-caching \
+      --max-num-seqs 1 \
+      --gpu-memory-utilization 0.93 \
+      --kv-cache-dtype fp8 \
       --enforce-eager \
+      --cpu-offload-gb 3 \
+      --limit-mm-per-prompt '{"image":0,"video":0}' \
       --enable-auto-tool-choice --tool-call-parser qwen3_xml
     ;;
   devstral)
-    # 24B FP16 ~48 GB. Needs 24 GB GPU + 24 GB CPU. WSL defaults to 50% of
-    # host RAM (~15 GB on 32 GB system) → won't fit. To enable: edit
-    # %USERPROFILE%/.wslconfig and set:
-    #   [wsl2]
-    #   memory=28GB
-    # then `wsl --shutdown` from PowerShell to apply.
-    # --enforce-eager required because cpu-offload uva.py is not Dynamo-traceable.
-    exec vllm serve mistralai/Devstral-Small-2507 \
+    # Devstral-Small-2507-AWQ-4bit (cyankiwi) — AWQ-INT4 ~13.3 GiB, fits the 24 GB 3090
+    # with NO offload (no WSL memory bump needed). Mistral-tokenizer format: ships
+    # tekken.json/params.json and NO HF tokenizer, so --tokenizer-mode mistral is
+    # REQUIRED. Weights are HF-sharded + config.json present → default load/config
+    # format. Dense 40L / 8 KV-heads / head_dim 128 (~80 KB/token FP8 KV); tekken
+    # provides the chat template so no --chat-template. --enforce-eager: compile mode
+    # left the box at 98.9% VRAM (CUDA-graph memory is unaccounted with the profiler
+    # env off) and OOM-restarted under a tool-call request; eager frees that headroom
+    # and lifts KV. --max-num-batched-tokens bounds the prefill activation spike.
+    # Pivoted from FP16 Devstral-Small-2507 (needed 26 GB offload + WSL≥28 GB).
+    # max-model-len tuned live. (2026-06-20)
+    exec vllm serve cyankiwi/Devstral-Small-2507-AWQ-4bit \
       --host "$HOST" \
       --port "$PORT" \
       --served-model-name devstral \
-      --max-model-len 4096 \
-      --gpu-memory-utilization 0.88 \
-      --cpu-offload-gb 26 \
+      --max-model-len 98304 \
+      --max-num-batched-tokens 2048 \
+      --gpu-memory-utilization 0.92 \
+      --kv-cache-dtype fp8 \
       --enforce-eager \
-      --enable-auto-tool-choice --tool-call-parser mistral \
-      --chat-template /home/folar/vllm/templates/tool_chat_template_mistral_parallel.jinja
+      --tokenizer-mode mistral \
+      --enable-auto-tool-choice --tool-call-parser mistral
     ;;
   ""|-h|--help)
     cat <<USAGE
@@ -313,12 +316,11 @@ Fits single 3090 (24 GB) no offload:
   vl32          Qwen2.5-VL-32B-Instruct-AWQ    (vision, ~19 GB)
   coder32       Qwen2.5-Coder-32B-Instruct-AWQ (coder, ~19 GB)
   coder30-awq   Qwen3-Coder-30B-A3B-AWQ        (MoE, ~17 GB, auto-DLs)
+  q36-27b       Qwen3.6-27B-AWQ                (hybrid, ~20 GB)
+  devstral      Devstral-Small-2507-AWQ        (~13 GB, mistral tokenizer)
 
 Needs CPU offload (slower, uses WSL RAM):
-  coder30-fp8   Qwen3-Coder-30B-A3B-FP8        (~30 GB, 10 GB offload)
-  q36-27b       Qwen3.6-27B-FP8                (~28 GB, 8 GB offload)
-  q36-moe       Qwen3.6-35B-A3B-FP8            (~36 GB, 16 GB offload)
-  devstral      Devstral-Small-2507 FP16       (~48 GB, requires WSL RAM ≥28 GB)
+  q36-moe       Qwen3.6-35B-A3B-AWQ            (MoE hybrid, ~24 GB, ~6 GB offload)
 
 Kills any existing 'vllm serve' before launching.
 Defaults: PORT=11435, HOST=0.0.0.0 (LAN-reachable via WSL mirrored networking).

@@ -77,12 +77,12 @@ aliases:
     managed_by: serve.sh
 
   - alias: q36-moe
-    hf_repo: Qwen/Qwen3.6-35B-A3B-FP8
+    hf_repo: QuantTrio/Qwen3.6-35B-A3B-AWQ
     served_name: qwen3.6-moe
     mode: eager
-    status: unverified
-    notes: CPU offload 16 GB; ~11 min cold load; chat unverified
-    load_timeout_s: 900
+    status: blocked
+    notes: AWQ-INT4 ~24 GB loads (no b_scales bug) but forces cpu-offload on 24 GB; MoE expert offload ~0.2-0.6 tok/s = unusable. Needs 2nd GPU. force=true to experiment
+    load_timeout_s: 600
     managed_by: serve.sh
 
   - alias: coder30-awq
@@ -94,29 +94,20 @@ aliases:
     load_timeout_s: 300
     managed_by: serve.sh
 
-  - alias: coder30-fp8
-    hf_repo: Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8
-    served_name: qwen3-coder-30b
-    mode: eager
-    status: blocked
-    notes: vLLM 0.20.2 FP8+cpu-offload b_scales bug. Shares served name with coder30-awq; prefer AWQ
-    load_timeout_s: 240
-    managed_by: serve.sh
-
   - alias: q36-27b
-    hf_repo: Qwen/Qwen3.6-27B-FP8
+    hf_repo: QuantTrio/Qwen3.6-27B-AWQ
     served_name: qwen3.6-27b
     mode: eager
-    status: blocked
-    notes: Same FP8+cpu-offload b_scales bug in vLLM 0.20.2
-    load_timeout_s: 240
+    status: ok
+    notes: qwen3_5 Mamba-hybrid (same arch as q35-27b); AWQ-INT4 ~20 GB; FP8 KV eager; 65536 ctx no-offload; MM disabled; tool-calls (qwen3_xml)
+    load_timeout_s: 300
     managed_by: serve.sh
 
   - alias: devstral
-    hf_repo: mistralai/Devstral-Small-2507
+    hf_repo: cyankiwi/Devstral-Small-2507-AWQ-4bit
     served_name: devstral
     mode: eager
-    status: skipped
-    notes: 48 GB FP16; needs WSL RAM ≥28 GB
-    load_timeout_s: 600
+    status: ok
+    notes: AWQ-INT4 ~13 GB, no offload; mistral tokenizer (tekken); FP8 KV, eager; 98304 ctx; tool-calls (mistral)
+    load_timeout_s: 300
     managed_by: serve.sh

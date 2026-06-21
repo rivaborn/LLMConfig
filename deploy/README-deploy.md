@@ -36,6 +36,27 @@ loginctl enable-linger folar
 > risk). After bumping a context, redeploy serve.sh and tell the opencode-config session the new
 > served value so it re-syncs `context = served − output`.
 
+> **AWQ pivot for the formerly-offloaded aliases (2026-06-20).** `q36-27b`, `q36-moe`, and
+> `devstral` were FP8/FP16 builds that needed `--cpu-offload-gb` and hit the vLLM 0.20.2
+> FP8+offload `b_scales` bug (devstral: a 26 GB offload + WSL≥28 GB). They now run AWQ-INT4
+> builds that fit the 24 GB card: `QuantTrio/Qwen3.6-27B-AWQ`, `QuantTrio/Qwen3.6-35B-A3B-AWQ`,
+> `cyankiwi/Devstral-Small-2507-AWQ-4bit`. Gotchas found tuning them:
+> - **Qwen3.6 (`qwen3_5` / `qwen3_5_moe`) are Mamba-hybrid + stealth-multimodal** — the same
+>   arch family as `q35-27b`. Always pass `--limit-mm-per-prompt '{"image":0,"video":0}'` or the
+>   video profile-run OOMs WSL (the `gemma4` failure). Tiny attention KV → high context is cheap;
+>   weights are the binding limit. `q36-moe` (~24 GB) exceeds free VRAM so it **requires**
+>   `--cpu-offload-gb` to fit (AWQ-INT4 offload does *not* hit the b_scales bug — that's FP8/NVFP4),
+>   **but** MoE expert-offload over PCIe runs at only ~0.2–0.6 tok/s, so `q36-moe` is left
+>   `status: blocked` (unusable on one 24 GB GPU; `force=true` to experiment). `q36-27b` fits and is fine.
+> - **`devstral` is Mistral-tokenizer format** (ships `tekken.json`/`params.json`, no HF
+>   tokenizer) → `--tokenizer-mode mistral` is **required**; weights are HF-sharded so keep the
+>   default load format (not `--load-format mistral`). It no longer needs the `.wslconfig`
+>   `memory=28GB` bump. Tool-calls via `--tool-call-parser mistral`.
+> - **Dense AWQ at high util can exceed the budget:** with `VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0`
+>   CUDA-graph memory is unaccounted, so compile mode pushed devstral to ~99% VRAM and it
+>   OOM-restarted under a tool call — `--enforce-eager` removes that overhead (stable + more KV).
+>   `coder30-fp8` was retired (the AWQ `coder30-awq` already serves `qwen3-coder-30b`).
+
 ## 3. Verify the box matches expectations
 ```powershell
 .\.venv\Scripts\llmconfig doctor --local

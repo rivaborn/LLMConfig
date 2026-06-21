@@ -11,9 +11,6 @@ def test_seed_and_crud(tmp_path):
     assert {"smoke", "coder30-awq", "devstral"} <= aliases
     assert reg.served_name("coder30-awq") == "qwen3-coder-30b"
 
-    # coder30-awq and coder30-fp8 intentionally share a served name
-    assert reg.served_name("coder30-fp8") == "qwen3-coder-30b"
-
     reg.upsert(VllmAliasEntry(alias="custom", served_name="custom-x", managed_by="registry"))
     assert Registry(path).get("custom").served_name == "custom-x"
 
@@ -22,6 +19,11 @@ def test_seed_and_crud(tmp_path):
 
 
 def test_blocked_status_present(tmp_path):
-    reg = Registry(tmp_path / "r.yaml")
-    blocked = {e.alias for e in reg.entries() if e.status == "blocked"}
-    assert {"coder30-fp8", "q36-27b"} <= blocked
+    # The status field carries "blocked" (the loader refuses such aliases). Use a
+    # synthetic entry so the test doesn't depend on which catalog aliases are blocked.
+    path = tmp_path / "r.yaml"
+    reg = Registry(path)
+    reg.upsert(VllmAliasEntry(alias="zzz-blocked", served_name="zzz",
+                              status="blocked", managed_by="serve.sh"))
+    blocked = {e.alias for e in Registry(path).entries() if e.status == "blocked"}
+    assert "zzz-blocked" in blocked

@@ -11,7 +11,7 @@ from llmconfig.jobs import JobManager
 from llmconfig.orchestrator import Orchestrator
 from llmconfig.proc import CmdResult
 from llmconfig.registry import Registry
-from llmconfig.schemas import LoadRequest, OllamaModel, UnloadRequest
+from llmconfig.schemas import LoadRequest, OllamaModel, UnloadRequest, VllmAliasEntry
 
 GiB = 1024 ** 3
 BASE_MB = 400  # driver baseline (GPU "free")
@@ -157,7 +157,10 @@ async def test_load_vllm_evicts_ollama(monkeypatch, tmp_path):
 
 async def test_load_vllm_blocked_alias_refused(monkeypatch, tmp_path):
     world, orch, jobs = _make(monkeypatch, tmp_path)
-    job = await _run_load(orch, jobs, LoadRequest(server="vllm", model="coder30-fp8"))
+    # A blocked alias must be refused (synthetic entry — decoupled from the catalog).
+    orch.primary.registry.upsert(VllmAliasEntry(alias="zzz-blocked", served_name="zzz",
+                                                status="blocked", managed_by="serve.sh"))
+    job = await _run_load(orch, jobs, LoadRequest(server="vllm", model="zzz-blocked"))
     assert job.state == "failed"
     assert "blocked" in job.error.lower()
 
