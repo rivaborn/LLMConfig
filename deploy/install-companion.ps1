@@ -23,8 +23,10 @@ expose it past the perimeter. Pass -OnBoxOnly to bind 127.0.0.1 and skip the fir
 By default this also stops the Ollama tray app and removes its login-autostart: the
 tray hosts the auto-updater, which can't stop the NSSM-managed ollama.exe and corrupts
 the install on update (rollback wipes the CUDA runner -> CPU-only) and fights the
-service for :11434. Pass -KeepTrayApp to leave it alone. After this, update Ollama
-manually: Stop-Service Ollama -> run OllamaSetup -> Start-Service Ollama.
+service for :11434. Pass -KeepTrayApp to leave it alone. Ollama updates are automated by
+deploy\update-ollama.ps1 + the weekly LLMConfig-OllamaUpdate task (see
+deploy\install-ollama-update.ps1); the manual fallback is still Stop-Service Ollama ->
+run OllamaSetup -> Start-Service Ollama (for both Ollama and OllamaCompanion).
 
 Run elevated:
     powershell -ExecutionPolicy Bypass -File deploy\install-companion.ps1

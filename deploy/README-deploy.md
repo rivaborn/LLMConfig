@@ -162,6 +162,47 @@ that.
 - **`OllamaCompanion`** picks this up from `install-companion.ps1` automatically
   (`-OllamaContextLength`, default `32768`); re-run that installer to change it.
 
+## Automated Ollama updates
+
+Ollama's tray auto-updater is disabled on this box (it can't stop the NSSM-managed
+`ollama.exe`, so its in-place update hits `DeleteFile … Access is denied`, rolls back, and
+**wipes the CUDA runner → silent CPU-only fallback**). `deploy\update-ollama.ps1` does the
+update safely instead, and a weekly task runs it automatically.
+
+**What the updater does** (safe stop-order — both Ollama services share the same per-user
+`ollama.exe`, so all of it must stop before the binary can be replaced):
+1. Check installed vs latest (GitHub releases). **If already latest and not `-Force`, it
+   exits with zero downtime** — nothing is stopped.
+2. Stop the `LLMConfig` task (so its `ensure_running()` can't `Start-Service ollama`
+   mid-install and re-lock the binary); free `:11430` if anything still holds it.
+3. Stop both Ollama services + the tray + any stray `ollama.exe`.
+4. Download `OllamaSetup.exe` and run it `/VERYSILENT`.
+5. Re-suppress the tray + login-autostart the installer re-enables.
+6. Restart both services and wait for each `/api/version`.
+7. **Verify the CUDA runner survived** — load the smallest pulled model and confirm
+   `/api/ps` shows `size_vram > 0` (not `library=cpu`). If it comes back CPU-only it retries
+   the reinstall once, then logs a loud failure for manual attention.
+8. Restart the `LLMConfig` task.
+
+Steps 2–8 are wrapped so a mid-run failure still restarts the services + LLMConfig. Each run
+appends an `old → new | runner=… | outcome` line to `logs\ollama-update.log`.
+
+**Install the weekly task** (elevated — needs service + per-user-install control), runs
+**Sunday 04:00** by default:
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\install-ollama-update.ps1
+```
+It is deliberately a **local Windows Scheduled Task** (not the lab's Rundeck/Ansible) because
+the update needs the interactive user's Windows service control + HKCU + per-user install.
+
+**On-demand / manual update** (e.g. to force an immediate upgrade):
+```powershell
+powershell -ExecutionPolicy Bypass -File deploy\update-ollama.ps1 -Force
+```
+Without `-Force` it no-ops when already on the latest version. The old fully-manual fallback
+(`Stop-Service Ollama` + `OllamaCompanion` → run `OllamaSetup` → `Start-Service …`) still
+works if needed.
+
 ## OpenAI `/v1` gateway (auto-load on first request)
 LLMConfig serves an OpenAI-compatible gateway at `http://192.168.1.40:11430/v1`
 (`/v1/models`, `/v1/chat/completions`, `/v1/completions`). A client points a
