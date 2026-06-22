@@ -174,7 +174,10 @@ update safely instead, and a weekly task runs it automatically.
 1. Check installed vs latest (GitHub releases). **If already latest and not `-Force`, it
    exits with zero downtime** — nothing is stopped.
 2. Stop the `LLMConfig` task (so its `ensure_running()` can't `Start-Service ollama`
-   mid-install and re-lock the binary); free `:11430` if anything still holds it.
+   mid-install and re-lock the binary); free `:11430` if anything still holds it, then
+   `wsl --shutdown` to release the 3090 — vLLM lives in WSL and does **not** exit when
+   LLMConfig stops, so the runner-verify (step 7) would otherwise mis-read a full GPU as
+   CPU-only. LLMConfig restarts WSL/vLLM at the end.
 3. Stop both Ollama services + the tray + any stray `ollama.exe`.
 4. Download `OllamaSetup.exe` and run it `/VERYSILENT`.
 5. Re-suppress the tray + login-autostart the installer re-enables.

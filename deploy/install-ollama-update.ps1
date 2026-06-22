@@ -29,8 +29,10 @@ if (-not (Test-Path $script)) { throw "update-ollama.ps1 not found at $script." 
 # Run as the invoking interactive user, RunLevel Highest -- same as the LLMConfig task,
 # so it can Stop/Start the Ollama services + the LLMConfig task and touch the per-user install.
 $userId    = "$env:USERDOMAIN\$env:USERNAME"
+# Pass -RepoPath explicitly: under Task Scheduler -File, update-ollama.ps1's $PSScriptRoot
+# came back empty (logs then landed in C:\logs), so don't rely on it resolving the repo.
 $action    = New-ScheduledTaskAction -Execute "powershell.exe" `
-    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$script`"" -WorkingDirectory $RepoPath
+    -Argument "-NoProfile -ExecutionPolicy Bypass -File `"$script`" -RepoPath `"$RepoPath`"" -WorkingDirectory $RepoPath
 $trigger   = New-ScheduledTaskTrigger -Weekly -DaysOfWeek $DayOfWeek -At $At
 $set       = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
     -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Hours 1)

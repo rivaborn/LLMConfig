@@ -26,7 +26,7 @@ Normally invoked weekly by the LLMConfig-OllamaUpdate scheduled task
 #>
 [CmdletBinding()]
 param(
-    [string]$RepoPath = (Resolve-Path "$PSScriptRoot\..").Path,
+    [string]$RepoPath = "",
     [string[]]$ServiceNames = @('Ollama', 'OllamaCompanion'),
     [string]$LLMConfigTask = "LLMConfig",
     [int]$Port = 11430,                 # LLMConfig's control port (freed if still held)
@@ -36,6 +36,14 @@ param(
     [string]$LogPath = ""
 )
 $ErrorActionPreference = "Stop"
+# $PSScriptRoot is unreliable under Task Scheduler -File on this box (it came back empty,
+# which made RepoPath resolve to C:\ and logs land in C:\logs). Resolve robustly; the
+# scheduled task also passes -RepoPath explicitly (see install-ollama-update.ps1).
+if (-not $RepoPath) {
+    if ($PSScriptRoot)      { $RepoPath = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path }
+    elseif ($PSCommandPath) { $RepoPath = (Resolve-Path (Join-Path (Split-Path $PSCommandPath) "..")).Path }
+    else                    { $RepoPath = (Get-Location).Path }
+}
 if (-not $LogPath) { $LogPath = Join-Path $RepoPath "logs\ollama-update.log" }
 
 # --- logging --------------------------------------------------------------
@@ -136,8 +144,18 @@ function Install-Ollama {
     Write-Log "Downloading OllamaSetup.exe..."
     Invoke-WebRequest -Uri "https://ollama.com/download/OllamaSetup.exe" -OutFile $tmp -UseBasicParsing -TimeoutSec 600
     Write-Log "Running installer (/VERYSILENT)..."
-    $p = Start-Process -FilePath $tmp -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -Wait -PassThru
+    # Use -PassThru + WaitForExit, NOT -Wait: the installer auto-launches the persistent tray
+    # ('ollama app') + a server ('ollama'), and Start-Process -Wait blocks on the whole process
+    # tree -> it hangs forever (verified live 2026-06-21). WaitForExit() waits only for the
+    # installer process, which exits once it has spawned the app.
+    $p = Start-Process -FilePath $tmp -ArgumentList '/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART' -PassThru
+    $null = $p.Handle   # cache handle so ExitCode is readable after exit (PS -PassThru gotcha)
+    if (-not $p.WaitForExit(300000)) { throw "OllamaSetup.exe did not exit within 5 minutes." }
     if ($p.ExitCode -ne 0) { throw "OllamaSetup.exe exited with code $($p.ExitCode)." }
+    # The installer auto-launches the tray + a server that squat :11434; kill them so the NSSM
+    # services can rebind. (Suppress-Tray below also handles the tray + its autostart key.)
+    Write-Log "Installer done; killing the tray + stray server it auto-launched."
+    Get-Process 'ollama app', 'ollama' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Remove-Item $tmp -Force -ErrorAction SilentlyContinue
 }
 
@@ -220,6 +238,15 @@ try {
         Write-Log "Port $Port still held by PID $($conn.OwningProcess); stopping it."
         Stop-Process -Id $conn.OwningProcess -Force -ErrorAction SilentlyContinue
     }
+
+    # 4b. Free the primary GPU. vLLM runs in WSL and does NOT exit when LLMConfig stops,
+    #     so the CUDA-runner check (step 10) would load Ollama onto an already-full 3090
+    #     and mis-read it as CPU-only. WSL here hosts only vLLM; LLMConfig restarts it in
+    #     the finally block. (Verified live 2026-06-21: WSL/vLLM persisted and the 3090
+    #     stayed at ~23.7 GiB after the task stopped LLMConfig.)
+    Write-Log "Shutting down WSL to release the primary GPU (vLLM)..."
+    & wsl.exe --shutdown 2>$null
+    Start-Sleep -Seconds 5
 
     # 5. Quiesce Ollama (both services + tray + strays) so the binary unlocks.
     Stop-OllamaProcesses
