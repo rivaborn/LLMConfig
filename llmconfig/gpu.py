@@ -14,6 +14,13 @@ from .wsl import run_wsl
 
 GPU_QUERY = "--query-gpu=uuid,memory.total,memory.used,memory.free --format=csv,noheader,nounits"
 APPS_QUERY = "--query-compute-apps=pid,used_memory,process_name --format=csv,noheader,nounits"
+# Richer per-GPU telemetry for the Monitor tab (core temp / power / util on top of
+# memory). `index` is included so the Monitor can pair each card with its NVAPI
+# hotspot/junction sensors (nvidia-smi and NVAPI share the PCI-bus ordering).
+METRICS_QUERY = (
+    "--query-gpu=index,uuid,name,temperature.gpu,power.draw,utilization.gpu,"
+    "memory.total,memory.used,memory.free --format=csv,noheader,nounits"
+)
 
 
 @dataclass
@@ -55,6 +62,58 @@ def _parse_int(s: str) -> int:
         return int(s.strip().split()[0])
     except (ValueError, IndexError):
         return 0
+
+
+def _parse_float(s: str) -> float | None:
+    """Parse one nvidia-smi numeric field; returns None for "[N/A]"/blank
+    (power/util read N/A on some cards or under WSL)."""
+    tok = s.strip().split()[0] if s.strip() else ""
+    try:
+        return float(tok)
+    except ValueError:
+        return None
+
+
+@dataclass
+class GpuMetric:
+    """One per-GPU telemetry sample (the Monitor tab's unit of data)."""
+    index: int
+    uuid: str
+    name: str
+    temp_c: float | None
+    power_w: float | None
+    util_pct: float | None
+    mem_total_mb: int
+    mem_used_mb: int
+    mem_free_mb: int
+
+
+async def sample_gpu_metrics(settings: Settings | None = None) -> list[GpuMetric]:
+    """One nvidia-smi snapshot of every visible GPU's thermals/power/util/memory.
+    Returns [] when nvidia-smi is unreachable (the Monitor degrades gracefully)."""
+    settings = settings or get_settings()
+    r = await _run_smi(METRICS_QUERY, settings)
+    if not r.ok:
+        return []
+    out: list[GpuMetric] = []
+    for line in r.out.splitlines():
+        parts = [p.strip() for p in line.split(",")]
+        if len(parts) < 9:
+            continue
+        out.append(
+            GpuMetric(
+                index=_parse_int(parts[0]),
+                uuid=parts[1],
+                name=parts[2],
+                temp_c=_parse_float(parts[3]),
+                power_w=_parse_float(parts[4]),
+                util_pct=_parse_float(parts[5]),
+                mem_total_mb=_parse_int(parts[6]),
+                mem_used_mb=_parse_int(parts[7]),
+                mem_free_mb=_parse_int(parts[8]),
+            )
+        )
+    return out
 
 
 async def query_gpu(settings: Settings | None = None, uuid: str | None = None) -> GpuInfo:

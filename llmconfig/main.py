@@ -17,6 +17,7 @@ from . import doctor as doctor_mod
 from .config import PACKAGE_DIR, get_settings
 from .gpu import query_gpu
 from .jobs import JobManager
+from .monitor import Monitor
 from .openai_gateway import OpenAIGateway, build_gateway_router
 from .orchestrator import Orchestrator
 from .registry import make_registry
@@ -40,12 +41,15 @@ def create_app() -> FastAPI:
     jobs = JobManager()
     orch = Orchestrator(settings, registry, jobs)
     gateway = OpenAIGateway(orch, jobs, settings)
+    monitor = Monitor(settings, orch)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # Auto-load each lane's configured default model (fire-and-forget Jobs).
         orch.autoload_defaults()
+        monitor.start()  # begin sampling GPU/LLM telemetry for the Monitor tab
         yield
+        await monitor.stop()
         # Release the WSL keepalive so the distro can idle-shut-down cleanly when
         # the control app stops (an already-loaded vLLM model goes with it).
         orch.keepalive.stop()
@@ -59,6 +63,7 @@ def create_app() -> FastAPI:
     app.state.jobs = jobs
     app.state.orch = orch
     app.state.gateway = gateway
+    app.state.monitor = monitor
 
     async def require_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         if settings.auth_enabled and x_api_key != settings.llmconfig_api_key:
@@ -129,6 +134,16 @@ def create_app() -> FastAPI:
     async def api_doctor() -> dict:
         report = await doctor_mod.run_doctor(settings, registry)
         return report.model_dump()
+
+    @app.get("/api/monitor")
+    async def api_monitor() -> dict:
+        """Latest GPU thermals/power/VRAM + Ollama split (the Monitor tab readouts)."""
+        return monitor.snapshot()
+
+    @app.get("/api/monitor/history")
+    async def api_monitor_history(window: float = 3600.0) -> dict:
+        """Bucketed telemetry history over the last `window` seconds."""
+        return monitor.history(window)
 
     @app.get("/api/vllm/aliases", response_model=list[VllmAliasEntry])
     async def api_aliases(lane: str = "primary") -> list[VllmAliasEntry]:

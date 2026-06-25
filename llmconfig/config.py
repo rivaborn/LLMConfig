@@ -84,6 +84,11 @@ class Settings(BaseSettings):
     companion_default_server: str = ""   # "ollama" | "vllm" | "" — auto-load on startup
     companion_default_model: str = ""    # Ollama tag or vLLM alias
 
+    # --- monitoring (the Monitor tab: thermals/power/VRAM history) ---
+    monitor_enabled: bool = True
+    monitor_interval_s: float = 5.0   # GPU sample cadence
+    monitor_retention_h: int = 24     # in-memory history window
+
     # --- HuggingFace (vLLM downloads) ---
     hf_token: str = ""
 

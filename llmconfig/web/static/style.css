@@ -2,6 +2,11 @@
   --bg: #0f1115; --panel: #171a21; --panel2: #1f242e; --ink: #e6e9ef;
   --muted: #99a2b2; --line: #2a313d; --accent: #6ea8fe; --ok: #3fb950;
   --warn: #d29922; --bad: #f85149; --vllm: #c678dd; --ollama: #56b6c2;
+  /* telemetry traces (Monitor tab) — core/hotspot/junction read coolest→hottest */
+  --trace-core: #6ea8fe; --trace-hotspot: #f0883e; --trace-junction: #f85149;
+  --trace-power: #d29922; --trace-vram: #56b6c2;
+  --trace-gpu: #3fb950; --trace-cpu: #f85149;
+  --mono: ui-monospace, "Cascadia Code", "Cascadia Mono", "SFMono-Regular", Consolas, monospace;
 }
 * { box-sizing: border-box; }
 body {
@@ -29,8 +34,21 @@ header {
 .keybox summary { cursor: pointer; list-style: none; font-size: 18px; }
 .keybox input { background: var(--panel2); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 4px 8px; }
 
-main { display: grid; grid-template-columns: 1fr 320px; gap: 16px; padding: 16px; align-items: start; }
-@media (max-width: 980px) { main { grid-template-columns: 1fr; } }
+/* tab navigation */
+.tabs { display: flex; gap: 4px; flex: 1; }
+.tab {
+  background: transparent; color: var(--muted); border: 0; border-bottom: 2px solid transparent;
+  padding: 8px 14px; font: inherit; font-weight: 700; cursor: pointer; border-radius: 6px 6px 0 0;
+}
+.tab:hover { color: var(--ink); }
+.tab.active { color: var(--ink); border-bottom-color: var(--accent); }
+.tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* view switching: hidden by default, the active view restores its own layout */
+.view { display: none; }
+.view.active { display: grid; grid-template-columns: 1fr 320px; gap: 16px; padding: 16px; align-items: start; }
+#view-monitor.active { display: block; padding: 16px; }
+@media (max-width: 980px) { .view.active { grid-template-columns: 1fr; } }
 .col h2, .col h3, .activity h2 { margin: 0 0 10px; font-size: 15px; }
 .hint { color: var(--muted); margin: 0 0 10px; font-size: 12px; }
 .header-hint { flex: 1; min-width: 200px; }
@@ -75,3 +93,70 @@ main { display: grid; grid-template-columns: 1fr 320px; gap: 16px; padding: 16px
   height: 60vh; overflow: auto; white-space: pre-wrap; color: var(--muted); font-size: 12px;
 }
 .err { color: var(--bad); font-size: 12px; min-height: 1em; }
+
+/* ===================================================================== */
+/* Monitor tab — telemetry console                                       */
+/* ===================================================================== */
+.offload-banner {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 16px;
+  padding: 10px 14px; border-radius: 10px; font-weight: 700;
+  background: rgba(248, 81, 73, .12); border: 1px solid var(--bad); color: var(--bad);
+}
+.offload-banner.warn { background: rgba(210, 153, 34, .12); border-color: var(--warn); color: var(--warn); }
+.offload-banner::before { content: "▲"; font-size: 12px; }
+.offload-banner[hidden] { display: none; }  /* author display:flex would otherwise beat the UA [hidden] rule */
+
+/* instrument cluster — one card per GPU, the live readout is the focal point */
+.instruments { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+.inst {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 16px; display: grid; grid-template-columns: auto 1fr; gap: 4px 18px; align-items: start;
+}
+.inst-head { grid-column: 1 / -1; display: flex; align-items: baseline; gap: 10px; margin-bottom: 4px; }
+.inst-name { font-size: 16px; font-weight: 700; }
+.inst-idx { color: var(--muted); font: 12px var(--mono); }
+.inst-temp {
+  font: 700 52px/1 var(--mono); letter-spacing: -1px; font-variant-numeric: tabular-nums;
+  grid-row: span 3; align-self: center;
+}
+.inst-temp .unit { font-size: 20px; color: var(--muted); font-weight: 400; }
+.inst-temp.hot { color: var(--trace-hotspot); }
+.inst-temp.crit { color: var(--bad); }
+.readouts { display: grid; grid-template-columns: 1fr 1fr; gap: 6px 16px; align-self: center; }
+.ro { display: flex; flex-direction: column; }
+.ro-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .4px; }
+.ro-val { font: 700 16px var(--mono); font-variant-numeric: tabular-nums; }
+.ro-val .dim { color: var(--muted); font-weight: 400; font-size: 12px; }
+.ro-val .swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; }
+.inst-vram { grid-column: 1 / -1; margin-top: 10px; }
+.inst-vram .vram-bar { width: 100%; height: 10px; }
+.inst-vram-text { display: flex; justify-content: space-between; color: var(--muted); font: 12px var(--mono); margin-bottom: 5px; }
+.inst-spark { grid-column: 1 / -1; margin-top: 12px; }
+.inst-spark canvas { width: 100%; height: 46px; display: block; }
+
+/* chart board controls */
+.board-head { display: flex; flex-wrap: wrap; gap: 12px; justify-content: space-between; align-items: center; margin: 24px 0 14px; }
+.seg { display: inline-flex; background: var(--panel2); border: 1px solid var(--line); border-radius: 9px; padding: 2px; }
+.seg-btn {
+  background: transparent; color: var(--muted); border: 0; border-radius: 7px;
+  padding: 6px 13px; font: 700 13px/1 inherit; cursor: pointer;
+}
+.seg-btn:hover { color: var(--ink); }
+.seg-btn.active { background: var(--accent); color: #0b1020; }
+#window-seg .seg-btn { font-family: var(--mono); }
+.seg-btn:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+
+/* the charts themselves — the signature element */
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(440px, 1fr)); gap: 16px; }
+.chart {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px 10px;
+}
+.chart-head { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; margin-bottom: 8px; }
+.chart-title { font-weight: 700; font-size: 14px; }
+.chart-legend { display: flex; gap: 12px; flex-wrap: wrap; color: var(--muted); font: 11px var(--mono); }
+.chart-legend span { display: inline-flex; align-items: center; gap: 5px; }
+.chart-legend i { width: 12px; height: 2px; border-radius: 2px; display: inline-block; }
+.chart canvas { width: 100%; height: 200px; display: block; }
+.chart-empty { color: var(--muted); font-size: 12px; padding: 70px 0; text-align: center; }
+.monitor-note { color: var(--muted); font: 12px var(--mono); margin-top: 14px; min-height: 1em; }
+@media (max-width: 720px) { .charts { grid-template-columns: 1fr; } .inst-temp { font-size: 44px; } }

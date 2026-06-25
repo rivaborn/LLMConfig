@@ -9,22 +9,52 @@
 <body>
   <header>
     <div class="brand">LLM<span>Config</span></div>
-    <p class="hint header-hint">Each GPU lane runs one model at a time (Ollama ⇄ vLLM); lanes are independent.</p>
+    <nav class="tabs" role="tablist" aria-label="Views">
+      <button class="tab active" data-view="control" role="tab" aria-selected="true">Control</button>
+      <button class="tab" data-view="monitor" role="tab" aria-selected="false">Monitor</button>
+    </nav>
     <details class="keybox">
       <summary>⚙</summary>
       <label>API key <input id="apikey" type="password" placeholder="X-API-Key (if set)" /></label>
     </details>
   </header>
 
-  <main>
-    <div id="lanes" class="lanes"></div>
-
+  <main id="view-control" class="view active" role="tabpanel">
+    <div class="control-main">
+      <p class="hint">Each GPU lane runs one model at a time (Ollama ⇄ vLLM); lanes are independent.</p>
+      <div id="lanes" class="lanes"></div>
+    </div>
     <aside class="activity">
       <h2>Activity</h2>
       <pre id="log" class="log">idle</pre>
     </aside>
   </main>
 
+  <section id="view-monitor" class="view" role="tabpanel" hidden>
+    <div id="offload-banner" class="offload-banner" hidden></div>
+
+    <div id="instruments" class="instruments"></div>
+
+    <div class="board-head">
+      <div class="seg" id="metric-seg" role="group" aria-label="Metric">
+        <button class="seg-btn active" data-metric="temp">Temperature</button>
+        <button class="seg-btn" data-metric="power">Power</button>
+        <button class="seg-btn" data-metric="vram">VRAM</button>
+        <button class="seg-btn" data-metric="llm">LLM split</button>
+      </div>
+      <div class="seg" id="window-seg" role="group" aria-label="Time window">
+        <button class="seg-btn" data-window="3600">1h</button>
+        <button class="seg-btn active" data-window="14400">4h</button>
+        <button class="seg-btn" data-window="43200">12h</button>
+        <button class="seg-btn" data-window="86400">24h</button>
+      </div>
+    </div>
+
+    <div id="charts" class="charts"></div>
+    <p id="monitor-note" class="monitor-note"></p>
+  </section>
+
   <script src="/static/app.js" defer></script>
+  <script src="/static/monitor.js" defer></script>
 </body>
 </html>
