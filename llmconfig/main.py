@@ -86,9 +86,21 @@ def create_app() -> FastAPI:
     @app.get("/", response_class=HTMLResponse)
     async def index() -> HTMLResponse:
         idx = WEB_DIR / "templates" / "index.html"
-        if idx.is_file():
-            return HTMLResponse(idx.read_text(encoding="utf-8"))
-        return HTMLResponse("<h1>LLMConfig</h1><p>UI not installed; use the REST API at /docs.</p>")
+        if not idx.is_file():
+            return HTMLResponse("<h1>LLMConfig</h1><p>UI not installed; use the REST API at /docs.</p>")
+        html = idx.read_text(encoding="utf-8")
+        # Cache-bust the static assets: StaticFiles sends no Cache-Control, so
+        # browsers heuristically serve a stale style.css/app.js after a redeploy
+        # (the tab rules would be missing → views stack). Tag each asset URL with
+        # the newest static-file mtime so a changed file always fetches fresh.
+        try:
+            token = str(int(max(p.stat().st_mtime for p in (WEB_DIR / "static").glob("*.*"))))
+        except (ValueError, OSError):
+            token = __version__
+        for asset in ("style.css", "app.js", "monitor.js"):
+            html = html.replace(f"/static/{asset}\"", f"/static/{asset}?v={token}\"")
+        # Always revalidate the HTML itself so new tokens are picked up.
+        return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
     @app.get("/api/status", response_model=StatusResponse)
     async def api_status() -> StatusResponse:
