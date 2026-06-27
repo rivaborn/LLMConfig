@@ -302,6 +302,24 @@ case "$ALIAS" in
       --tokenizer-mode mistral \
       --enable-auto-tool-choice --tool-call-parser mistral
     ;;
+  surya2)
+    # Surya 2 OCR VLM (Qwen3_5ForConditionalGeneration) — datalab's purpose-built OCR
+    # model, used by the epubocr pipeline as its default engine. epubocr points
+    # SURYA_INFERENCE_URL at this relay; the served name must equal its
+    # SURYA_MODEL_CHECKPOINT (epubocr sets surya-ocr-2). Args mirror surya's own vllm
+    # backend: bf16, max-model-len 18000, Qwen-style image-tiling pixel bounds. Small
+    # (~3 GB bf16) so KV room is ample on the 3090. vLLM's default logprobs provide the
+    # per-block confidence epubocr's conf-floor relies on.
+    exec vllm serve datalab-to/surya-ocr-2 \
+      --host "$HOST" \
+      --port "$PORT" \
+      --served-model-name surya-ocr-2 \
+      --max-model-len 18000 \
+      --dtype bfloat16 \
+      --gpu-memory-utilization 0.85 \
+      --mm-processor-kwargs '{"min_pixels":3136,"max_pixels":6291456}' \
+      --enable-prefix-caching
+    ;;
   ""|-h|--help)
     cat <<USAGE
 serve.sh — start a vLLM OpenAI-compatible server on port \$PORT (default 8000).
@@ -318,6 +336,7 @@ Fits single 3090 (24 GB) no offload:
   coder30-awq   Qwen3-Coder-30B-A3B-AWQ        (MoE, ~17 GB, auto-DLs)
   q36-27b       Qwen3.6-27B-AWQ                (hybrid, ~20 GB)
   devstral      Devstral-Small-2507-AWQ        (~13 GB, mistral tokenizer)
+  surya2        datalab-to/surya-ocr-2         (OCR VLM for epubocr, ~3 GB bf16)
 
 Needs CPU offload (slower, uses WSL RAM):
   q36-moe       Qwen3.6-35B-A3B-AWQ            (MoE hybrid, ~24 GB, ~6 GB offload)
