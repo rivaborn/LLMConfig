@@ -95,6 +95,25 @@ WSL-keepalive of `/api/load`. Concurrent identical loads coalesce onto one job; 
 non-stream request that arrives mid-load of a *different* model returns an empty 200
 (so title-gen never blocks for minutes). LAN-only, like the other endpoints.
 
+## Context size (Ollama)
+
+`/api/load` (and the OpenAI gateway's auto-load) do **not** take a context-length
+parameter -- an Ollama model is loaded at the `num_ctx` baked into its Modelfile.
+`OllamaBackend.load` sets only `keep_alive` and an optional `num_gpu`, so the KV
+cache -- and therefore the VRAM footprint -- is fixed by the *tag* you load, not
+by the caller. To run a model at a smaller context (to leave VRAM headroom on the
+24 GB card), bake a context-specific tag instead of trying to pass an option:
+
+    # Modelfile:  FROM <model>  +  PARAMETER num_ctx 65536
+    ollama create <model>-64k -f Modelfile   # reuses the existing weights blob
+    llmconfig load ollama <model>-64k        # POST /api/load {server:ollama,model:<model>-64k}
+
+A raw per-request `num_ctx` (Ollama `/api/chat` `options.num_ctx`) is honored by
+Ollama directly, but it forces an unload+reload whenever it differs from the
+currently-loaded context -- so a model loaded via LLMConfig and then hit with a
+differently-sized request will reload. Loading the matching baked tag avoids the
+churn and keeps the pre-flight load and inference at the same VRAM footprint.
+
 ## Status
 **Live-verified on `.40` (2026-06-17).** `doctor --local` is green; both paths
 were exercised end-to-end on the RTX 3090: Ollama load/unload, and a vLLM load
