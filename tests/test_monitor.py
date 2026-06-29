@@ -88,3 +88,41 @@ async def test_monitor_snapshot_and_history(monkeypatch):
     assert len(hist["gpus"][1]["series"]["junction"]) == 1
     assert len(hist["gpus"][0]["series"]["junction"]) == 0  # none recorded for the 3070 Ti
     assert len(hist["ollama"]["gpu_pct"]) == 1
+
+
+async def test_monitor_persists_across_restart(tmp_path, monkeypatch):
+    async def fake_metrics(settings=None):
+        return [
+            GpuMetric(0, G3070, "RTX 3070 Ti", 73.0, 36.7, 0.0, 8192, 11, 8181),
+            GpuMetric(1, G3090, "RTX 3090", 51.0, 117.0, 95.0, 24576, 22488, 2088),
+        ]
+
+    def fake_channels(index):
+        return {"hotspot": 66.0, "memory": 64.0} if index == 1 else {"hotspot": 84.0}
+
+    monkeypatch.setattr(monitor, "sample_gpu_metrics", fake_metrics)
+    monkeypatch.setattr(monitor.nvapi, "read_thermal_channels", fake_channels)
+
+    running = [{"name": "qwen3.6:27b-96k", "size": 100, "size_vram": 88}]
+    db = tmp_path / "monitor.db"
+    s = Settings(_env_file=None, monitor_db_path=db)
+
+    # First instance: open DB, sample once, shut down (flushes + closes).
+    m1 = Monitor(s, _FakeOrch(running))
+    m1._open_db()
+    m1._load_history()
+    await m1._sample_once()
+    await m1.stop()
+    assert db.exists()
+
+    # Fresh instance against the same DB rehydrates the deques from disk.
+    m2 = Monitor(s, _FakeOrch(running))
+    m2._open_db()
+    m2._load_history()
+    snap = m2.snapshot()
+    assert [g["uuid"] for g in snap["gpus"]] == [G3070, G3090]  # index order preserved
+    g3090 = snap["gpus"][1]
+    assert g3090["temp_c"] == 51.0 and g3090["hotspot_c"] == 66.0 and g3090["junction_c"] == 64.0
+    assert snap["ollama"]["spilled"] is True and snap["ollama"]["cpu_pct"] == 12.0
+    assert len(m2._gpus[G3090].points) == 1
+    await m2.stop()

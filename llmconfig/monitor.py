@@ -2,9 +2,11 @@
 
 A background asyncio task samples every visible GPU (core/hotspot/junction temp,
 power, utilization, VRAM) plus the primary Ollama lane's GPU-vs-CPU split, and
-keeps a rolling in-memory history (no DB, no extra dependency). The original
-`nmon` TUI did the same with SQLite; here the window is small enough to live in
-deques and is naturally disposable — it rebuilds the moment the app restarts.
+keeps a rolling in-memory history in deques. Like the original `nmon` TUI, samples
+are also persisted to a small SQLite DB (`monitor_db_path`), so the history window
+survives an app/service restart instead of rebuilding from empty: on `start()` the
+last `retention_h` of rows are loaded back into the deques. Persistence is
+best-effort — a DB failure disables it and the collector keeps running in-memory.
 
 Sources:
   * nvidia-smi (via gpu.sample_gpu_metrics) — core temp, power, util, memory.
@@ -16,8 +18,11 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import sqlite3
+import threading
 import time
 from collections import deque
+from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 from . import nvapi
@@ -30,8 +35,24 @@ if TYPE_CHECKING:
 log = logging.getLogger(__name__)
 
 # A GPU history point: (ts, temp, hotspot, junction, power, util, mem_used_mb).
-# An Ollama point: (ts, gpu_pct, cpu_pct).
+# An Ollama point: (ts, gpu_pct, cpu_pct, model, running).
 _HISTORY_BUCKETS = 180  # max points returned per series; peak-per-bucket keeps spikes
+_PRUNE_EVERY = 60       # prune the on-disk window once per this many writes
+
+_SCHEMA = """
+CREATE TABLE IF NOT EXISTS gpu_meta (
+    uuid TEXT PRIMARY KEY, idx INTEGER, name TEXT, mem_total_mb INTEGER
+);
+CREATE TABLE IF NOT EXISTS gpu_samples (
+    ts REAL, uuid TEXT, temp REAL, hotspot REAL, junction REAL,
+    power REAL, util REAL, mem_used_mb INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_gpu_samples_ts ON gpu_samples(ts);
+CREATE TABLE IF NOT EXISTS ollama_samples (
+    ts REAL, gpu_pct REAL, cpu_pct REAL, model TEXT, running INTEGER
+);
+CREATE INDEX IF NOT EXISTS ix_ollama_samples_ts ON ollama_samples(ts);
+"""
 
 
 class GpuTrack:
@@ -58,11 +79,24 @@ class Monitor:
         self._stop = asyncio.Event()
         self._last_error = ""
         self._last_sample_ts = 0.0
+        # persistence (best-effort SQLite; None when disabled or unavailable)
+        self._persist = bool(settings.monitor_persist)
+        self._db_path = Path(settings.monitor_db_path)
+        self._db: Optional[sqlite3.Connection] = None
+        self._db_lock = threading.Lock()
+        self._writes = 0
 
     # ---- lifecycle ----
     def start(self) -> None:
         if not self.s.monitor_enabled or self._task is not None:
             return
+        if self._persist:
+            try:
+                self._open_db()
+                self._load_history()
+            except Exception as e:  # noqa: BLE001 — never let persistence block startup
+                log.warning("monitor persistence disabled (%s): %s", type(e).__name__, e)
+                self._db = None
         self._stop.clear()
         self._task = asyncio.create_task(self._loop(), name="monitor-sampler")
 
@@ -75,6 +109,86 @@ class Monitor:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001 — best-effort shutdown
                 pass
             self._task = None
+        if self._db is not None:
+            try:
+                with self._db_lock:
+                    self._db.commit()
+                    self._db.close()
+            except Exception:  # noqa: BLE001
+                pass
+            self._db = None
+
+    # ---- persistence ----
+    def _open_db(self) -> None:
+        self._db_path.parent.mkdir(parents=True, exist_ok=True)
+        db = sqlite3.connect(str(self._db_path), check_same_thread=False)
+        db.execute("PRAGMA journal_mode=WAL")
+        db.execute("PRAGMA synchronous=NORMAL")
+        db.executescript(_SCHEMA)
+        db.commit()
+        self._db = db
+
+    def _load_history(self) -> None:
+        """Rehydrate the deques from the retained on-disk window (newest restart)."""
+        if self._db is None:
+            return
+        now = time.time()
+        cutoff = now - self.retention_s
+        with self._db_lock:
+            self._db.execute("DELETE FROM gpu_samples WHERE ts < ?", (cutoff,))
+            self._db.execute("DELETE FROM ollama_samples WHERE ts < ?", (cutoff,))
+            self._db.commit()
+            meta = self._db.execute(
+                "SELECT uuid, idx, name, mem_total_mb FROM gpu_meta").fetchall()
+            order = sorted(meta, key=lambda r: r[1] if r[1] is not None else 1 << 30)
+            for uuid, idx, name, mem_total in order:
+                self._gpus[uuid] = GpuTrack(idx or 0, uuid, name or "", mem_total or 0)
+            self._order = [r[0] for r in order]
+            for uuid in self._order:
+                rows = self._db.execute(
+                    "SELECT ts,temp,hotspot,junction,power,util,mem_used_mb "
+                    "FROM gpu_samples WHERE uuid=? AND ts>=? ORDER BY ts",
+                    (uuid, cutoff)).fetchall()
+                self._gpus[uuid].points.extend(tuple(r) for r in rows)
+            orows = self._db.execute(
+                "SELECT ts,gpu_pct,cpu_pct,model,running FROM ollama_samples "
+                "WHERE ts>=? ORDER BY ts", (cutoff,)).fetchall()
+            self._ollama.extend(
+                (ts, gp, cp, model or "", bool(run)) for ts, gp, cp, model, run in orows)
+
+    def _persist_sample(self, now: float, gpu_rows: list[tuple],
+                        ollama_row: Optional[tuple]) -> None:
+        """Append this tick's rows; prune the on-disk window periodically.
+
+        `gpu_rows`: (uuid, idx, name, mem_total, temp, hotspot, junction, power,
+        util, mem_used). Runs in a worker thread — never touches the deques."""
+        if self._db is None:
+            return
+        try:
+            with self._db_lock:
+                self._db.executemany(
+                    "INSERT OR REPLACE INTO gpu_meta(uuid,idx,name,mem_total_mb) "
+                    "VALUES(?,?,?,?)",
+                    [(r[0], r[1], r[2], r[3]) for r in gpu_rows])
+                self._db.executemany(
+                    "INSERT INTO gpu_samples"
+                    "(ts,uuid,temp,hotspot,junction,power,util,mem_used_mb) "
+                    "VALUES(?,?,?,?,?,?,?,?)",
+                    [(now, r[0], r[4], r[5], r[6], r[7], r[8], r[9]) for r in gpu_rows])
+                if ollama_row is not None:
+                    self._db.execute(
+                        "INSERT INTO ollama_samples(ts,gpu_pct,cpu_pct,model,running) "
+                        "VALUES(?,?,?,?,?)",
+                        (ollama_row[0], ollama_row[1], ollama_row[2],
+                         ollama_row[3], int(bool(ollama_row[4]))))
+                self._writes += 1
+                if self._writes % _PRUNE_EVERY == 0:
+                    cutoff = now - self.retention_s
+                    self._db.execute("DELETE FROM gpu_samples WHERE ts < ?", (cutoff,))
+                    self._db.execute("DELETE FROM ollama_samples WHERE ts < ?", (cutoff,))
+                self._db.commit()
+        except Exception as e:  # noqa: BLE001 — a persist hiccup must never kill the loop
+            log.debug("monitor persist failed: %s", e)
 
     async def _loop(self) -> None:
         while not self._stop.is_set():
@@ -98,6 +212,7 @@ class Monitor:
             self._last_error = ""
             self._last_sample_ts = now
         order: list[str] = []
+        gpu_rows: list[tuple] = []
         for m in metrics:
             order.append(m.uuid)
             track = self._gpus.get(m.uuid)
@@ -113,14 +228,21 @@ class Monitor:
             except Exception:  # noqa: BLE001
                 channels = None
             channels = channels or {}
+            hotspot, junction = channels.get("hotspot"), channels.get("memory")
             track.points.append((
-                now, m.temp_c, channels.get("hotspot"), channels.get("memory"),
+                now, m.temp_c, hotspot, junction,
                 m.power_w, m.util_pct, m.mem_used_mb,
             ))
             self._prune(track.points, now)
+            gpu_rows.append((m.uuid, m.index, m.name, track.mem_total_mb,
+                             m.temp_c, hotspot, junction, m.power_w, m.util_pct,
+                             m.mem_used_mb))
         if order:
             self._order = order
         await self._sample_ollama(now)
+        if self._db is not None:
+            ollama_row = self._ollama[-1] if self._ollama else None
+            await asyncio.to_thread(self._persist_sample, now, gpu_rows, ollama_row)
 
     async def _sample_ollama(self, now: float) -> None:
         """Primary lane's Ollama GPU/CPU split (size_vram / size)."""

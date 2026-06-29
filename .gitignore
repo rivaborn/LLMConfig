@@ -21,6 +21,8 @@ env/
 /data/vllm_models_companion.yaml
 # Runtime-generated per-lane default-model state (set via UI/CLI).
 /data/lane_defaults.yaml
+# Monitor-tab telemetry history (SQLite + WAL sidecars).
+/data/monitor.db*
 
 # Editor / OS
 .vscode/

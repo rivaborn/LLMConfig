@@ -87,7 +87,11 @@ class Settings(BaseSettings):
     # --- monitoring (the Monitor tab: thermals/power/VRAM history) ---
     monitor_enabled: bool = True
     monitor_interval_s: float = 5.0   # GPU sample cadence
-    monitor_retention_h: int = 24     # in-memory history window
+    monitor_retention_h: int = 24     # history window (in-memory + on-disk)
+    # Persist samples to SQLite so the history survives an app/service restart.
+    # When false, history is in-memory only (lost on restart, as before).
+    monitor_persist: bool = True
+    monitor_db_path: Path = REPO_ROOT / "data" / "monitor.db"
 
     # --- HuggingFace (vLLM downloads) ---
     hf_token: str = ""
