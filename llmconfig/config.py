@@ -93,6 +93,16 @@ class Settings(BaseSettings):
     monitor_persist: bool = True
     monitor_db_path: Path = REPO_ROOT / "data" / "monitor.db"
 
+    # --- idle auto-unload (power: reap an idle lane so the card drops to P8) ---
+    # A resident model pins the card in P0 (~117 W on the 3090); unloading lets it
+    # fall to its ~25 W P8 idle. Activity = a /v1 gateway request, a load finishing,
+    # or a Monitor utilization sample above the threshold (the last catches clients
+    # that talk to Ollama / the vLLM relay directly, bypassing the gateway).
+    idle_unload_enabled: bool = True
+    idle_unload_after_min: float = 15.0       # sustained inactivity before reaping
+    idle_unload_check_interval_s: float = 60.0
+    idle_unload_util_pct: float = 5.0         # util above this counts as activity
+
     # --- HuggingFace (vLLM downloads) ---
     hf_token: str = ""
 

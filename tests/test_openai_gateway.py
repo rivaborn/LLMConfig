@@ -233,6 +233,24 @@ async def test_cold_load_streams_progress_then_forwards(monkeypatch, tmp_path):
     assert any(":11437" in u for u in captured)
 
 
+async def test_gateway_request_touches_lane(monkeypatch, tmp_path):
+    # A /v1 request must reset the lane's idle-unload window (Lane.touch), so the
+    # idle reaper never counts gateway traffic as inactivity.
+    import time
+
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    world.vllm = "qwen3-coder-30b"
+    world.used_mb = 16000
+    lane = orch.primary
+    lane.last_activity = time.time() - 3600  # backdated: an hour "idle"
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions",
+                         json={"model": "qwen3-coder-30b", "stream": False,
+                               "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    assert time.time() - lane.last_activity < 60, "the request must advance last_activity"
+
+
 async def test_nonstream_shortcircuits_during_a_different_load(monkeypatch, tmp_path):
     app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
     lane = orch.primary

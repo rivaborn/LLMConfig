@@ -213,6 +213,29 @@ in rolling in-memory deques **and** a best-effort SQLite DB (`data/monitor.db`),
 history window survives an app/service restart. Persistence failures degrade to
 in-memory only — they never take down the sampler.
 
+## Idle auto-unload (power saving)
+
+A resident model pins the card in the **P0** power state — memory clocks never drop, so
+the 3090 draws **~117 W doing nothing** instead of its ~25 W **P8** idle. Neither server
+lets go on its own (LLMConfig loads Ollama with `keep_alive:-1`; vLLM never
+auto-unloads), so a background **idle reaper** (`llmconfig/idle.py`, on by default)
+unloads a lane after `IDLE_UNLOAD_AFTER_MIN` minutes (default 15) with no observed
+activity, letting the card fall to P8.
+
+**Activity** is any of: a `/v1` gateway request routed to the lane, a load finishing, or
+a Monitor **utilization sample above `IDLE_UNLOAD_UTIL_PCT`** (default 5 %) on the
+lane's GPU — the util signal catches clients that hit Ollama or the vLLM relay directly,
+bypassing the gateway. Each lane's seconds-since-activity is reported as `idle_s` in
+`GET /api/status` → `lanes[]`.
+
+Reaping goes through the same per-lane unload path as `POST /api/unload` (lane lock +
+eviction-wait gate), and a reaped model returns hands-free: the next `/v1` request
+auto-loads it (direct-Ollama clients reload through Ollama itself). When no lane serves
+vLLM anymore the reaper also releases the WSL keepalive so the WSL2 distro can
+idle-shutdown; the next vLLM load restarts it. Set `IDLE_UNLOAD_ENABLED=false` to keep
+models pinned. If the lane's GPU also renders a desktop, background compositing can
+register as activity — raise `IDLE_UNLOAD_UTIL_PCT`.
+
 ## Context size (Ollama)
 
 `/api/load` (and the `/v1` auto-load) do **not** take a context-length parameter — an
@@ -291,6 +314,7 @@ llmconfig/
   gpu.py            nvidia-smi truth (by UUID) + Monitor metric sampling
   nvapi.py          NVAPI hotspot + GDDR6X junction temps (ctypes)
   monitor.py        telemetry sampler + SQLite history
+  idle.py           idle auto-unload policy (reap an unused lane → GPU drops to P8)
   registry.py       vLLM alias catalog (YAML)
   schemas.py        pydantic models
   jobs.py           async job manager (streamed logs)

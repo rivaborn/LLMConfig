@@ -16,6 +16,7 @@ from . import __version__
 from . import doctor as doctor_mod
 from .config import PACKAGE_DIR, get_settings
 from .gpu import query_gpu
+from .idle import IdleReaper
 from .jobs import JobManager
 from .monitor import Monitor
 from .openai_gateway import OpenAIGateway, build_gateway_router
@@ -42,13 +43,16 @@ def create_app() -> FastAPI:
     orch = Orchestrator(settings, registry, jobs)
     gateway = OpenAIGateway(orch, jobs, settings)
     monitor = Monitor(settings, orch)
+    reaper = IdleReaper(settings, orch, monitor)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
         # Auto-load each lane's configured default model (fire-and-forget Jobs).
         orch.autoload_defaults()
         monitor.start()  # begin sampling GPU/LLM telemetry for the Monitor tab
+        reaper.start()   # idle auto-unload policy (reads the monitor's util samples)
         yield
+        await reaper.stop()  # before the monitor: the reaper reads its samples
         await monitor.stop()
         # Release the WSL keepalive so the distro can idle-shut-down cleanly when
         # the control app stops (an already-loaded vLLM model goes with it).
@@ -64,6 +68,7 @@ def create_app() -> FastAPI:
     app.state.orch = orch
     app.state.gateway = gateway
     app.state.monitor = monitor
+    app.state.reaper = reaper
 
     async def require_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         if settings.auth_enabled and x_api_key != settings.llmconfig_api_key:

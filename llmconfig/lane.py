@@ -53,6 +53,15 @@ class Lane:
         )
         self._lock = asyncio.Lock()
         self._active_job_id: Optional[str] = None
+        # Idle-reaper input: wall-clock of the last observed activity (gateway
+        # request, load completion, or a Monitor util spike). Construction time =
+        # app start, so an autoloaded default gets a full idle window before reaping.
+        self.last_activity: float = time.time()
+
+    def touch(self, ts: float | None = None) -> None:
+        """Record lane activity for the idle reaper. Never moves the clock backwards,
+        so a stale Monitor sample can't shorten the idle window."""
+        self.last_activity = max(self.last_activity, time.time() if ts is None else ts)
 
     async def _gpu(self) -> GpuInfo:
         """This lane's card only (by UUID) — never the other lane's."""
@@ -115,6 +124,7 @@ class Lane:
             gpu=GpuOut.from_info(gpu),
             swap_in_progress=self._lock.locked(),
             active_job_id=self._active_job_id,
+            idle_s=round(max(0.0, time.time() - self.last_activity), 1),
         )
 
     # ------------------------------------------------------------------ #
@@ -134,6 +144,7 @@ class Lane:
                     return await self._load_vllm(job, req)
                 finally:
                     self._active_job_id = None
+                    self.touch()  # a load (even a failed one) restarts the idle window
 
         return self.jobs.start(job, body)
 

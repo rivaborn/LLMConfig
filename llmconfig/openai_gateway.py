@@ -205,7 +205,23 @@ class OpenAIGateway:
         return False, f"load did not finish within {int(timeout)}s"
 
     async def _stream_load_then_forward(self, job_id: Optional[str], backend: str, sub_path: str,
-                                        body: dict, model: str, headers, is_chat: bool):
+                                        body: dict, model: str, headers, is_chat: bool,
+                                        lane: Optional[Lane] = None):
+        """Wrapper that marks the lane active when the stream finishes (however it
+        ends), so a generation longer than the idle timeout isn't reaped mid-answer
+        even when the Monitor's util signal is unavailable."""
+        try:
+            async for chunk in self._stream_load_then_forward_inner(
+                job_id, backend, sub_path, body, model, headers, is_chat
+            ):
+                yield chunk
+        finally:
+            if lane is not None:
+                lane.touch()
+
+    async def _stream_load_then_forward_inner(self, job_id: Optional[str], backend: str,
+                                              sub_path: str, body: dict, model: str,
+                                              headers, is_chat: bool):
         created = int(time.time())
         cid = ("chatcmpl-" if is_chat else "cmpl-") + uuid.uuid4().hex[:12]
         emitted = 0
@@ -261,6 +277,7 @@ class OpenAIGateway:
                                     "type": "invalid_request_error", "code": "model_not_found"}},
             )
         server, load_arg, backend = resolved
+        lane.touch()  # inference traffic on this lane — reset the idle-unload window
 
         # Fast path: the lane already serves exactly this model → forward, no load.
         status = await lane.status()
@@ -268,10 +285,12 @@ class OpenAIGateway:
             if stream:
                 return StreamingResponse(
                     self._stream_load_then_forward(None, backend, sub_path, body, model,
-                                                   request.headers, is_chat),
+                                                   request.headers, is_chat, lane=lane),
                     media_type="text/event-stream",
                 )
-            return await self.forward(backend, sub_path, body, request.headers)
+            resp = await self.forward(backend, sub_path, body, request.headers)
+            lane.touch()  # generation finished — a long answer shouldn't count as idle time
+            return resp
 
         # Need to load (cold / wrong model). Coalesce onto an identical in-flight load.
         target_kind = f"load:{lane.cfg.id}:{server}:{load_arg}"
@@ -280,7 +299,7 @@ class OpenAIGateway:
         if stream:
             return StreamingResponse(
                 self._stream_load_then_forward(job.id if job else None, backend, sub_path, body,
-                                               model, request.headers, is_chat),
+                                               model, request.headers, is_chat, lane=lane),
                 media_type="text/event-stream",
             )
 
@@ -301,7 +320,9 @@ class OpenAIGateway:
                 content={"error": {"message": f"failed to load '{model}': {err}",
                                     "type": "server_error", "code": "model_load_failed"}},
             )
-        return await self.forward(backend, sub_path, body, request.headers)
+        resp = await self.forward(backend, sub_path, body, request.headers)
+        lane.touch()  # generation finished — a long answer shouldn't count as idle time
+        return resp
 
     async def models(self, request: Request) -> dict:
         lane = self.lane(request.headers.get("x-llm-lane") or "primary")

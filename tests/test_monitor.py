@@ -90,6 +90,31 @@ async def test_monitor_snapshot_and_history(monkeypatch):
     assert len(hist["ollama"]["gpu_pct"]) == 1
 
 
+async def test_last_util_activity(monkeypatch):
+    async def fake_metrics(settings=None):
+        return [
+            GpuMetric(0, G3070, "RTX 3070 Ti", 73.0, 36.7, 0.0, 8192, 11, 8181),
+            GpuMetric(1, G3090, "RTX 3090", 51.0, 117.0, 95.0, 24576, 22488, 2088),
+        ]
+
+    monkeypatch.setattr(monitor, "sample_gpu_metrics", fake_metrics)
+    monkeypatch.setattr(monitor.nvapi, "read_thermal_channels", lambda i: {})
+
+    mon = Monitor(Settings(_env_file=None), _FakeOrch([]))
+    before = time.time()
+    await mon._sample_once()
+
+    # busy 3090 (util 95) → the sample ts comes back as activity
+    ts = mon.last_util_activity(G3090, threshold=5.0, since=before - 60)
+    assert ts is not None and ts >= before
+    # ...but not when `since` is at/after the sample, or the threshold exceeds it
+    assert mon.last_util_activity(G3090, threshold=5.0, since=ts) is None
+    assert mon.last_util_activity(G3090, threshold=99.0, since=before - 60) is None
+    # idle 3070 Ti (util 0) and an unseen UUID → no activity
+    assert mon.last_util_activity(G3070, threshold=5.0, since=before - 60) is None
+    assert mon.last_util_activity("GPU-nope", threshold=5.0, since=before - 60) is None
+
+
 async def test_monitor_persists_across_restart(tmp_path, monkeypatch):
     async def fake_metrics(settings=None):
         return [

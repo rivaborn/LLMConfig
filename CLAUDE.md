@@ -66,6 +66,10 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 - `monitor.py` — `Monitor`: background asyncio sampler → rolling in-memory deques +
   **best-effort SQLite** persistence (`data/monitor.db`) so history survives a restart.
   Backs the Monitor tab and `/api/monitor*`.
+- `idle.py` — `IdleReaper`: background idle auto-unload policy. Reaps a lane after
+  `idle_unload_after_min` of no activity (gateway request / load completion / Monitor
+  util spike) so the card drops to P8, and releases the WSL keepalive when no lane
+  serves vLLM.
 - `registry.py` — `Registry`: the editable vLLM **alias catalog** (YAML at
   `data/vllm_models.yaml`, seeded from the package default). vLLM can't enumerate what
   it *could* serve, so this is that list.
@@ -96,6 +100,9 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    (that would cross-kill the other lane's vLLM when both GPUs serve). Keep it scoped.
 3. **The eviction-wait gate is the contract.** Any new load path must evict + confirm
    VRAM freed (`_wait_vram_free`) before loading. Don't add a load that skips it.
+   Likewise the idle reaper (`idle.py`) unloads **only** through `Lane.unload` (lane
+   lock + eviction-wait) — never give it (or any future policy) a private unload path,
+   and only release the WSL keepalive when no lane serves vLLM and no lane lock is held.
 4. **Hold WSL open around vLLM.** WSL2 idle-shuts-down the whole distro ~seconds after
    the last `wsl.exe` exits, killing a just-loaded vLLM model *and* the relay — even
    with lingering. A vLLM load calls `keepalive.ensure()`; the app releases it on

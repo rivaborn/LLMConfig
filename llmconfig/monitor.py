@@ -266,6 +266,26 @@ class Monitor:
             dq.popleft()
 
     # ---- read API ----
+    def last_util_activity(self, uuid: str, threshold: float, since: float) -> float | None:
+        """Newest sample ts for `uuid` with util_pct > threshold and ts > since, else None.
+
+        The idle reaper's utilization signal: scans the deque tail newest-first and
+        stops at `since`, so each reaper tick only touches the points added since the
+        previous one (~12/min at the 5 s cadence). Returns None when the monitor is
+        disabled, the UUID was never sampled, or util read N/A — the reaper then runs
+        on gateway/load timestamps alone.
+        """
+        track = self._gpus.get(uuid)
+        if track is None:
+            return None
+        for p in reversed(track.points):
+            if p[0] <= since:
+                return None
+            util = p[5]
+            if util is not None and util > threshold:
+                return p[0]
+        return None
+
     def snapshot(self) -> dict:
         """Latest reading per GPU + rolling aggregates + Ollama split."""
         now = time.time()

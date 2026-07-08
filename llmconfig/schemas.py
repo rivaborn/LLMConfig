@@ -129,6 +129,7 @@ class LaneStatus(BaseModel):
     gpu: GpuOut
     swap_in_progress: bool = False
     active_job_id: Optional[str] = None
+    idle_s: Optional[float] = None  # seconds since last observed activity (idle-reaper input)
 
 
 class StatusResponse(BaseModel):
