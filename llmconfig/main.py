@@ -16,7 +16,7 @@ from . import __version__
 from . import doctor as doctor_mod
 from .config import PACKAGE_DIR, get_settings
 from .gpu import query_gpu
-from .idle import IdleReaper
+from .idle import IdleReaper, classify_usage
 from .jobs import JobManager
 from .monitor import Monitor
 from .openai_gateway import OpenAIGateway, build_gateway_router
@@ -25,10 +25,12 @@ from .registry import make_registry
 from .schemas import (
     GpuOut,
     Job,
+    LaneUsageOut,
     LoadRequest,
     ModelsResponse,
     StatusResponse,
     UnloadRequest,
+    UsageResponse,
     VllmAliasEntry,
 )
 from .wsl import run_wsl
@@ -82,6 +84,19 @@ def create_app() -> FastAPI:
         except KeyError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
+    def _current_util(uuid: str) -> Optional[float]:
+        """The Monitor's latest utilization sample for one GPU (None when unmonitored)."""
+        for g in monitor.snapshot().get("gpus", []):
+            if g.get("uuid") == uuid:
+                return g.get("util_pct")
+        return None
+
+    async def _status_with_usage() -> StatusResponse:
+        resp = await orch.status()
+        for ls in resp.lanes:
+            ls.usage = classify_usage(ls, _current_util(orch.lane(ls.id).cfg.gpu_uuid), settings)
+        return resp
+
     if (WEB_DIR / "static").is_dir():
         app.mount("/static", StaticFiles(directory=str(WEB_DIR / "static")), name="static")
 
@@ -109,7 +124,28 @@ def create_app() -> FastAPI:
 
     @app.get("/api/status", response_model=StatusResponse)
     async def api_status() -> StatusResponse:
-        return await orch.status()
+        return await _status_with_usage()
+
+    @app.get("/api/usage", response_model=UsageResponse)
+    async def api_usage(lane: str = "primary") -> UsageResponse:
+        """Compact per-lane tri-state: free (nothing loaded) / idle (model loaded,
+        unused) / active (model loaded and in use). Top level mirrors `?lane=`."""
+        _lane(lane)  # validate the lane id (400 on unknown)
+        resp = await _status_with_usage()
+        lanes = [
+            LaneUsageOut(
+                lane=ls.id,
+                state=ls.usage or "free",
+                model=ls.loaded.model if ls.loaded else None,
+                idle_s=ls.idle_s,
+            )
+            for ls in resp.lanes
+        ]
+        mirror = next((u for u in lanes if u.lane == lane), lanes[0])
+        return UsageResponse(
+            lane=mirror.lane, state=mirror.state, model=mirror.model,
+            idle_s=mirror.idle_s, lanes=lanes,
+        )
 
     @app.get("/api/models", response_model=ModelsResponse)
     async def api_models(lane: str = "primary") -> ModelsResponse:

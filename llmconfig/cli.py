@@ -71,6 +71,23 @@ def status() -> None:
 
 
 @app.command()
+def usage(lane: str = typer.Option("primary", "--lane", help="lane mirrored at the top level")) -> None:
+    """Per-lane tri-state: free / idle (model loaded, unused) / active (in use)."""
+    try:
+        with _client() as c:
+            d = c.get("/api/usage", params={"lane": lane}).json()
+    except httpx.HTTPError as e:
+        _bail(e)
+    for u in d.get("lanes", []):
+        typer.secho(f"{u['lane']}: ", nl=False, bold=True)
+        typer.secho(u["state"], fg=_USAGE_COLORS.get(u["state"], "white"), nl=False)
+        if u.get("model"):
+            typer.echo(f" — {u['model']}{_idle_suffix(u.get('idle_s'))}")
+        else:
+            typer.echo("")
+
+
+@app.command()
 def models(lane: str = typer.Option("primary", "--lane", help="primary (3090) | companion (3070 Ti)")) -> None:
     """List available Ollama models and vLLM aliases."""
     try:
@@ -205,11 +222,24 @@ def doctor(local: bool = typer.Option(False, "--local", help="run in-process ins
 # --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
+_USAGE_COLORS = {"free": "green", "idle": "yellow", "active": "cyan"}
+
+
+def _idle_suffix(idle_s: object) -> str:
+    if not isinstance(idle_s, (int, float)):
+        return ""
+    return f" (idle {idle_s:.0f}s)" if idle_s < 120 else f" (idle {idle_s / 60:.1f}m)"
+
+
 def _print_lane(l: dict) -> None:
     owner = l["owner"]
     color = {"free": "green", "ollama": "cyan", "vllm": "magenta", "unknown": "yellow"}.get(owner, "white")
     label = f"{l.get('id', 'primary')}" + (f" / {l['name']}" if l.get("name") else "")
-    typer.secho(f"[{label}] owner: {owner}", fg=color, bold=True)
+    use = l.get("usage")
+    suffix = ""
+    if use:
+        suffix = f"  [{use}{_idle_suffix(l.get('idle_s')) if use == 'idle' else ''}]"
+    typer.secho(f"[{label}] owner: {owner}{suffix}", fg=color, bold=True)
     g = l["gpu"]
     if g["found"]:
         typer.echo(f"  gpu:   {g['used_mb']}/{g['total_mb']} MiB ({g['utilization_pct']}%)")

@@ -8,6 +8,8 @@ from pydantic import BaseModel, Field
 ServerName = Literal["ollama", "vllm"]
 Owner = Literal["free", "ollama", "vllm", "unknown"]
 JobState = Literal["pending", "running", "succeeded", "failed"]
+# free = nothing loaded; idle = model resident but unused; active = model in use
+LaneUsage = Literal["free", "idle", "active"]
 
 
 # --------------------------------------------------------------------------- #
@@ -130,6 +132,9 @@ class LaneStatus(BaseModel):
     swap_in_progress: bool = False
     active_job_id: Optional[str] = None
     idle_s: Optional[float] = None  # seconds since last observed activity (idle-reaper input)
+    # free/idle/active classification — populated by the REST layer (it needs the
+    # Monitor's current util, which the orchestrator doesn't hold); None in-process.
+    usage: Optional[LaneUsage] = None
 
 
 class StatusResponse(BaseModel):
@@ -144,6 +149,24 @@ class StatusResponse(BaseModel):
     active_job_id: Optional[str] = None
     message: str = ""
     lanes: list[LaneStatus] = Field(default_factory=list)
+
+
+class LaneUsageOut(BaseModel):
+    """Compact per-lane usage answer for GET /api/usage."""
+
+    lane: str
+    state: LaneUsage
+    model: Optional[str] = None   # None when free
+    idle_s: Optional[float] = None
+
+
+class UsageResponse(BaseModel):
+    # Top-level fields mirror the requested lane (default primary); `lanes` carries all.
+    lane: str
+    state: LaneUsage
+    model: Optional[str] = None
+    idle_s: Optional[float] = None
+    lanes: list[LaneUsageOut] = Field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #

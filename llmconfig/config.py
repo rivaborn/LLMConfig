@@ -102,6 +102,9 @@ class Settings(BaseSettings):
     idle_unload_after_min: float = 15.0       # sustained inactivity before reaping
     idle_unload_check_interval_s: float = 60.0
     idle_unload_util_pct: float = 5.0         # util above this counts as activity
+    # Recent-activity window for classifying a loaded lane "active" (GET /api/usage
+    # and the `usage` field on /api/status lanes).
+    usage_active_window_s: float = 60.0
 
     # --- HuggingFace (vLLM downloads) ---
     hf_token: str = ""

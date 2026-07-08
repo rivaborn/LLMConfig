@@ -31,7 +31,7 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 from .config import Settings
-from .schemas import UnloadRequest
+from .schemas import LaneStatus, LaneUsage, UnloadRequest
 
 if TYPE_CHECKING:
     from .lane import Lane
@@ -39,6 +39,28 @@ if TYPE_CHECKING:
     from .orchestrator import Orchestrator
 
 log = logging.getLogger(__name__)
+
+
+def classify_usage(st: LaneStatus, current_util_pct: float | None,
+                   settings: Settings) -> LaneUsage:
+    """Classify a lane free / idle / active — the answer behind GET /api/usage.
+
+    free = nothing we manage holds the card; active = loaded with recent activity
+    (`idle_s` within `usage_active_window_s`), currently-visible GPU utilization
+    (covers direct-to-backend clients, whose util only folds into `idle_s` on the
+    reaper's next tick), or a swap in flight; idle = loaded but none of the above.
+    Pure function: the caller supplies the Monitor's latest util for the lane's GPU
+    (None when the Monitor is off/off-box — the timestamps still classify).
+    """
+    if st.swap_in_progress:
+        return "active"  # a load/unload is running — the lane is busy, not free
+    if st.owner not in ("ollama", "vllm"):
+        return "free"
+    if st.idle_s is not None and st.idle_s <= settings.usage_active_window_s:
+        return "active"
+    if current_util_pct is not None and current_util_pct > settings.idle_unload_util_pct:
+        return "active"
+    return "idle"
 
 
 class IdleReaper:

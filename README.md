@@ -145,6 +145,7 @@ require `X-API-Key` only when `LLMCONFIG_API_KEY` is set. Read endpoints take
 | Method & path                           | Purpose                                                       |
 | --------------------------------------- | ------------------------------------------------------------- |
 | `GET /api/status`                       | Every lane under `lanes[]`: owner, loaded model, VRAM, swap   |
+| `GET /api/usage?lane=`                  | Compact tri-state per lane: `free` / `idle` / `active` + model|
 | `GET /api/lanes`                        | Configured lanes (id, name, enabled, current default)         |
 | `GET /api/models?lane=`                 | That lane's Ollama tags + vLLM alias catalog (loaded flagged) |
 | `GET /api/gpu?lane=`                    | Parsed `nvidia-smi` for that lane's GPU (by UUID)             |
@@ -235,6 +236,13 @@ vLLM anymore the reaper also releases the WSL keepalive so the WSL2 distro can
 idle-shutdown; the next vLLM load restarts it. Set `IDLE_UNLOAD_ENABLED=false` to keep
 models pinned. If the lane's GPU also renders a desktop, background compositing can
 register as activity — raise `IDLE_UNLOAD_UTIL_PCT`.
+
+The same activity signals back a **usage query**: `GET /api/usage` (and the `usage`
+field on each `/api/status` lane, plus `llmconfig usage`) classifies every lane as
+`free` (nothing loaded), `idle` (model loaded but unused — the name is returned), or
+`active` (model loaded and in use). "Active" means activity within
+`USAGE_ACTIVE_WINDOW_S` (default 60 s), a currently-visible GPU-utilization sample, or
+a swap in flight.
 
 ## Context size (Ollama)
 

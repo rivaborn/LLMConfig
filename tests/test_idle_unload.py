@@ -8,13 +8,13 @@ import llmconfig.lane as lane_mod
 import llmconfig.orchestrator as orch_mod
 from llmconfig.config import Settings
 from llmconfig.gpu import GpuInfo
-from llmconfig.idle import IdleReaper
+from llmconfig.idle import IdleReaper, classify_usage
 from llmconfig.jobs import JobManager
 from llmconfig.monitor import Monitor
 from llmconfig.orchestrator import Orchestrator
 from llmconfig.proc import CmdResult
 from llmconfig.registry import Registry
-from llmconfig.schemas import OllamaModel
+from llmconfig.schemas import GpuOut, LaneStatus, LoadedModel, OllamaModel
 
 GiB = 1024 ** 3
 BASE_MB = 400
@@ -287,3 +287,50 @@ async def test_lane_status_reports_idle_s(monkeypatch, tmp_path):
     status = await orch.status()
     idle_s = status.lanes[0].idle_s
     assert idle_s is not None and 119 <= idle_s <= 130
+
+
+# --------------------------------------------------------------------------- #
+# classify_usage — the free / idle / active tri-state behind GET /api/usage
+# --------------------------------------------------------------------------- #
+def _lane_status(owner, idle_s=None, swap=False, model=None):
+    return LaneStatus(
+        id="primary", name="RTX 3090", owner=owner, ollama_up=True,
+        vllm_up=owner == "vllm", gpu=GpuOut(found=False),
+        loaded=LoadedModel(server=owner, model=model) if model else None,
+        swap_in_progress=swap, idle_s=idle_s,
+    )
+
+
+def test_classify_free_when_nothing_loaded():
+    s = Settings(_env_file=None)
+    assert classify_usage(_lane_status("free"), None, s) == "free"
+    assert classify_usage(_lane_status("unknown"), None, s) == "free"
+
+
+def test_classify_idle_when_loaded_past_window():
+    s = Settings(_env_file=None)
+    st = _lane_status("vllm", idle_s=300.0, model="gemma-4-26b")
+    assert classify_usage(st, None, s) == "idle"
+    assert classify_usage(st, 0.0, s) == "idle"  # current util below threshold
+
+
+def test_classify_active_within_window():
+    s = Settings(_env_file=None)
+    st = _lane_status("ollama", idle_s=12.0, model="qwen3:32b")
+    assert classify_usage(st, None, s) == "active"
+    # boundary: exactly the window is still active
+    st.idle_s = s.usage_active_window_s
+    assert classify_usage(st, None, s) == "active"
+
+
+def test_classify_active_on_current_util_despite_stale_idle_s():
+    # A direct-to-backend client is generating right now, but its util hasn't been
+    # folded into idle_s yet (that happens on the reaper's next tick).
+    s = Settings(_env_file=None)
+    st = _lane_status("vllm", idle_s=900.0, model="gemma-4-26b")
+    assert classify_usage(st, 91.7, s) == "active"
+
+
+def test_classify_active_during_swap():
+    s = Settings(_env_file=None)
+    assert classify_usage(_lane_status("free", swap=True), None, s) == "active"

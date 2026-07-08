@@ -69,7 +69,8 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 - `idle.py` — `IdleReaper`: background idle auto-unload policy. Reaps a lane after
   `idle_unload_after_min` of no activity (gateway request / load completion / Monitor
   util spike) so the card drops to P8, and releases the WSL keepalive when no lane
-  serves vLLM.
+  serves vLLM. Also `classify_usage()` — the shared free/idle/active classification
+  behind `GET /api/usage` and the `usage` field on `/api/status` lanes.
 - `registry.py` — `Registry`: the editable vLLM **alias catalog** (YAML at
   `data/vllm_models.yaml`, seeded from the package default). vLLM can't enumerate what
   it *could* serve, so this is that list.
