@@ -22,7 +22,7 @@ env/
 # Runtime-generated per-lane default-model state (set via UI/CLI).
 /data/lane_defaults.yaml
 # Monitor-tab telemetry history (SQLite + WAL sidecars).
-/data/monitor.db*
+/data/monitor*.db*
 
 # Editor / OS
 .vscode/
