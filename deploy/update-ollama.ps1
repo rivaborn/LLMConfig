@@ -1,7 +1,15 @@
 <#
-Safely update Ollama on .40 (both NSSM instances) on a schedule, then verify the
-CUDA runner survived. Replaces the manual "Stop-Service -> OllamaSetup -> Start-Service"
-dance documented in install-companion.ps1.
+Safely update Ollama on .40 (both NSSM instances) on a schedule, then verify each
+instance's runner (a) offloads to GPU at all and (b) lands on the GPU its service is
+PINNED to. Replaces the manual "Stop-Service -> OllamaSetup -> Start-Service" dance
+documented in install-companion.ps1.
+
+The pinned-GPU check exists because an Ollama update can silently break pinning
+without breaking GPU offload: the 0.19 -> 0.30 update (2026-06-21) added Vulkan GPU
+discovery that ignores CUDA_VISIBLE_DEVICES, and the companion's model quietly moved
+onto the 3090 (found 2026-07-08 as ~2 GB of "unowned" VRAM holding the card in P0 at
+~117 W). The old "size_vram > 0" check passed the whole time. See the GPU pinning
+note in install-companion.ps1 for the env fix (OLLAMA_VULKAN=0 + UUID pin).
 
 Why this exists: Ollama's tray auto-updater is disabled (it can't stop the NSSM-managed
 ollama.exe, so its in-place update hits "DeleteFile ... Access is denied", rolls back, and
@@ -103,6 +111,41 @@ function Get-ServicePort {
     return 11434
 }
 
+# The GPU a service is pinned to, as a UUID. Reads CUDA_VISIBLE_DEVICES from the
+# service's NSSM env; a legacy *index* pin (pre 2026-07-08) is translated via
+# nvidia-smi, whose enumeration is PCI order — the same order those pins were
+# defined under (CUDA_DEVICE_ORDER=PCI_BUS_ID). $null = unpinned / unknowable.
+function Get-ServicePinnedUuid {
+    param([string]$Name)
+    $nssm = (Get-Command nssm.exe -ErrorAction SilentlyContinue).Source
+    if (-not $nssm) { return $null }
+    try { $extra = (& $nssm get $Name AppEnvironmentExtra 2>$null) | Out-String } catch { return $null }
+    $m = [regex]::Match($extra, 'CUDA_VISIBLE_DEVICES=(GPU-[0-9a-fA-F-]+|\d+)')
+    if (-not $m.Success) { return $null }
+    $pin = $m.Groups[1].Value
+    if ($pin -like 'GPU-*') { return $pin }
+    try {
+        $line = (nvidia-smi --query-gpu=index,uuid --format=csv,noheader) |
+            Where-Object { ($_ -split ',')[0].Trim() -eq $pin } | Select-Object -First 1
+        if ($line) { return ($line -split ',')[1].Trim() }
+    } catch { }
+    return $null
+}
+
+# Per-GPU memory.used (MiB) keyed by UUID. $null when nvidia-smi is unavailable —
+# the pin check then degrades to unverified rather than failing the run.
+function Get-GpuMemSnapshot {
+    try {
+        $snap = @{}
+        foreach ($line in (nvidia-smi --query-gpu=uuid,memory.used --format=csv,noheader,nounits)) {
+            $parts = $line -split ','
+            $snap[$parts[0].Trim()] = [int]$parts[1].Trim()
+        }
+        if ($snap.Count) { return $snap }
+    } catch { }
+    return $null
+}
+
 function Stop-OllamaProcesses {
     foreach ($name in (Get-PresentServices)) {
         Write-Log "Stopping service '$name'..."
@@ -172,10 +215,15 @@ function Wait-ApiHealthy {
     return $false
 }
 
-# Prove the CUDA runner survived: load a tiny model and confirm it offloaded to GPU.
-# size_vram == 0 is the CPU-only corruption (library=cpu / total_vram=0).
+# Prove the runner survived: load a tiny model, confirm it offloaded to GPU
+# (size_vram == 0 is the CPU-only corruption: library=cpu / total_vram=0), and
+# confirm the VRAM appeared on the service's PINNED card (per-GPU memory.used
+# delta around the load, by UUID — Ollama can't report which card it used).
+# Deltas are clean because the services were just restarted, so nothing of ours
+# is resident when the baseline is taken. Returns OK / CPU-ONLY / WRONG-GPU /
+# skipped / error.
 function Test-CudaRunner {
-    param([int]$ApiPort)
+    param([int]$ApiPort, [string]$ServiceName)
     $base = "http://127.0.0.1:$ApiPort"
     $model = $VerifyModel
     if (-not $model) {
@@ -185,21 +233,48 @@ function Test-CudaRunner {
             if ($smallest) { $model = $smallest.name }
         } catch { }
     }
-    if (-not $model) { Write-Log "Runner check SKIPPED on :$ApiPort (no pulled model available)."; return "skipped" }
+    if (-not $model) { Write-Log "Runner check SKIPPED for '$ServiceName' on :$ApiPort (no pulled model available)."; return "skipped" }
 
-    Write-Log "Verifying CUDA runner on :$ApiPort with '$model'..."
+    $pin = Get-ServicePinnedUuid -Name $ServiceName
+    $before = Get-GpuMemSnapshot
+    Write-Log "Verifying runner for '$ServiceName' on :$ApiPort with '$model' (pin: $(if ($pin) { $pin } else { 'none/unknown' }))..."
     try {
         $loadBody = @{ model = $model; keep_alive = -1; stream = $false } | ConvertTo-Json
         Invoke-RestMethod -Uri "$base/api/generate" -Method Post -Body $loadBody -ContentType "application/json" -TimeoutSec 120 | Out-Null
         $ps = Invoke-RestMethod -Uri "$base/api/ps" -TimeoutSec 15
         $entry = $ps.models | Where-Object { $_.name -eq $model } | Select-Object -First 1
         $vram = if ($entry) { [int64]$entry.size_vram } else { 0 }
+        $after = Get-GpuMemSnapshot
+
+        # Which card actually gained the VRAM? (>= 200 MiB = attributable; the
+        # smallest pulled model is ~1 GB, so a real load always clears this.)
+        $pinResult = "unverified"
+        if ($vram -gt 0 -and $pin -and $before -and $after) {
+            $bestUuid = $null; $bestDelta = 0
+            foreach ($uuid in $after.Keys) {
+                $b = if ($before.ContainsKey($uuid)) { $before[$uuid] } else { 0 }
+                $delta = $after[$uuid] - $b
+                if ($delta -gt $bestDelta) { $bestDelta = $delta; $bestUuid = $uuid }
+            }
+            if ($bestDelta -ge 200 -and $bestUuid -ne $pin) {
+                Write-Log "*** '$ServiceName' loaded '$model' on the WRONG GPU: +$bestDelta MiB on $bestUuid, pinned to $pin. ***"
+                $pinResult = "wrong"
+            } elseif ($bestDelta -ge 200) {
+                Write-Log "'$ServiceName': +$bestDelta MiB on the pinned GPU — pin verified."
+                $pinResult = "ok"
+            } else {
+                Write-Log "'$ServiceName': VRAM delta inconclusive (<200 MiB on every card) — pin unverified."
+            }
+        }
+
         # unload
         $unloadBody = @{ model = $model; keep_alive = 0; stream = $false } | ConvertTo-Json
         Invoke-RestMethod -Uri "$base/api/generate" -Method Post -Body $unloadBody -ContentType "application/json" -TimeoutSec 30 | Out-Null
-        if ($vram -gt 0) { return "OK" } else { return "CPU-ONLY" }
+        if ($vram -le 0) { return "CPU-ONLY" }
+        if ($pinResult -eq "wrong") { return "WRONG-GPU" }
+        return "OK"
     } catch {
-        Write-Log "Runner check ERROR on :$ApiPort : $($_.Exception.Message)"
+        Write-Log "Runner check ERROR for '$ServiceName' on :$ApiPort : $($_.Exception.Message)"
         return "error"
     }
 }
@@ -265,27 +340,42 @@ try {
         else { Write-Log "WARNING: '$name' API not healthy on :$apiPort within timeout." }
     }
 
-    # 10. Verify the CUDA runner survived (the 2026-06-18 failure mode).
-    $primary = (Get-PresentServices | Select-Object -First 1)
-    if ($primary) {
-        $apiPort = Get-ServicePort -Name $primary
-        $runnerResult = Test-CudaRunner -ApiPort $apiPort
-        if ($runnerResult -eq "CPU-ONLY") {
-            Write-Log "*** RUNNER CPU-ONLY after update -- CUDA runner corrupted. Retrying reinstall once. ***"
+    # 10. Verify EACH instance's runner: it must offload to GPU (the 2026-06-18
+    #     corruption) AND land on its pinned card (the 2026-07-08 Vulkan-discovery
+    #     regression — that one hit the companion, so checking only the primary
+    #     is not enough).
+    $results = [ordered]@{}
+    $reinstalled = $false
+    foreach ($name in (Get-PresentServices)) {
+        $apiPort = Get-ServicePort -Name $name
+        $r = Test-CudaRunner -ApiPort $apiPort -ServiceName $name
+        if ($r -eq "CPU-ONLY" -and -not $reinstalled) {
+            # Corruption is install-level: one reinstall retry can fix it.
+            Write-Log "*** '$name' runner CPU-ONLY after update -- CUDA runner corrupted. Retrying reinstall once. ***"
+            $reinstalled = $true
             Stop-OllamaProcesses
             Install-Ollama
             Suppress-Tray
             Start-OllamaServices
             if (Wait-ApiHealthy -ApiPort $apiPort) {
-                $runnerResult = Test-CudaRunner -ApiPort $apiPort
+                $r = Test-CudaRunner -ApiPort $apiPort -ServiceName $name
             }
-            if ($runnerResult -ne "OK") {
-                Write-Log "*** RUNNER STILL $runnerResult after retry -- MANUAL ATTENTION NEEDED (CPU-only fallback). ***"
+            if ($r -ne "OK") {
+                Write-Log "*** '$name' runner STILL $r after retry -- MANUAL ATTENTION NEEDED (CPU-only fallback). ***"
             }
         }
+        if ($r -eq "WRONG-GPU") {
+            # Pin bypass is env/discovery-level: a reinstall can't fix it, so don't retry.
+            Write-Log "*** '$name' is IGNORING its GPU pin -- a reinstall won't fix this; check the service env (OLLAMA_VULKAN=0 + GGML_VK_VISIBLE_DEVICES=-1 + UUID pin, see install-companion.ps1). MANUAL ATTENTION NEEDED. ***"
+        }
+        $results[$name] = $r
     }
+    $runnerResult = if ($results.Count) {
+        ($results.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join " "
+    } else { "n/a" }
 
-    $outcome = if ($runnerResult -eq "OK" -or $runnerResult -eq "skipped") { "updated OK" } else { "updated but runner $runnerResult" }
+    $bad = @($results.Values | Where-Object { $_ -notin @("OK", "skipped") })
+    $outcome = if (-not $bad.Count) { "updated OK" } else { "updated but runner problems: $($bad -join ', ')" }
 }
 catch {
     $outcome = "FAILED: $($_.Exception.Message)"
@@ -301,5 +391,5 @@ finally {
 # 12. Final log line.
 $final = Get-InstalledVersion
 Write-Log "$installed -> $final | runner=$runnerResult | $outcome"
-if ($outcome -like "FAILED:*" -or $runnerResult -eq "CPU-ONLY" -or $runnerResult -eq "error") { exit 1 }
+if ($outcome -like "FAILED:*" -or $runnerResult -match "CPU-ONLY|WRONG-GPU|error") { exit 1 }
 exit 0
