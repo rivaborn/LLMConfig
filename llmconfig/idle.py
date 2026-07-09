@@ -19,6 +19,11 @@ eviction-wait gate — never a private unload path. After reaping the last vLLM
 (no lane serving vLLM, no lane lock held) the shared WSL keepalive is released
 so the distro can idle-shutdown too; the next vLLM load re-`ensure()`s it.
 
+Participation is per lane (`LaneConfig.idle_unload_enabled`): the companion
+3070 Ti is exempt by default — it idles in P8 (~13 W) even with a small model
+resident, so reaping it saves ~nothing and would cost the opencode /swap echo
+relay its instant response (`COMPANION_IDLE_UNLOAD_ENABLED=1` opts it in).
+
 Degrades gracefully off-box: with no Monitor samples the util signal simply goes
 quiet and the timestamps still drive the policy; a tick failure never kills the
 loop.
@@ -115,14 +120,15 @@ class IdleReaper:
 
     async def _check_lane(self, lane: "Lane") -> bool:
         """Reap the lane if idle past the timeout. Returns True if vLLM was reaped."""
-        # Fold in the Monitor util signal (catches direct-to-backend clients).
+        # Fold in the Monitor util signal (catches direct-to-backend clients). Done
+        # even for reap-exempt lanes so their idle_s / usage classification stays honest.
         ts = self.monitor.last_util_activity(
             lane.cfg.gpu_uuid, self.s.idle_unload_util_pct, since=lane.last_activity
         )
         if ts is not None:
             lane.touch(ts)
         # Cheap guards before any HTTP/nvidia-smi probing.
-        if not lane.cfg.enabled:
+        if not lane.cfg.enabled or not lane.cfg.idle_unload_enabled:
             return False
         if lane._lock.locked() or lane._active_job_id:  # swap in progress
             return False

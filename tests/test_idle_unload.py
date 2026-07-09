@@ -266,8 +266,34 @@ async def test_no_monitor_still_reaps(monkeypatch, tmp_path):
     assert worlds["primary"].ollama == {}
 
 
-async def test_lane_failure_does_not_kill_tick(monkeypatch, tmp_path):
+async def test_companion_exempt_from_reaping_by_default(monkeypatch, tmp_path):
     worlds, orch, reaper, _ = _make(monkeypatch, tmp_path, two_lanes=True)
+    _load_ollama(worlds["primary"], orch.primary)
+    orch.primary.last_activity = time.time() - IDLE
+    _load_ollama(worlds["companion"], orch.lane("companion"), model="qwen2.5:1.5b")
+    orch.lane("companion").last_activity = time.time() - IDLE
+
+    await reaper._tick()
+
+    assert worlds["primary"].ollama == {}, "primary still participates"
+    assert "qwen2.5:1.5b" in worlds["companion"].ollama, \
+        "companion is exempt unless COMPANION_IDLE_UNLOAD_ENABLED is set"
+
+
+async def test_companion_reaped_when_opted_in(monkeypatch, tmp_path):
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path, two_lanes=True,
+                                    companion_idle_unload_enabled=True)
+    _load_ollama(worlds["companion"], orch.lane("companion"), model="qwen2.5:1.5b")
+    orch.lane("companion").last_activity = time.time() - IDLE
+
+    await reaper._tick()
+
+    assert worlds["companion"].ollama == {}
+
+
+async def test_lane_failure_does_not_kill_tick(monkeypatch, tmp_path):
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path, two_lanes=True,
+                                    companion_idle_unload_enabled=True)
     _load_ollama(worlds["companion"], orch.lane("companion"))
     orch.lane("companion").last_activity = time.time() - IDLE
     orch.primary.last_activity = time.time() - IDLE

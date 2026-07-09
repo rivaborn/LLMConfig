@@ -37,6 +37,9 @@ class LaneConfig:
     enabled: bool = True
     default_server: str = ""      # "ollama" | "vllm" | "" — auto-load on startup
     default_model: str = ""       # Ollama tag or vLLM alias
+    # Whether the idle reaper may unload this lane (the global idle_unload_enabled
+    # is the master switch; this is per-lane participation).
+    idle_unload_enabled: bool = True
 
 
 class Settings(BaseSettings):
@@ -102,6 +105,10 @@ class Settings(BaseSettings):
     idle_unload_after_min: float = 15.0       # sustained inactivity before reaping
     idle_unload_check_interval_s: float = 60.0
     idle_unload_util_pct: float = 5.0         # util above this counts as activity
+    # The companion 3070 Ti is EXEMPT by default: it reaches P8 (~13 W) even with a
+    # small model resident, so reaping saves ~nothing and would cost the opencode
+    # /swap echo relay its instant response. Opt it in explicitly if that changes.
+    companion_idle_unload_enabled: bool = False
     # Recent-activity window for classifying a loaded lane "active" (GET /api/usage
     # and the `usage` field on /api/status lanes).
     usage_active_window_s: float = 60.0
@@ -169,6 +176,7 @@ class Settings(BaseSettings):
                     enabled=True,
                     default_server=self.companion_default_server,
                     default_model=self.companion_default_model,
+                    idle_unload_enabled=self.companion_idle_unload_enabled,
                 )
             )
         return lanes

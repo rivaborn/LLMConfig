@@ -221,7 +221,10 @@ the 3090 draws **~117 W doing nothing** instead of its ~25 W **P8** idle. Neithe
 lets go on its own (LLMConfig loads Ollama with `keep_alive:-1`; vLLM never
 auto-unloads), so a background **idle reaper** (`llmconfig/idle.py`, on by default)
 unloads a lane after `IDLE_UNLOAD_AFTER_MIN` minutes (default 15) with no observed
-activity, letting the card fall to P8.
+activity, letting the card fall to P8. Participation is per lane: the **companion
+3070 Ti is exempt by default** (`COMPANION_IDLE_UNLOAD_ENABLED=false`) — it reaches P8
+(~13 W) even with a small model resident, so reaping it saves ~nothing and would cost
+its always-resident relay model the instant response; flip the flag to opt it in.
 
 **Activity** is any of: a `/v1` gateway request routed to the lane, a load finishing, or
 a Monitor **utilization sample above `IDLE_UNLOAD_UTIL_PCT`** (default 5 %) on the
