@@ -16,13 +16,13 @@ GPU pinning note (learned live on this box, twice):
   models on the 3090 (found live 2026-07-08 as ~2 GB of "unowned" VRAM pinning the
   3090 in P0; see ollama/ollama#16508, #16592). Fix: **OLLAMA_VULKAN=0 +
   GGML_VK_VISIBLE_DEVICES=-1** force CUDA-only discovery, and with Vulkan off the
-  0.30 runner accepts a **UUID** in CUDA_VISIBLE_DEVICES — so we now pin by UUID
+  0.30 runner accepts a **UUID** in CUDA_VISIBLE_DEVICES -- so we now pin by UUID
   (enumeration-order-proof). The index translation is kept only to verify the UUID
   exists. The NSSM service runs as LocalSystem and sets these in its own
   AppEnvironmentExtra. (A User-scope CUDA_VISIBLE_DEVICES=1 exists for the 3090 but
   only affects user-session/WSL processes; LocalSystem services don't inherit it.)
   The primary `Ollama` service needs the same three values (UUID + the two
-  Vulkan-off vars) — applied live 2026-07-08; re-apply if that service is rebuilt.
+  Vulkan-off vars) -- applied live 2026-07-08; re-apply if that service is rebuilt.
 
 Bind: by default the companion Ollama binds LAN-wide (0.0.0.0:11435) and a firewall
 rule is added, so an off-box client (e.g. the opencode /swap relay) can reach the
@@ -128,7 +128,7 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
 # OLLAMA_CONTEXT_LENGTH raises the default served context (Ollama defaults to a small
 # 4096 that silently truncates big-context prompts, e.g. opencode's ~24.5k baseline).
 # OLLAMA_VULKAN=0 + GGML_VK_VISIBLE_DEVICES=-1: Ollama 0.30+'s Vulkan discovery
-# ignores CUDA_VISIBLE_DEVICES and cross-pins GPUs — force CUDA-only discovery,
+# ignores CUDA_VISIBLE_DEVICES and cross-pins GPUs -- force CUDA-only discovery,
 # which honors the UUID pin (see the GPU pinning note in the header).
 & $nssm set $ServiceName AppEnvironmentExtra `
     "OLLAMA_HOST=${BindHost}:$Port" `

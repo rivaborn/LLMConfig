@@ -113,7 +113,7 @@ function Get-ServicePort {
 
 # The GPU a service is pinned to, as a UUID. Reads CUDA_VISIBLE_DEVICES from the
 # service's NSSM env; a legacy *index* pin (pre 2026-07-08) is translated via
-# nvidia-smi, whose enumeration is PCI order — the same order those pins were
+# nvidia-smi, whose enumeration is PCI order -- the same order those pins were
 # defined under (CUDA_DEVICE_ORDER=PCI_BUS_ID). $null = unpinned / unknowable.
 function Get-ServicePinnedUuid {
     param([string]$Name)
@@ -132,7 +132,7 @@ function Get-ServicePinnedUuid {
     return $null
 }
 
-# Per-GPU memory.used (MiB) keyed by UUID. $null when nvidia-smi is unavailable —
+# Per-GPU memory.used (MiB) keyed by UUID. $null when nvidia-smi is unavailable --
 # the pin check then degrades to unverified rather than failing the run.
 function Get-GpuMemSnapshot {
     try {
@@ -218,7 +218,7 @@ function Wait-ApiHealthy {
 # Prove the runner survived: load a tiny model, confirm it offloaded to GPU
 # (size_vram == 0 is the CPU-only corruption: library=cpu / total_vram=0), and
 # confirm the VRAM appeared on the service's PINNED card (per-GPU memory.used
-# delta around the load, by UUID — Ollama can't report which card it used).
+# delta around the load, by UUID -- Ollama can't report which card it used).
 # Deltas are clean because the services were just restarted, so nothing of ours
 # is resident when the baseline is taken. Returns OK / CPU-ONLY / WRONG-GPU /
 # skipped / error.
@@ -260,10 +260,10 @@ function Test-CudaRunner {
                 Write-Log "*** '$ServiceName' loaded '$model' on the WRONG GPU: +$bestDelta MiB on $bestUuid, pinned to $pin. ***"
                 $pinResult = "wrong"
             } elseif ($bestDelta -ge 200) {
-                Write-Log "'$ServiceName': +$bestDelta MiB on the pinned GPU — pin verified."
+                Write-Log "'$ServiceName': +$bestDelta MiB on the pinned GPU -- pin verified."
                 $pinResult = "ok"
             } else {
-                Write-Log "'$ServiceName': VRAM delta inconclusive (<200 MiB on every card) — pin unverified."
+                Write-Log "'$ServiceName': VRAM delta inconclusive (<200 MiB on every card) -- pin unverified."
             }
         }
 
@@ -342,7 +342,7 @@ try {
 
     # 10. Verify EACH instance's runner: it must offload to GPU (the 2026-06-18
     #     corruption) AND land on its pinned card (the 2026-07-08 Vulkan-discovery
-    #     regression — that one hit the companion, so checking only the primary
+    #     regression -- that one hit the companion, so checking only the primary
     #     is not enough).
     $results = [ordered]@{}
     $reinstalled = $false
