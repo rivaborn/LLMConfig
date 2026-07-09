@@ -7,13 +7,22 @@ Ollama's model store (so models pulled on either instance are visible to both).
 LLMConfig then controls it through the same winsvc path as the primary
 (Get-/Start-/Restart-Service OllamaCompanion).
 
-GPU pinning note (learned live on this box): Ollama's CUDA_VISIBLE_DEVICES wants a
-device *index*, not a `GPU-<uuid>` string (it won't resolve the UUID and falls back to
-CPU). We keep the UUID as the source of truth and translate it to an index under
-CUDA_DEVICE_ORDER=PCI_BUS_ID (so indices match nvidia-smi). The NSSM service runs as
-LocalSystem and sets CUDA_VISIBLE_DEVICES in its own AppEnvironmentExtra, so it pins
-the 3070 Ti explicitly. (A User-scope CUDA_VISIBLE_DEVICES=1 exists for the 3090 but
-only affects user-session/WSL processes; LocalSystem services don't inherit it.)
+GPU pinning note (learned live on this box, twice):
+- Ollama <= 0.19 wanted a device *index* in CUDA_VISIBLE_DEVICES (a `GPU-<uuid>`
+  string fell back to CPU), so this script translated the UUID to an index under
+  CUDA_DEVICE_ORDER=PCI_BUS_ID.
+- Ollama 0.30+ broke that: its new discovery also enumerates GPUs via **Vulkan**,
+  which ignores CUDA_VISIBLE_DEVICES entirely, so the scheduler put companion
+  models on the 3090 (found live 2026-07-08 as ~2 GB of "unowned" VRAM pinning the
+  3090 in P0; see ollama/ollama#16508, #16592). Fix: **OLLAMA_VULKAN=0 +
+  GGML_VK_VISIBLE_DEVICES=-1** force CUDA-only discovery, and with Vulkan off the
+  0.30 runner accepts a **UUID** in CUDA_VISIBLE_DEVICES — so we now pin by UUID
+  (enumeration-order-proof). The index translation is kept only to verify the UUID
+  exists. The NSSM service runs as LocalSystem and sets these in its own
+  AppEnvironmentExtra. (A User-scope CUDA_VISIBLE_DEVICES=1 exists for the 3090 but
+  only affects user-session/WSL processes; LocalSystem services don't inherit it.)
+  The primary `Ollama` service needs the same three values (UUID + the two
+  Vulkan-off vars) — applied live 2026-07-08; re-apply if that service is rebuilt.
 
 Bind: by default the companion Ollama binds LAN-wide (0.0.0.0:11435) and a firewall
 rule is added, so an off-box client (e.g. the opencode /swap relay) can reach the
@@ -90,7 +99,8 @@ if (-not $ModelsDir) {
     else { $ModelsDir = Join-Path $env:USERPROFILE ".ollama\models" }
 }
 
-# Translate the UUID -> device index under PCI_BUS_ID order (Ollama needs an index).
+# Translate the UUID -> device index under PCI_BUS_ID order. Since the 0.30 fix the
+# pin itself uses the UUID; this lookup remains as a hard check that the card exists.
 if ($GpuIndex -lt 0) {
     $env:CUDA_DEVICE_ORDER = "PCI_BUS_ID"
     $line = (nvidia-smi --query-gpu=index,uuid --format=csv,noheader) | Where-Object { $_ -match [regex]::Escape($GpuUuid) }
@@ -102,7 +112,7 @@ $BindHost = if ($OnBoxOnly) { "127.0.0.1" } else { "0.0.0.0" }
 
 Write-Host "ollama.exe : $OllamaExe"
 Write-Host "models dir : $ModelsDir  (shared with the primary instance)"
-Write-Host "GPU pin    : index $GpuIndex  (= $GpuUuid, PCI_BUS_ID order)"
+Write-Host "GPU pin    : $GpuUuid  (index $GpuIndex under PCI_BUS_ID; Vulkan discovery disabled)"
 Write-Host "listen     : ${BindHost}:$Port  $(if ($OnBoxOnly) {'(on-box only)'} else {'(LAN + firewall)'})"
 Write-Host "ctx length : $OllamaContextLength  (OLLAMA_CONTEXT_LENGTH)"
 
@@ -117,14 +127,19 @@ if (Get-Service -Name $ServiceName -ErrorAction SilentlyContinue) {
 & $nssm set $ServiceName DisplayName "Ollama (companion, RTX 3070 Ti)"
 # OLLAMA_CONTEXT_LENGTH raises the default served context (Ollama defaults to a small
 # 4096 that silently truncates big-context prompts, e.g. opencode's ~24.5k baseline).
+# OLLAMA_VULKAN=0 + GGML_VK_VISIBLE_DEVICES=-1: Ollama 0.30+'s Vulkan discovery
+# ignores CUDA_VISIBLE_DEVICES and cross-pins GPUs — force CUDA-only discovery,
+# which honors the UUID pin (see the GPU pinning note in the header).
 & $nssm set $ServiceName AppEnvironmentExtra `
     "OLLAMA_HOST=${BindHost}:$Port" `
     "CUDA_DEVICE_ORDER=PCI_BUS_ID" `
-    "CUDA_VISIBLE_DEVICES=$GpuIndex" `
+    "CUDA_VISIBLE_DEVICES=$GpuUuid" `
+    "OLLAMA_VULKAN=0" `
+    "GGML_VK_VISIBLE_DEVICES=-1" `
     "OLLAMA_MODELS=$ModelsDir" `
     "OLLAMA_CONTEXT_LENGTH=$OllamaContextLength"
 & $nssm start $ServiceName
-Write-Host "Started '$ServiceName' (Ollama on ${BindHost}:$Port pinned to GPU index $GpuIndex / the 3070 Ti)."
+Write-Host "Started '$ServiceName' (Ollama on ${BindHost}:$Port pinned to $GpuUuid / the 3070 Ti)."
 
 # LAN access for off-box clients (e.g. the opencode /swap relay). Auth-less + LAN-only.
 if (-not $OnBoxOnly) {

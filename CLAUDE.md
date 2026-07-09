@@ -98,6 +98,12 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    order (3090 = index 1) but vLLM 0.20.2's worker ignores `CUDA_DEVICE_ORDER` and uses
    CUDA FASTEST_FIRST (3090 = index 0). `serve.sh` resolves the index via the venv
    **torch** by UUID and hard-fails if absent — never silently index 0.
+   **Ollama 0.30+ is a second trap:** its discovery also enumerates GPUs via **Vulkan**,
+   which ignores `CUDA_VISIBLE_DEVICES` — an index pin silently lands models on the
+   wrong card (found live 2026-07-08: companion's model on the 3090; ollama#16508).
+   Both NSSM Ollama services therefore set `OLLAMA_VULKAN=0` + `GGML_VK_VISIBLE_DEVICES=-1`
+   (CUDA-only discovery) and pin `CUDA_VISIBLE_DEVICES` by **UUID** (works once Vulkan
+   is off). `deploy/install-companion.ps1` writes this; keep it if you touch the env.
 2. **Lanes never touch each other's card.** vLLM stop is scoped to the lane's own
    systemd unit glob + its `serve.sh` path — **never a global `pkill -f venv/bin/vllm`**
    (that would cross-kill the other lane's vLLM when both GPUs serve). Keep it scoped.
