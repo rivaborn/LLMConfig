@@ -58,9 +58,11 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 - `backends/vllm.py` — `VllmBackend`: relay `/v1/models` for status; `serve.sh` /
   `systemctl --user` over `wsl.exe` for lifecycle; `wait_ready`, `journal_tail`.
 - `gpu.py` — nvidia-smi truth. `query_gpu(uuid)` (one card, w/ processes),
-  `query_all_gpus()` (all cards, memory only — the multi-lane fast path),
+  `query_all_gpus()` (all cards — the multi-lane fast path),
   `sample_gpu_metrics()` (temp/power/util for the Monitor). Tries Windows nvidia-smi,
-  falls back into WSL.
+  falls back into WSL. `GpuInfo` carries `util_pct` (compute utilization, `None` when
+  the driver reports `[N/A]`) and the `vram_pct` property (memory fraction) — see
+  invariant 8 for why these must never be conflated.
 - `nvapi.py` — pure-ctypes NVAPI wrapper for **hotspot + GDDR6X memory-junction**
   temps that nvidia-smi hides on consumer cards. Every failure path returns `None`.
 - `monitor.py` — `Monitor`: background asyncio sampler → rolling in-memory deques +
@@ -126,7 +128,13 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 7. **Write endpoints are gated by `X-API-Key` only when `LLMCONFIG_API_KEY` is set**
    (`require_key` dependency). Read/inference endpoints are open (LAN perimeter). Keep
    new mutating endpoints on the `write` dependency list.
-8. **Adding a vLLM model needs a `serve.sh` case, not just a registry row.** The
+8. **`utilization_pct` means compute load, never VRAM occupancy.** `/api/status`'s
+   `gpu.utilization_pct` is nvidia-smi `utilization.gpu` (nullable); the memory
+   fraction lives in `vram_pct` (and `loaded.gpu_vram_pct`). Until 9e55316 the field
+   carried the VRAM fraction, so external idle gates (LocalLLM_Code_Analysis's
+   `Wait-GpuIdle`) saw a resident model as ~86% "busy" forever and deadlocked their
+   runs. Off-box consumers key off this field — don't swap the semantics back.
+9. **Adding a vLLM model needs a `serve.sh` case, not just a registry row.** The
    registry's `launch_args` / `managed_by: registry` fields are currently **unwired** —
    `_load_vllm` always launches via `vllm@<alias>` → `serve.sh <alias>`, whose hardcoded
    `case` sets the args. A user-added model = add a `case` to `deploy/serve.sh` **and**
