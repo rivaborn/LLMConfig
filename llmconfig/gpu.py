@@ -12,7 +12,7 @@ from .config import Settings, get_settings
 from .proc import CmdResult, run_argv
 from .wsl import run_wsl
 
-GPU_QUERY = "--query-gpu=uuid,memory.total,memory.used,memory.free --format=csv,noheader,nounits"
+GPU_QUERY = "--query-gpu=uuid,memory.total,memory.used,memory.free,utilization.gpu --format=csv,noheader,nounits"
 APPS_QUERY = "--query-compute-apps=pid,used_memory,process_name --format=csv,noheader,nounits"
 # Richer per-GPU telemetry for the Monitor tab (core temp / power / util on top of
 # memory). `index` is included so the Monitor can pair each card with its NVAPI
@@ -37,11 +37,15 @@ class GpuInfo:
     total_mb: int = 0
     used_mb: int = 0
     free_mb: int = 0
+    # Compute utilization (nvidia-smi utilization.gpu); None when the driver
+    # reports [N/A] (some cards / WSL fallback). NOT the VRAM fraction — that's
+    # vram_pct. External idle gates key off this, so keep the semantics honest.
+    util_pct: float | None = None
     processes: list[GpuProcess] = field(default_factory=list)
     error: str = ""
 
     @property
-    def utilization_pct(self) -> float:
+    def vram_pct(self) -> float:
         return round(100.0 * self.used_mb / self.total_mb, 1) if self.total_mb else 0.0
 
     def is_free(self, baseline_mb: int) -> bool:
@@ -133,7 +137,8 @@ async def query_gpu(settings: Settings | None = None, uuid: str | None = None) -
         u, total, used, free = parts[0], _parse_int(parts[1]), _parse_int(parts[2]), _parse_int(parts[3])
         seen.append(u)
         if u == target:
-            info = GpuInfo(found=True, uuid=u, total_mb=total, used_mb=used, free_mb=free)
+            util = _parse_float(parts[4]) if len(parts) > 4 else None
+            info = GpuInfo(found=True, uuid=u, total_mb=total, used_mb=used, free_mb=free, util_pct=util)
             info.processes = await _query_processes(settings)
             return info
 
@@ -162,6 +167,7 @@ async def query_all_gpus(settings: Settings | None = None) -> dict[str, GpuInfo]
             total_mb=_parse_int(parts[1]),
             used_mb=_parse_int(parts[2]),
             free_mb=_parse_int(parts[3]),
+            util_pct=_parse_float(parts[4]) if len(parts) > 4 else None,
         )
     return out
 

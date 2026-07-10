@@ -85,7 +85,12 @@ class GpuOut(BaseModel):
     total_mb: int = 0
     used_mb: int = 0
     free_mb: int = 0
-    utilization_pct: float = 0.0
+    # Compute utilization (nvidia-smi utilization.gpu); None when unavailable.
+    # Historically this field carried the VRAM fraction, which deadlocked external
+    # idle gates (a resident model reads ~86% "busy" forever) — that value now
+    # lives in vram_pct.
+    utilization_pct: Optional[float] = None
+    vram_pct: float = 0.0
     processes: list[GpuProcessOut] = Field(default_factory=list)
     error: str = ""
 
@@ -97,7 +102,8 @@ class GpuOut(BaseModel):
             total_mb=g.total_mb,
             used_mb=g.used_mb,
             free_mb=g.free_mb,
-            utilization_pct=g.utilization_pct,
+            utilization_pct=g.util_pct,
+            vram_pct=g.vram_pct,
             processes=[GpuProcessOut(pid=p.pid, used_mb=p.used_mb, name=p.name) for p in g.processes],
             error=g.error,
         )
@@ -114,7 +120,7 @@ class LoadedModel(BaseModel):
     on_cpu_bytes: int = 0
     spilled: bool = False
     fully_on_gpu: bool = True
-    gpu_utilization_pct: float = 0.0
+    gpu_vram_pct: float = 0.0  # share of the card's VRAM in use once loaded
 
 
 class LaneStatus(BaseModel):

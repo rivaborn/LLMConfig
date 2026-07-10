@@ -132,8 +132,8 @@ async function refreshStatus() {
     r.owner.textContent = l.owner;
     r.owner.className = "badge owner " + l.owner;
     const g = l.gpu || {};
-    r.vramFill.style.width = (g.found ? g.utilization_pct : 0) + "%";
-    r.vramText.textContent = g.found ? `${g.used_mb}/${g.total_mb} MiB (${g.utilization_pct}%)` : "GPU n/a";
+    r.vramFill.style.width = (g.found ? g.vram_pct : 0) + "%";
+    r.vramText.textContent = g.found ? `${g.used_mb}/${g.total_mb} MiB (${g.vram_pct}%)` : "GPU n/a";
     const lm = l.loaded;
     if (lm && lm.server === "ollama") {
       const spill = lm.spilled ? `, ${GIB(lm.on_cpu_bytes)} CPU` : " (all GPU)";

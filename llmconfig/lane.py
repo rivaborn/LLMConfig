@@ -93,7 +93,7 @@ class Lane:
             loaded = LoadedModel(
                 server="vllm",
                 model=served,
-                gpu_utilization_pct=gpu.utilization_pct,
+                gpu_vram_pct=gpu.vram_pct,
                 fully_on_gpu=True,
             )
         elif ollama_loaded:
@@ -108,7 +108,7 @@ class Lane:
                 on_cpu_bytes=on_cpu,
                 spilled=on_cpu > 0,
                 fully_on_gpu=on_cpu == 0,
-                gpu_utilization_pct=gpu.utilization_pct,
+                gpu_vram_pct=gpu.vram_pct,
             )
         else:
             owner = "free" if (not gpu.found or gpu.is_free(self.cfg.vram_free_baseline_mb)) else "unknown"
@@ -220,7 +220,7 @@ class Lane:
             )
 
         gpu = await self._gpu()
-        self.jobs.log(job, f"vLLM serving {served_target} (GPU {gpu.utilization_pct}% used)")
+        self.jobs.log(job, f"vLLM serving {served_target} (VRAM {gpu.vram_pct}% used)")
         return self._vllm_result(served_target, gpu)
 
     # ------------------------------------------------------------------ #
@@ -295,7 +295,7 @@ class Lane:
         self.jobs.log(
             job,
             f"loaded {req.model}: {_gib(match.size_vram_bytes)} on GPU / "
-            f"{_gib(on_cpu)} on CPU; GPU {gpu.utilization_pct}% used"
+            f"{_gib(on_cpu)} on CPU; VRAM {gpu.vram_pct}% used"
             + (" — WARNING premature spill" if premature else ""),
         )
         return LoadedModel(
@@ -306,7 +306,7 @@ class Lane:
             on_cpu_bytes=on_cpu,
             spilled=spilled,
             fully_on_gpu=not spilled,
-            gpu_utilization_pct=gpu.utilization_pct,
+            gpu_vram_pct=gpu.vram_pct,
         ).model_dump()
 
     async def _max_pack_reload(self, job: Job, req: LoadRequest, gpu: GpuInfo) -> Optional[dict]:
@@ -339,7 +339,7 @@ class Lane:
         return LoadedModel(
             server="vllm",
             model=served_name,
-            gpu_utilization_pct=gpu.utilization_pct,
+            gpu_vram_pct=gpu.vram_pct,
             fully_on_gpu=True,
         ).model_dump()
 

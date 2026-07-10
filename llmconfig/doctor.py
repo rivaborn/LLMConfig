@@ -60,7 +60,7 @@ async def _check_lane(add, settings: Settings, cfg: LaneConfig, registry: Regist
     # --- GPU (by UUID) ---
     gpu = await query_gpu(settings, uuid=cfg.gpu_uuid)
     if gpu.found:
-        add(f"{p}.gpu", True, f"{cfg.name}: {gpu.uuid}: {gpu.used_mb}/{gpu.total_mb} MiB ({gpu.utilization_pct}%)")
+        add(f"{p}.gpu", True, f"{cfg.name}: {gpu.uuid}: {gpu.used_mb}/{gpu.total_mb} MiB ({gpu.vram_pct}%)")
     else:
         add(f"{p}.gpu", False, gpu.error or f"{cfg.gpu_uuid} not reported by nvidia-smi")
 

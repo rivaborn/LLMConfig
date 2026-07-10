@@ -121,7 +121,9 @@ def gpu(lane: str = typer.Option("primary", "--lane", help="primary (3090) | com
     if not d["found"]:
         typer.secho(f"GPU not found: {d.get('error')}", fg="red")
         raise typer.Exit(1)
-    typer.echo(f"{d['uuid']}\n  {d['used_mb']}/{d['total_mb']} MiB used ({d['utilization_pct']}%)  free {d['free_mb']} MiB")
+    util = d.get("utilization_pct")
+    util_s = f"  util {util}%" if util is not None else ""
+    typer.echo(f"{d['uuid']}\n  {d['used_mb']}/{d['total_mb']} MiB used ({d['vram_pct']}%)  free {d['free_mb']} MiB{util_s}")
     for p in d.get("processes", []):
         typer.echo(f"    pid {p['pid']:>7}  {p['used_mb']:>6} MiB  {p['name']}")
 
@@ -242,7 +244,7 @@ def _print_lane(l: dict) -> None:
     typer.secho(f"[{label}] owner: {owner}{suffix}", fg=color, bold=True)
     g = l["gpu"]
     if g["found"]:
-        typer.echo(f"  gpu:   {g['used_mb']}/{g['total_mb']} MiB ({g['utilization_pct']}%)")
+        typer.echo(f"  gpu:   {g['used_mb']}/{g['total_mb']} MiB ({g['vram_pct']}%)")
     else:
         typer.echo(f"  gpu:   n/a ({g.get('error', '')})")
     lm = l.get("loaded")
