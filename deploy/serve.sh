@@ -252,6 +252,27 @@ case "$ALIAS" in
       --limit-mm-per-prompt '{"image":0,"video":0}' \
       --enable-auto-tool-choice --tool-call-parser qwen3_xml
     ;;
+  q36-27b-abl)
+    # Huihui-Qwen3.6-27B-abliterated-AWQ — the abliterated (refusal-removed) sibling
+    # of q36-27b. IDENTICAL architecture (Qwen3_5ForConditionalGeneration, model_type
+    # qwen3_5: Mamba-hybrid, head_dim 256, stealth-multimodal) and quant (AWQ-INT4,
+    # group_size 128, gemm; auto-round provider), so it reuses q36-27b's recipe verbatim
+    # — only the repo + served name change. ~19.6 GB weights, fits no-offload. FP8 KV +
+    # --enforce-eager; MM MUST be disabled (video profile-run OOMs WSL). --max-model-len
+    # 65536 (KV-full at util 0.93). Tool-calls via qwen3_xml (native). Added 2026-07-14.
+    exec vllm serve lhca521/Huihui-Qwen3.6-27B-abliterated-AWQ \
+      --host "$HOST" \
+      --port "$PORT" \
+      --served-model-name qwen3.6-27b-abl \
+      --max-model-len 65536 \
+      --max-num-batched-tokens 2048 \
+      --max-num-seqs 1 \
+      --gpu-memory-utilization 0.93 \
+      --kv-cache-dtype fp8 \
+      --enforce-eager \
+      --limit-mm-per-prompt '{"image":0,"video":0}' \
+      --enable-auto-tool-choice --tool-call-parser qwen3_xml
+    ;;
   q36-moe)
     # Qwen3.6-35B-A3B-AWQ — MoE (256 experts / 8 active) on the qwen3_5_moe arch
     # (Mamba-hybrid, head_dim 256, 262144 native, stealth-multimodal). AWQ-INT4
@@ -335,6 +356,7 @@ Fits single 3090 (24 GB) no offload:
   coder32       Qwen2.5-Coder-32B-Instruct-AWQ (coder, ~19 GB)
   coder30-awq   Qwen3-Coder-30B-A3B-AWQ        (MoE, ~17 GB, auto-DLs)
   q36-27b       Qwen3.6-27B-AWQ                (hybrid, ~20 GB)
+  q36-27b-abl   Huihui-Qwen3.6-27B-abliterated-AWQ (abliterated hybrid, ~20 GB)
   devstral      Devstral-Small-2507-AWQ        (~13 GB, mistral tokenizer)
   surya2        datalab-to/surya-ocr-2         (OCR VLM for epubocr, ~3 GB bf16)
 

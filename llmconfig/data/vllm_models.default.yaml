@@ -103,6 +103,15 @@ aliases:
     load_timeout_s: 300
     managed_by: serve.sh
 
+  - alias: q36-27b-abl
+    hf_repo: lhca521/Huihui-Qwen3.6-27B-abliterated-AWQ
+    served_name: qwen3.6-27b-abl
+    mode: eager
+    status: ok
+    notes: Abliterated (refusal-removed) sibling of q36-27b; identical qwen3_5 Mamba-hybrid arch + AWQ-INT4; ~20 GB; FP8 KV eager; 65536 ctx no-offload; MM disabled; tool-calls (qwen3_xml)
+    load_timeout_s: 300
+    managed_by: serve.sh
+
   - alias: devstral
     hf_repo: cyankiwi/Devstral-Small-2507-AWQ-4bit
     served_name: devstral
