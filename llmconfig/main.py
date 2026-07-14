@@ -5,6 +5,7 @@ edits/download) require `X-API-Key` only when LLMCONFIG_API_KEY is set.
 """
 from __future__ import annotations
 
+import shlex
 from contextlib import asynccontextmanager
 from typing import Optional
 
@@ -283,9 +284,21 @@ def create_app() -> FastAPI:
         job = jobs.create(kind=f"download:{repo}")
 
         async def run(job: Job) -> dict:
-            env = f"HF_TOKEN={settings.hf_token} " if settings.hf_token else ""
+            # `hf` lives in the WSL venv, not on the login PATH, so activate it first
+            # (a bare `hf download` under `bash -lc` fails "command not found"). Shell-
+            # quote the token + repo so an odd HF_TOKEN value can't break parsing — an
+            # unquoted prefix previously produced a `bash: unexpected EOF matching '`.
+            prefix = (
+                f"source {shlex.quote(settings.vllm_venv_activate)} "
+                "&& export HF_HUB_ENABLE_HF_TRANSFER=1 && "
+            )
+            if settings.hf_token:
+                prefix += f"HF_TOKEN={shlex.quote(settings.hf_token)} "
             jobs.log(job, f"hf download {repo} (may take a long time)…")
-            r = await run_wsl(f"{env}hf download {repo}", login=True, timeout=3 * 60 * 60, settings=settings)
+            r = await run_wsl(
+                f"{prefix}hf download {shlex.quote(repo)}",
+                login=True, timeout=3 * 60 * 60, settings=settings,
+            )
             if not r.ok:
                 raise RuntimeError(r.text()[:2000] or "hf download failed")
             return {"repo": repo, "output": r.out[-500:]}

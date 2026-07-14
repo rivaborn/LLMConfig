@@ -63,6 +63,9 @@ class Settings(BaseSettings):
     vllm_relay_url: str = "http://127.0.0.1:11437"  # 127.0.0.1, not localhost
     vllm_serve_script: str = "/home/folar/vllm/serve.sh"
     vllm_systemd_unit: str = "vllm@"  # templated user unit; instance = alias
+    # `hf` lives in this venv, NOT on the WSL login PATH — the download endpoint
+    # sources this before `hf download` (a bare `hf` fails "command not found").
+    vllm_venv_activate: str = "/home/folar/vllm/.venv/bin/activate"
 
     # --- WSL plumbing ---
     wsl_distro: str = "Ubuntu-24.04"
