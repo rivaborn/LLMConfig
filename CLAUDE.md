@@ -24,6 +24,17 @@ does **not** reimplement either server (vLLM lifecycle still goes through `serve
 
 ## The mental model (read once, it explains everything)
 
+There are two kinds of **unit**, and the UI/API treat them identically (Home tab =
+one box per unit; one control tab per unit; Monitor covers all of them):
+
+- a **`Lane`** — one local GPU arbitrated Ollama-XOR-vLLM (3090 / 3070 Ti);
+- a **`SparkUnit`** — one remote DGX Spark node driven by `sparkrun`.
+
+`settings.units()` = `lanes()` + `sparks()`; the orchestrator keys everything off
+`self.units`, while `self.lanes` stays GPU-only (the WSL keepalive and the vLLM
+release logic are meaningless for a remote node). Sparks are **off by default**
+(`SPARK_ENABLED`). The rest of this section describes the GPU-lane half.
+
 A **Lane** binds one inference-server *pair* (Ollama + vLLM) to **one GPU, matched by
 UUID**. The core guarantee is the **eviction-wait gate** in `lane.py`: before loading
 a target, the lane stops the other server + unloads all Ollama models on that card,
@@ -51,6 +62,14 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
   `query_all_gpus`), owns the **shared** `WslKeepalive` and `LaneDefaults`.
 - `lane.py` — `Lane`: the per-GPU arbitration state machine (eviction-wait gate,
   `_load_ollama`/`_load_vllm`, `unload`, `_max_pack_reload`). **The heart of the app.**
+- `spark_unit.py` — `SparkUnit`: one **remote DGX Spark node** as a unit. Same
+  duck-typed surface as `Lane` (`status`/`load`/`unload`/`touch`/`aclose`, own
+  `asyncio.Lock`, Job pattern) but no eviction gate and no local card — the node
+  *is* the unit and runs one sparkrun workload, so a swap is stop → run → wait-ready.
+- `backends/spark.py` — `SparkBackend`: three transports, each the most reliable
+  source for its job — **status over HTTP** (the node's `/v1/models`), **lifecycle
+  via the `sparkrun` CLI** through `run_wsl`, **telemetry over SSH** (`nvidia-smi`,
+  parsed by `gpu.py`).
 - `lane_state.py` — `LaneDefaults`: persist each lane's startup-default model to
   `data/lane_defaults.yaml`.
 - `backends/ollama.py` — `OllamaBackend`: REST client to the Ollama server + Windows
@@ -134,7 +153,17 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    carried the VRAM fraction, so external idle gates (LocalLLM_Code_Analysis's
    `Wait-GpuIdle`) saw a resident model as ~86% "busy" forever and deadlocked their
    runs. Off-box consumers key off this field — don't swap the semantics back.
-9. **Adding a vLLM model needs a `serve.sh` case, not just a registry row.** The
+9. **A Spark unit must never block `/api/status` on SSH.** The UI polls status every
+   2.5 s; a node's `nvidia-smi` is an SSH round-trip and a powered-off node costs the
+   full connect timeout. `SparkUnit.status()` therefore awaits **only** the fast HTTP
+   probe, serves the last telemetry sample, and refreshes it in a background task
+   (`_refresh_gpu_soon`); a repeated-failure breaker also backs off the HTTP probe.
+   Keep both — without them one dead Spark adds seconds to every status call for
+   every client. `tests/test_spark.py::test_status_never_awaits_ssh` guards this.
+10. **`sparkrun` command templates live in `Settings`, not in code.** Its flags shift
+   between releases, so `SPARK_RUN_CMD` / `SPARK_STOP_CMD` / `SPARK_SSH_CMD` are
+   `.env`-tunable. Fix a flag mismatch there, not by hardcoding a new argv.
+11. **Adding a vLLM model needs a `serve.sh` case, not just a registry row.** The
    registry's `launch_args` / `managed_by: registry` fields are currently **unwired** —
    `_load_vllm` always launches via `vllm@<alias>` → `serve.sh <alias>`, whose hardcoded
    `case` sets the args. A user-added model = add a `case` to `deploy/serve.sh` **and**

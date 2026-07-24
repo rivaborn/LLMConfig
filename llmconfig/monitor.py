@@ -79,6 +79,10 @@ class Monitor:
         self._stop = asyncio.Event()
         self._last_error = ""
         self._last_sample_ts = 0.0
+        # DGX Sparks are sampled over SSH, so they get a slower cadence than the
+        # local cards (one round-trip per node per tick would be wasteful).
+        self._last_spark_sample = 0.0
+        self._spark_interval = max(15.0, self.interval * 3)
         # persistence (best-effort SQLite; None when disabled or unavailable)
         self._persist = bool(settings.monitor_persist)
         self._db_path = Path(settings.monitor_db_path)
@@ -237,12 +241,53 @@ class Monitor:
             gpu_rows.append((m.uuid, m.index, m.name, track.mem_total_mb,
                              m.temp_c, hotspot, junction, m.power_w, m.util_pct,
                              m.mem_used_mb))
+        order.extend(await self._sample_sparks(now, gpu_rows))
         if order:
             self._order = order
         await self._sample_ollama(now)
         if self._db is not None:
             ollama_row = self._ollama[-1] if self._ollama else None
             await asyncio.to_thread(self._persist_sample, now, gpu_rows, ollama_row)
+
+    async def _sample_sparks(self, now: float, gpu_rows: list[tuple]) -> list[str]:
+        """Append a telemetry point for each reachable DGX Spark.
+
+        Each sample is an SSH round-trip, so Sparks are polled on a slower cadence
+        than the local cards (they're also thermally boring — ~25 W idle). A node
+        that doesn't answer is skipped silently and simply keeps its old track, so
+        an unplugged Spark never stalls the sampler or blanks the chart.
+        """
+        sparks = getattr(self.orch, "sparks", {})
+        if not sparks:
+            return []
+        if now - self._last_spark_sample < self._spark_interval:
+            # Keep them in the display order even on ticks we don't re-poll.
+            return [u.cfg.gpu_uuid for u in sparks.values() if u.cfg.gpu_uuid in self._gpus]
+        self._last_spark_sample = now
+
+        results = await asyncio.gather(
+            *(u.spark.metrics() for u in sparks.values()), return_exceptions=True
+        )
+        seen: list[str] = []
+        for unit, m in zip(sparks.values(), results):
+            if isinstance(m, BaseException) or m is None:
+                if unit.cfg.gpu_uuid in self._gpus:
+                    seen.append(unit.cfg.gpu_uuid)
+                continue
+            track = self._gpus.get(m.uuid)
+            if track is None:
+                track = GpuTrack(m.index, m.uuid, m.name, m.mem_total_mb)
+                self._gpus[m.uuid] = track
+            track.index, track.name = m.index, m.name
+            if m.mem_total_mb:
+                track.mem_total_mb = m.mem_total_mb
+            # No NVAPI on a remote node — hotspot/junction stay None.
+            track.points.append((now, m.temp_c, None, None, m.power_w, m.util_pct, m.mem_used_mb))
+            self._prune(track.points, now)
+            gpu_rows.append((m.uuid, m.index, m.name, track.mem_total_mb,
+                             m.temp_c, None, None, m.power_w, m.util_pct, m.mem_used_mb))
+            seen.append(m.uuid)
+        return seen
 
     async def _sample_ollama(self, now: float) -> None:
         """Primary lane's Ollama GPU/CPU split (size_vram / size)."""

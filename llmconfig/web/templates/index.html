@@ -9,26 +9,23 @@
 <body>
   <header>
     <div class="brand">LLM<span>Config</span></div>
-    <nav class="tabs" role="tablist" aria-label="Views">
-      <button class="tab active" data-view="control" role="tab" aria-selected="true">Control</button>
-      <button class="tab" data-view="monitor" role="tab" aria-selected="false">Monitor</button>
-    </nav>
+    <!-- Tabs are built at runtime from /api/lanes: Home, one per LLM unit
+         (3090 / 3070 Ti / each DGX Spark), then Monitor. -->
+    <nav class="tabs" id="tabs" role="tablist" aria-label="Views"></nav>
     <details class="keybox">
       <summary>⚙</summary>
       <label>API key <input id="apikey" type="password" placeholder="X-API-Key (if set)" /></label>
     </details>
   </header>
 
-  <main id="view-control" class="view active" role="tabpanel">
-    <div class="control-main">
-      <p class="hint">Each GPU lane runs one model at a time (Ollama ⇄ vLLM); lanes are independent.</p>
-      <div id="lanes" class="lanes"></div>
-    </div>
-    <aside class="activity">
-      <h2>Activity</h2>
-      <pre id="log" class="log">idle</pre>
-    </aside>
-  </main>
+  <!-- Home: one box per LLM unit with its loaded model + a quick-switch dropdown. -->
+  <section id="view-home" class="view active" role="tabpanel">
+    <p class="hint">Every LLM unit at a glance. Pick a model to switch that unit; each runs one model at a time.</p>
+    <div id="unit-grid" class="unit-grid"></div>
+  </section>
+
+  <!-- Per-unit views are injected here by app.js (id="view-<unitId>"). -->
+  <div id="unit-views"></div>
 
   <section id="view-monitor" class="view" role="tabpanel" hidden>
     <div id="offload-banner" class="offload-banner" hidden></div>
@@ -53,6 +50,14 @@
     <div id="charts" class="charts"></div>
     <p id="monitor-note" class="monitor-note"></p>
   </section>
+
+  <!-- One shared activity log for every view (a DOM node can only live in one
+       place, and job output is global anyway). Collapsible so it stays out of
+       the way on the Monitor tab. -->
+  <details class="activity" id="activity" open>
+    <summary>Activity</summary>
+    <pre id="log" class="log">idle</pre>
+  </details>
 
   <script src="/static/app.js" defer></script>
   <script src="/static/monitor.js" defer></script>

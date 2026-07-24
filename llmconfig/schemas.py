@@ -5,11 +5,17 @@ from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
-ServerName = Literal["ollama", "vllm"]
-Owner = Literal["free", "ollama", "vllm", "unknown"]
+ServerName = Literal["ollama", "vllm", "spark"]
+Owner = Literal["free", "ollama", "vllm", "spark", "unknown"]
 JobState = Literal["pending", "running", "succeeded", "failed"]
 # free = nothing loaded; idle = model resident but unused; active = model in use
 LaneUsage = Literal["free", "idle", "active"]
+# "gpu"   = a local card arbitrated Ollama-XOR-vLLM (the 3090 / 3070 Ti lanes)
+# "spark" = a remote DGX Spark node driven by sparkrun; the node IS the unit, so
+#           there is no intra-unit arbitration and no local nvidia-smi.
+UnitKind = Literal["gpu", "spark"]
+# The set of owners that mean "something we manage holds this unit".
+MANAGED_OWNERS: tuple[str, ...] = ("ollama", "vllm", "spark")
 
 
 # --------------------------------------------------------------------------- #
@@ -63,11 +69,56 @@ class VllmAliasEntry(BaseModel):
         )
 
 
+class SparkModel(BaseModel):
+    """Public view of one curated sparkrun recipe available on a Spark node."""
+
+    alias: str
+    server: ServerName = "spark"
+    recipe: str = ""         # the sparkrun recipe id actually launched
+    served_name: str = ""    # what the node's /v1/models reports once up
+    tp: int = 1              # node count; 1 until the 200G switch lands
+    status: str = "ok"       # "ok" | "blocked" | "unverified"
+    notes: str = ""
+    loaded: bool = False
+    load_timeout_s: int = 900
+
+
+class SparkModelEntry(BaseModel):
+    """Full curated catalog record (persisted to data/spark_models_<unit>.yaml).
+
+    sparkrun can enumerate hundreds of registry recipes; this is the small
+    hand-maintained set this lab actually serves on a given node — the same
+    role `VllmAliasEntry` plays for vLLM.
+    """
+
+    alias: str
+    recipe: str = ""
+    served_name: str = ""
+    tp: int = 1
+    status: str = "ok"
+    notes: str = ""
+    extra_args: list[str] = Field(default_factory=list)
+    load_timeout_s: int = 900
+
+    def to_public(self) -> "SparkModel":
+        return SparkModel(
+            alias=self.alias,
+            recipe=self.recipe or self.alias,
+            served_name=self.served_name or self.alias,
+            tp=self.tp,
+            status=self.status,
+            notes=self.notes,
+            load_timeout_s=self.load_timeout_s,
+        )
+
+
 class ModelsResponse(BaseModel):
     ollama: list[OllamaModel] = Field(default_factory=list)
     vllm: list[VllmAlias] = Field(default_factory=list)
+    spark: list[SparkModel] = Field(default_factory=list)
     ollama_error: str = ""
     vllm_error: str = ""
+    spark_error: str = ""
 
 
 # --------------------------------------------------------------------------- #
@@ -124,17 +175,28 @@ class LoadedModel(BaseModel):
 
 
 class LaneStatus(BaseModel):
-    """Per-GPU lane state. The primary lane is the RTX 3090; an optional companion
-    lane is the RTX 3070 Ti. Each lane independently arbitrates Ollama-XOR-vLLM."""
+    """Per-unit state. `kind="gpu"` lanes are local cards arbitrating Ollama-XOR-vLLM
+    (primary = RTX 3090, companion = RTX 3070 Ti); `kind="spark"` units are remote
+    DGX Spark nodes driven by sparkrun, where the node itself is the unit.
+
+    The name is historical — it predates non-GPU units — but the shape is shared so
+    every unit renders through one code path in the UI and one `/api/status` schema.
+    """
 
     id: str
     name: str
+    kind: UnitKind = "gpu"
+    host: str = ""            # remote units: the node's LAN address; "" for local lanes
+    reachable: bool = True    # remote units: last probe succeeded
     enabled: bool = True
     owner: Owner
     ollama_up: bool
     vllm_up: bool
     loaded: Optional[LoadedModel] = None
-    gpu: GpuOut
+    # Remote units have no local card, so this defaults to a not-found GpuOut rather
+    # than being required; Spark telemetry (when available) is filled in from the
+    # node's own nvidia-smi over SSH.
+    gpu: GpuOut = Field(default_factory=lambda: GpuOut(found=False))
     swap_in_progress: bool = False
     active_job_id: Optional[str] = None
     idle_s: Optional[float] = None  # seconds since last observed activity (idle-reaper input)

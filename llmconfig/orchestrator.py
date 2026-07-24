@@ -1,25 +1,40 @@
-"""Coordinator over one or more GPU lanes.
+"""Coordinator over every LLM unit.
 
-Each `Lane` (see `lane.py`) owns the arbitration for a single card; the Orchestrator
-just builds the lanes from `settings.lanes()`, routes load/unload to the right lane,
-and aggregates per-lane status. The WSL keepalive is shared (one distro hosts every
-lane's vLLM relay).
+Two kinds of unit exist and the orchestrator is what makes them interchangeable:
+
+* a **`Lane`** (`lane.py`) — one local card arbitrated Ollama-XOR-vLLM, with the
+  eviction-wait gate. The RTX 3090 (`primary`) and RTX 3070 Ti (`companion`).
+* a **`SparkUnit`** (`spark_unit.py`) — one remote DGX Spark node driven by
+  `sparkrun`. The node is the unit; no local GPU, no keepalive.
+
+Both satisfy the same duck-typed contract (see `UNIT_METHODS`), so routing,
+status aggregation, defaults, and autoload are written once against `self.units`.
+`self.lanes` still exposes only the GPU lanes, because the WSL keepalive and the
+Ollama/vLLM back-compat shims are meaningless for a remote node.
 """
 from __future__ import annotations
 
 import asyncio
-from typing import Optional
+from typing import Optional, Union
 
 from .backends.ollama import OllamaBackend
 from .backends.vllm import VllmBackend
-from .config import Settings
+from .config import Settings, SparkConfig
 from .jobs import JobManager
 from .gpu import GpuInfo, query_all_gpus
 from .lane import Lane
 from .lane_state import LaneDefaults
-from .registry import DEFAULT_COMPANION_REGISTRY, Registry
+from .registry import DEFAULT_COMPANION_REGISTRY, Registry, SparkRegistry
 from .schemas import Job, LaneStatus, LoadRequest, StatusResponse, UnloadRequest
+from .spark_unit import SparkUnit
 from .wsl import WslKeepalive
+
+Unit = Union[Lane, SparkUnit]
+
+# The duck-typed surface every unit must provide. Kept here as documentation and
+# as the assertion target in tests — there is no ABC, because `Lane` predates the
+# split and shares none of `SparkUnit`'s internals.
+UNIT_METHODS = ("status", "load", "unload", "touch", "aclose")
 
 
 class Orchestrator:
@@ -28,7 +43,8 @@ class Orchestrator:
         self.jobs = jobs
         self.keepalive = WslKeepalive(settings)
         self.defaults = LaneDefaults(settings)
-        self.lanes: dict[str, Lane] = {}
+        self.units: dict[str, Unit] = {}
+
         for cfg in settings.lanes():
             # The primary lane reuses the registry the app already loaded; the companion
             # lane loads its own (small, 8 GB-friendly) catalog from its configured path.
@@ -36,18 +52,34 @@ class Orchestrator:
                 reg = registry
             else:
                 reg = Registry(cfg.registry_path, default_path=DEFAULT_COMPANION_REGISTRY)
-            self.lanes[cfg.id] = Lane(settings, cfg, reg, jobs, self.keepalive)
+            self.units[cfg.id] = Lane(settings, cfg, reg, jobs, self.keepalive)
 
-    # ---- lane access / back-compat shims ----
-    def lane(self, lane_id: str) -> Lane:
-        lane = self.lanes.get(lane_id)
-        if lane is None:
-            raise KeyError(f"unknown lane '{lane_id}' (have: {', '.join(self.lanes)})")
-        return lane
+        for scfg in settings.sparks():
+            self.units[scfg.id] = SparkUnit(settings, scfg, SparkRegistry(scfg.registry_path), jobs)
+
+    # ---- unit access ----
+    def unit(self, unit_id: str) -> Unit:
+        u = self.units.get(unit_id)
+        if u is None:
+            raise KeyError(f"unknown unit '{unit_id}' (have: {', '.join(self.units)})")
+        return u
+
+    # `lane()` is the historical name and still the one the REST layer uses.
+    lane = unit
+
+    @property
+    def lanes(self) -> dict[str, Lane]:
+        """Only the local GPU lanes — what the keepalive and idle-reaper vLLM logic
+        legitimately care about. Use `units` for anything unit-kind-agnostic."""
+        return {k: v for k, v in self.units.items() if isinstance(v, Lane)}
+
+    @property
+    def sparks(self) -> dict[str, SparkUnit]:
+        return {k: v for k, v in self.units.items() if isinstance(v, SparkUnit)}
 
     @property
     def primary(self) -> Lane:
-        return self.lanes["primary"]
+        return self.units["primary"]  # type: ignore[return-value]
 
     @property
     def ollama(self) -> OllamaBackend:
@@ -59,18 +91,22 @@ class Orchestrator:
 
     # ---- status (aggregate) ----
     async def status(self) -> StatusResponse:
-        gpus = await query_all_gpus(self.s)  # one nvidia-smi for every lane's card
+        # One nvidia-smi for every LOCAL card. Sparks aren't in this namespace —
+        # each fetches its own telemetry over SSH inside its status() call.
+        gpus = await query_all_gpus(self.s)
 
-        async def _lane_status(lane: Lane) -> LaneStatus:
-            gpu = gpus.get(lane.cfg.gpu_uuid) or GpuInfo(
-                found=False, uuid=lane.cfg.gpu_uuid, error=f"GPU {lane.cfg.gpu_uuid} not present"
-            )
-            return await lane.status(gpu=gpu)
+        async def _unit_status(u: Unit) -> LaneStatus:
+            if isinstance(u, Lane):
+                gpu = gpus.get(u.cfg.gpu_uuid) or GpuInfo(
+                    found=False, uuid=u.cfg.gpu_uuid, error=f"GPU {u.cfg.gpu_uuid} not present"
+                )
+                return await u.status(gpu=gpu)
+            return await u.status()
 
-        lane_statuses: list[LaneStatus] = list(
-            await asyncio.gather(*(_lane_status(lane) for lane in self.lanes.values()))
+        statuses: list[LaneStatus] = list(
+            await asyncio.gather(*(_unit_status(u) for u in self.units.values()))
         )
-        primary = next((s for s in lane_statuses if s.id == "primary"), lane_statuses[0])
+        primary = next((s for s in statuses if s.id == "primary"), statuses[0])
         return StatusResponse(
             owner=primary.owner,
             ollama_up=primary.ollama_up,
@@ -79,43 +115,46 @@ class Orchestrator:
             gpu=primary.gpu,
             swap_in_progress=primary.swap_in_progress,
             active_job_id=primary.active_job_id,
-            lanes=lane_statuses,
+            lanes=statuses,
         )
 
-    # ---- load / unload (routed to a lane) ----
+    # ---- load / unload (routed to a unit) ----
     def load(self, req: LoadRequest) -> Job:
-        return self.lane(req.lane).load(req)
+        return self.unit(req.lane).load(req)
 
     async def unload(self, req: UnloadRequest) -> StatusResponse:
-        await self.lane(req.lane).unload(req)
+        await self.unit(req.lane).unload(req)
         return await self.status()
 
-    # ---- per-lane defaults ("what runs on this card") ----
-    def default_for(self, lane_id: str) -> Optional[dict]:
-        """Persisted override, else the static config seed (companion_default_*)."""
-        d = self.defaults.get(lane_id)
+    # ---- per-unit defaults ("what runs on this unit") ----
+    def default_for(self, unit_id: str) -> Optional[dict]:
+        """Persisted override, else the static config seed."""
+        d = self.defaults.get(unit_id)
         if d:
             return d
-        for cfg in self.s.lanes():
-            if cfg.id == lane_id and cfg.default_model and cfg.default_server in ("ollama", "vllm"):
+        for cfg in self.s.units():
+            if cfg.id != unit_id or not cfg.default_model:
+                continue
+            if isinstance(cfg, SparkConfig):
+                return {"server": "spark", "model": cfg.default_model}
+            if cfg.default_server in ("ollama", "vllm"):
                 return {"server": cfg.default_server, "model": cfg.default_model}
         return None
 
     def autoload_defaults(self) -> list[Job]:
-        """Fire (don't await) a load Job for every enabled lane that has a default."""
+        """Fire (don't await) a load Job for every enabled unit that has a default."""
         jobs: list[Job] = []
-        for cfg in self.s.lanes():
+        for cfg in self.s.units():
             if not cfg.enabled:
                 continue
             d = self.default_for(cfg.id)
-            if not d or d["server"] not in ("ollama", "vllm") or not d["model"]:
+            if not d or d["server"] not in ("ollama", "vllm", "spark") or not d["model"]:
                 continue
             req = LoadRequest(server=d["server"], model=d["model"], lane=cfg.id)
-            jobs.append(self.lane(cfg.id).load(req))
+            jobs.append(self.unit(cfg.id).load(req))
         return jobs
 
     async def aclose(self) -> None:
-        """Close every lane's pooled HTTP clients (call on app shutdown)."""
-        for lane in self.lanes.values():
-            await lane.ollama.aclose()
-            await lane.vllm.aclose()
+        """Close every unit's pooled HTTP clients (call on app shutdown)."""
+        for u in self.units.values():
+            await u.aclose()

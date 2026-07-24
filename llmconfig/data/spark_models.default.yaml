@@ -1,0 +1,45 @@
+# Curated sparkrun recipes for a single DGX Spark (GB10) node.
+#
+# Seeded into ../../data/spark_models_<unit>.yaml on first run, then editable per
+# node through the UI / API. sparkrun's synced registries carry ~147 models; this
+# is the small set this lab actually serves, mirroring the vLLM alias registry.
+#
+# tp = node count. Everything here is tp: 1 — the 200G switch has not been
+# delivered, so the four Sparks run as independent single-node servers. Raise tp
+# only after the fabric is up (see the wiki runbook).
+#
+# status: "unverified" until it has been launched and recall-tested on THIS
+# cluster. The decode figures in the notes are community numbers from the Spark
+# Arena leaderboard, not measurements from this lab.
+models:
+  - alias: gpt-oss-120b
+    recipe: gpt-oss-120b
+    served_name: gpt-oss-120b
+    tp: 1
+    status: unverified
+    notes: "MXFP4. Community 1-node decode ~58.8 t/s, strong prefill (~6000 t/s)."
+    load_timeout_s: 1200
+
+  - alias: qwen3-coder-next
+    recipe: Qwen3-Coder-Next
+    served_name: Qwen3-Coder-Next
+    tp: 1
+    status: unverified
+    notes: "INT4/FP8. Community 1-node decode ~73.3 t/s — fastest on a single node."
+    load_timeout_s: 900
+
+  - alias: qwen35-35b-a3b
+    recipe: Qwen3.5-35B-A3B
+    served_name: Qwen3.5-35B-A3B
+    tp: 1
+    status: unverified
+    notes: "FP8 MoE. ~50.8 t/s single-stream, ~196 t/s aggregate at c10."
+    load_timeout_s: 900
+
+  - alias: gemma-4-26b
+    recipe: gemma-4-26B-A4B-it
+    served_name: gemma-4-26B-A4B-it
+    tp: 1
+    status: unverified
+    notes: "FP8. ~47.4 t/s on one node."
+    load_timeout_s: 900

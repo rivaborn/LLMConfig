@@ -19,6 +19,8 @@ env/
 # The user edits these copies; the committed seeds are the defaults.
 /data/vllm_models.yaml
 /data/vllm_models_companion.yaml
+# Per-Spark curated recipe catalogs (seeded from llmconfig/data/spark_models.default.yaml).
+/data/spark_models_*.yaml
 # Runtime-generated per-lane default-model state (set via UI/CLI).
 /data/lane_defaults.yaml
 # Monitor-tab telemetry history (SQLite + WAL sidecars).

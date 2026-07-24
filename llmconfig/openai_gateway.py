@@ -28,8 +28,9 @@ from fastapi.responses import JSONResponse, Response, StreamingResponse
 from .config import Settings
 from .jobs import JobManager
 from .lane import Lane
-from .orchestrator import Orchestrator
+from .orchestrator import Orchestrator, Unit
 from .schemas import LoadRequest
+from .spark_unit import SparkUnit
 
 
 class OpenAIGateway:
@@ -57,20 +58,32 @@ class OpenAIGateway:
     # ------------------------------------------------------------------ #
     # Helpers
     # ------------------------------------------------------------------ #
-    def lane(self, lane_id: str) -> Lane:
+    def lane(self, lane_id: str) -> "Unit":
         try:
             return self.orch.lane(lane_id)
         except KeyError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-    async def resolve(self, lane: Lane, model: str) -> Optional[tuple[str, str, str]]:
+    async def resolve(self, lane: "Unit", model: str) -> Optional[tuple[str, str, str]]:
         """Map an OpenAI `model` id → (server, load_arg, backend_base_url).
 
+        - on a Spark unit: a curated `served_name` → ("spark", alias, node api base)
         - a vLLM `served_name` (uses `-`) → ("vllm", alias, lane relay url)
         - else an Ollama tag (has `:`)     → ("ollama", tag, lane ollama url)
-        - else None (→ 404). vLLM/Ollama id formats don't collide.
+        - else None (→ 404). The id formats don't collide.
         """
         if not model:
+            return None
+        # A Spark node serves one workload; its catalog is the only thing to match.
+        if isinstance(lane, SparkUnit):
+            fallback: Optional[str] = None
+            for e in lane.registry.entries():
+                if (e.served_name or e.alias) == model:
+                    if e.status != "blocked":
+                        return ("spark", e.alias, lane.cfg.api_base)
+                    fallback = fallback or e.alias
+            if fallback is not None:
+                return ("spark", fallback, lane.cfg.api_base)
             return None
         # vLLM: match the served_name; prefer a non-blocked alias if several ever share one.
         match: Optional[str] = None
@@ -307,7 +320,12 @@ class OpenAIGateway:
         if short_circuit or job is None:
             return JSONResponse(content=self._minimal_completion(model, is_chat))
 
-        if server == "vllm":
+        if server == "spark":
+            entry = lane.registry.get(load_arg)
+            # Spark cold starts pull large weights over the network — give them the
+            # per-recipe budget plus slack rather than the generic 600 s.
+            timeout = float(entry.load_timeout_s if entry else lane.cfg.load_timeout_s) + 60.0
+        elif server == "vllm":
             entry = lane.registry.get(load_arg)
             base = float(entry.load_timeout_s if entry else self.s.default_vllm_load_timeout_s)
             timeout = base + self.s.vllm_ready_grace_s + 30.0
@@ -329,14 +347,18 @@ class OpenAIGateway:
         # Track the backend each id came from (the gateway's own source of truth), so
         # the display `name` is tagged from that — not guessed from the id convention.
         tagged: list[tuple[str, str]] = []  # (id, backend label)
-        for e in lane.registry.entries():
-            tagged.append((e.served_name or e.alias, "vLLM"))
-        try:
-            for m in await lane.ollama.list_models():
-                if m.name:
-                    tagged.append((m.name, "Ollama"))
-        except Exception:
-            pass
+        if isinstance(lane, SparkUnit):
+            for se in lane.registry.entries():
+                tagged.append((se.served_name or se.alias, f"Spark {lane.cfg.name}"))
+        else:
+            for e in lane.registry.entries():
+                tagged.append((e.served_name or e.alias, "vLLM"))
+            try:
+                for m in await lane.ollama.list_models():
+                    if m.name:
+                        tagged.append((m.name, "Ollama"))
+            except Exception:
+                pass
         seen: set[str] = set()
         data = []
         for mid, label in tagged:

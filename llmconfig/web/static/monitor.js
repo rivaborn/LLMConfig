@@ -18,28 +18,13 @@ const MON = {
 // Core boost-clock throttle point for the RTX 3090 — a reference line, not a limit.
 const TEMP_REDLINE = 83;
 
-// ---- tab switching -------------------------------------------------------
-function showView(name) {
-  document.querySelectorAll(".tab").forEach((t) => {
-    const on = t.dataset.view === name;
-    t.classList.toggle("active", on);
-    t.setAttribute("aria-selected", on ? "true" : "false");
-  });
-  document.querySelectorAll(".view").forEach((v) => {
-    const on = v.id === "view-" + name;
-    v.classList.toggle("active", on);
-    v.hidden = !on;
-  });
-  MON.active = name === "monitor";
-  if (location.hash !== "#" + name) history.replaceState(null, "", "#" + name);
-  if (MON.active) startMonitor();
-  else stopMonitor();
-}
-document.querySelectorAll(".tab").forEach((t) =>
-  t.addEventListener("click", () => showView(t.dataset.view))
-);
-// Deep-link the active tab so the Monitor view is bookmarkable / shareable.
-if (location.hash === "#monitor") showView("monitor");
+// ---- tab integration -----------------------------------------------------
+// app.js owns tab switching (the unit tabs are built at runtime from /api/lanes)
+// and calls these hooks so the Monitor only polls while its tab is visible.
+window.MonitorHooks = {
+  start() { MON.active = true; startMonitor(); },
+  stop() { MON.active = false; stopMonitor(); },
+};
 
 // ---- segmented controls --------------------------------------------------
 function wireSeg(id, key, parse) {

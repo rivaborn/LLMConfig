@@ -29,11 +29,13 @@ from .schemas import (
     LaneUsageOut,
     LoadRequest,
     ModelsResponse,
+    SparkModelEntry,
     StatusResponse,
     UnloadRequest,
     UsageResponse,
     VllmAliasEntry,
 )
+from .spark_unit import SparkUnit
 from .wsl import run_wsl
 
 WEB_DIR = PACKAGE_DIR / "web"
@@ -114,11 +116,14 @@ def create_app() -> FastAPI:
         # browsers heuristically serve a stale style.css/app.js after a redeploy
         # (the tab rules would be missing → views stack). Tag each asset URL with
         # the newest static-file mtime so a changed file always fetches fresh.
+        static_files = list((WEB_DIR / "static").glob("*.*"))
         try:
-            token = str(int(max(p.stat().st_mtime for p in (WEB_DIR / "static").glob("*.*"))))
+            token = str(int(max(p.stat().st_mtime for p in static_files)))
         except (ValueError, OSError):
             token = __version__
-        for asset in ("style.css", "app.js", "monitor.js"):
+        # Derived from what's actually on disk rather than a hardcoded list, so a
+        # newly added asset can't silently ship un-busted.
+        for asset in sorted(p.name for p in static_files):
             html = html.replace(f"/static/{asset}\"", f"/static/{asset}?v={token}\"")
         # Always revalidate the HTML itself so new tokens are picked up.
         return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
@@ -152,6 +157,12 @@ def create_app() -> FastAPI:
     async def api_models(lane: str = "primary") -> ModelsResponse:
         ln = _lane(lane)
         resp = ModelsResponse()
+        if isinstance(ln, SparkUnit):
+            try:
+                resp.spark = await ln.spark.list_models()
+            except Exception as e:
+                resp.spark_error = f"{type(e).__name__}: {e}"
+            return resp
         try:
             resp.ollama = await ln.ollama.list_models()
         except Exception as e:
@@ -164,13 +175,24 @@ def create_app() -> FastAPI:
 
     @app.get("/api/gpu", response_model=GpuOut)
     async def api_gpu(lane: str = "primary") -> GpuOut:
-        return GpuOut.from_info(await query_gpu(settings, uuid=_lane(lane).cfg.gpu_uuid))
+        ln = _lane(lane)
+        if isinstance(ln, SparkUnit):  # remote node — its own nvidia-smi over SSH
+            return GpuOut.from_info(await ln.spark.gpu())
+        return GpuOut.from_info(await query_gpu(settings, uuid=ln.cfg.gpu_uuid))
 
     @app.get("/api/lanes")
     async def api_lanes() -> list[dict]:
+        """Every LLM unit, in display order — what the UI turns into tabs/cards."""
         return [
-            {"id": cfg.id, "name": cfg.name, "enabled": cfg.enabled, "default": orch.default_for(cfg.id)}
-            for cfg in settings.lanes()
+            {
+                "id": cfg.id,
+                "name": cfg.name,
+                "kind": getattr(cfg, "kind", "gpu"),
+                "host": getattr(cfg, "host", ""),
+                "enabled": cfg.enabled,
+                "default": orch.default_for(cfg.id),
+            }
+            for cfg in settings.units()
         ]
 
     @app.get("/api/jobs", response_model=list[Job])
@@ -270,11 +292,34 @@ def create_app() -> FastAPI:
         model = (body.get("model") or "").strip()
         if not model:
             orch.defaults.clear(lane_id)
-        elif server not in ("ollama", "vllm"):
-            raise HTTPException(status_code=400, detail="server must be 'ollama' or 'vllm'")
+        elif server not in ("ollama", "vllm", "spark"):
+            raise HTTPException(status_code=400, detail="server must be 'ollama', 'vllm' or 'spark'")
         else:
             orch.defaults.set(lane_id, server, model)
         return {"lane": lane_id, "default": orch.default_for(lane_id)}
+
+    # ---- curated Spark model catalog (mirrors the vLLM alias endpoints) ----
+    def _spark(lane_id: str) -> SparkUnit:
+        unit = _lane(lane_id)
+        if not isinstance(unit, SparkUnit):
+            raise HTTPException(status_code=400, detail=f"unit '{lane_id}' is not a DGX Spark")
+        return unit
+
+    @app.get("/api/spark/models", response_model=list[SparkModelEntry])
+    async def api_spark_models(lane: str) -> list[SparkModelEntry]:
+        return _spark(lane).registry.entries()
+
+    @app.put("/api/spark/models/{alias}", response_model=SparkModelEntry, dependencies=write)
+    async def api_spark_model_upsert(alias: str, entry: SparkModelEntry, lane: str) -> SparkModelEntry:
+        entry.alias = alias
+        _spark(lane).registry.upsert(entry)
+        return entry
+
+    @app.delete("/api/spark/models/{alias}", dependencies=write)
+    async def api_spark_model_delete(alias: str, lane: str) -> dict:
+        if not _spark(lane).registry.remove(alias):
+            raise HTTPException(status_code=404, detail="model not found")
+        return {"deleted": alias}
 
     @app.post("/api/vllm/download", response_model=Job, dependencies=write)
     async def api_vllm_download(body: dict) -> Job:

@@ -36,12 +36,11 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 from .config import Settings
-from .schemas import LaneStatus, LaneUsage, UnloadRequest
+from .schemas import MANAGED_OWNERS, LaneStatus, LaneUsage, UnloadRequest
 
 if TYPE_CHECKING:
-    from .lane import Lane
     from .monitor import Monitor
-    from .orchestrator import Orchestrator
+    from .orchestrator import Orchestrator, Unit
 
 log = logging.getLogger(__name__)
 
@@ -59,7 +58,7 @@ def classify_usage(st: LaneStatus, current_util_pct: float | None,
     """
     if st.swap_in_progress:
         return "active"  # a load/unload is running — the lane is busy, not free
-    if st.owner not in ("ollama", "vllm"):
+    if st.owner not in MANAGED_OWNERS:
         return "free"
     if st.idle_s is not None and st.idle_s <= settings.usage_active_window_s:
         return "active"
@@ -108,17 +107,19 @@ class IdleReaper:
 
     # ---- one policy pass ----
     async def _tick(self) -> None:
+        # Every unit participates (Sparks are opted out via their own
+        # idle_unload_enabled, but their idle_s/usage still needs folding in).
         reaped_vllm = False
-        for lane in list(self.orch.lanes.values()):
+        for lane in list(self.orch.units.values()):
             try:
                 reaped_vllm |= await self._check_lane(lane)
-            except Exception as e:  # noqa: BLE001 — one lane's failure can't starve the other
+            except Exception as e:  # noqa: BLE001 — one unit's failure can't starve the others
                 log.warning("idle reaper: lane %s check failed: %s: %s",
                             lane.cfg.id, type(e).__name__, e)
         if reaped_vllm:
             await self._maybe_release_keepalive()
 
-    async def _check_lane(self, lane: "Lane") -> bool:
+    async def _check_lane(self, lane: "Unit") -> bool:
         """Reap the lane if idle past the timeout. Returns True if vLLM was reaped."""
         # Fold in the Monitor util signal (catches direct-to-backend clients). Done
         # even for reap-exempt lanes so their idle_s / usage classification stays honest.
@@ -135,9 +136,9 @@ class IdleReaper:
         idle = time.time() - lane.last_activity
         if idle < self.timeout_s:
             return False
-        # Something we manage must actually hold the card (free/unknown → nothing to do).
+        # Something we manage must actually hold the unit (free/unknown → nothing to do).
         st = await lane.status()
-        if st.swap_in_progress or st.owner not in ("ollama", "vllm"):
+        if st.swap_in_progress or st.owner not in MANAGED_OWNERS:
             return False
         # Final sync re-check, then reap through the existing lock + eviction-wait
         # path. No await between the check and unload(): an uncontended asyncio.Lock

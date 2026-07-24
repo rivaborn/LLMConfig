@@ -58,10 +58,17 @@ class Lane:
         # app start, so an autoloaded default gets a full idle window before reaping.
         self.last_activity: float = time.time()
 
+    kind = "gpu"
+
     def touch(self, ts: float | None = None) -> None:
         """Record lane activity for the idle reaper. Never moves the clock backwards,
         so a stale Monitor sample can't shorten the idle window."""
         self.last_activity = max(self.last_activity, time.time() if ts is None else ts)
+
+    async def aclose(self) -> None:
+        """Close pooled HTTP clients (part of the shared unit contract)."""
+        await self.ollama.aclose()
+        await self.vllm.aclose()
 
     async def _gpu(self) -> GpuInfo:
         """This lane's card only (by UUID) — never the other lane's."""

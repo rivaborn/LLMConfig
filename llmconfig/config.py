@@ -40,6 +40,67 @@ class LaneConfig:
     # Whether the idle reaper may unload this lane (the global idle_unload_enabled
     # is the master switch; this is per-lane participation).
     idle_unload_enabled: bool = True
+    kind: str = "gpu"
+
+
+@dataclass(frozen=True)
+class SparkConfig:
+    """One remote NVIDIA DGX Spark (GB10) node, driven by `sparkrun` over WSL.
+
+    Unlike a `LaneConfig` there is no intra-unit arbitration: the node *is* the
+    unit and serves exactly one model at a time (one sparkrun workload), so there
+    is no eviction-wait gate and no local nvidia-smi UUID. Status is read over
+    HTTP from the node's OpenAI endpoint; lifecycle goes through sparkrun.
+    """
+
+    id: str                       # "spark1".."spark4" — the API/lane key
+    name: str                     # display label, e.g. "spark-cc9b"
+    host: str                     # LAN address, e.g. "192.168.1.50"
+    ssh_user: str                 # SSH user on the node (for remote nvidia-smi)
+    api_port: int                 # OpenAI-compatible port the workload serves on
+    registry_path: Path           # curated per-node model catalog
+    enabled: bool = True
+    # GB10 is 128 GB unified memory; nvidia-smi reports memory.total as [N/A] on
+    # these parts, so this is the fallback denominator for the VRAM percentage.
+    vram_total_mb: int = 122880   # ~120 GiB usable
+    default_model: str = ""       # curated alias to auto-load on startup
+    # Remote nodes idle at ~25 W and reloading costs minutes (weights are large),
+    # so Sparks are exempt from the idle reaper by default.
+    idle_unload_enabled: bool = False
+    load_timeout_s: int = 900
+    kind: str = "spark"
+
+    @property
+    def api_base(self) -> str:
+        return f"http://{self.host}:{self.api_port}"
+
+    @property
+    def gpu_uuid(self) -> str:
+        """Synthetic telemetry key. Remote GB10s aren't in the local nvidia-smi
+        namespace, so Monitor/idle lookups key off this instead of a real UUID."""
+        return f"spark:{self.id}"
+
+
+def _parse_spark_nodes(spec: str) -> list[tuple[str, str, str]]:
+    """Parse `SPARK_NODES` → [(id, host, name)].
+
+    Format: comma-separated `id=host[=name]`, e.g.
+        spark1=192.168.1.50=spark-cc9b,spark2=192.168.1.51=spark-4cd0
+    Malformed entries are skipped rather than raising — a typo in .env must not
+    stop the app from starting with the local lanes.
+    """
+    nodes: list[tuple[str, str, str]] = []
+    for chunk in (spec or "").split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in chunk.split("=")]
+        if len(parts) < 2 or not parts[0] or not parts[1]:
+            continue
+        node_id, host = parts[0], parts[1]
+        name = parts[2] if len(parts) > 2 and parts[2] else node_id
+        nodes.append((node_id, host, name))
+    return nodes
 
 
 class Settings(BaseSettings):
@@ -89,6 +150,33 @@ class Settings(BaseSettings):
     companion_registry_path: Path = REPO_ROOT / "data" / "vllm_models_companion.yaml"
     companion_default_server: str = ""   # "ollama" | "vllm" | "" — auto-load on startup
     companion_default_model: str = ""    # Ollama tag or vLLM alias
+
+    # --- DGX Spark cluster (4× GB10, driven by sparkrun from this box's WSL) ---
+    # Off by default: enable once sparkrun is installed and the `sparks` cluster is
+    # configured on the box (see runbooks/local-llm-server-dgx-spark on the wiki).
+    spark_enabled: bool = False
+    # `id=host[=name]`, comma separated. Defaults to the as-built site-A cluster.
+    spark_nodes: str = (
+        "spark1=192.168.1.50=spark-cc9b,"
+        "spark2=192.168.1.51=spark-4cd0,"
+        "spark3=192.168.1.52=spark-b984,"
+        "spark4=192.168.1.53=spark-f04a"
+    )
+    spark_ssh_user: str = "fksogbetun"
+    spark_api_port: int = 8000          # OpenAI port the sparkrun workload serves on
+    spark_cluster: str = "sparks"       # saved sparkrun cluster name
+    spark_vram_total_mb: int = 122880   # ~120 GiB usable of the 128 GB unified pool
+    spark_load_timeout_s: int = 900     # weights are large; cold starts take minutes
+    spark_idle_unload_enabled: bool = False
+    # sparkrun command templates. Kept configurable because the exact flags differ
+    # across sparkrun releases — correct them in .env rather than patching code.
+    # Placeholders: {cluster} {host} {recipe} {tp} {extra}
+    spark_run_cmd: str = "sparkrun run {recipe} --cluster {cluster} --hosts {host} --tp {tp} {extra}"
+    spark_stop_cmd: str = "sparkrun stop --cluster {cluster} --hosts {host}"
+    spark_status_cmd: str = "sparkrun status --cluster {cluster}"
+    # Remote telemetry: plain SSH to the node (the control node's WSL already has
+    # passwordless key auth to every Spark).
+    spark_ssh_cmd: str = "ssh -o BatchMode=yes -o ConnectTimeout=5 {user}@{host} {command}"
 
     # --- monitoring (the Monitor tab: thermals/power/VRAM history) ---
     monitor_enabled: bool = True
@@ -183,6 +271,35 @@ class Settings(BaseSettings):
                 )
             )
         return lanes
+
+    def sparks(self) -> list[SparkConfig]:
+        """The DGX Spark nodes to expose as units — empty unless `spark_enabled`."""
+        if not self.spark_enabled:
+            return []
+        out: list[SparkConfig] = []
+        for node_id, host, name in _parse_spark_nodes(self.spark_nodes):
+            out.append(
+                SparkConfig(
+                    id=node_id,
+                    name=name,
+                    host=host,
+                    ssh_user=self.spark_ssh_user,
+                    api_port=self.spark_api_port,
+                    registry_path=REPO_ROOT / "data" / f"spark_models_{node_id}.yaml",
+                    vram_total_mb=self.spark_vram_total_mb,
+                    idle_unload_enabled=self.spark_idle_unload_enabled,
+                    load_timeout_s=self.spark_load_timeout_s,
+                )
+            )
+        return out
+
+    def units(self) -> list[LaneConfig | SparkConfig]:
+        """Every LLM unit in display order: local GPU lanes first, then Sparks.
+
+        This is the list the UI turns into tabs and dashboard cards; `lanes()` and
+        `sparks()` remain available for code that needs only one kind.
+        """
+        return [*self.lanes(), *self.sparks()]
 
 
 @lru_cache

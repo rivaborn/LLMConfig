@@ -44,12 +44,39 @@ header {
 .tab.active { color: var(--ink); border-bottom-color: var(--accent); }
 .tab:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 
-/* view switching: hidden by default, the active view restores its own layout */
+/* view switching: hidden by default. Every view is a simple block — the old
+   two-column rule was Control-specific and broke each new tab that wasn't it. */
 .view { display: none; }
-.view.active { display: grid; grid-template-columns: 1fr 320px; gap: 16px; padding: 16px; align-items: start; }
-#view-monitor.active { display: block; padding: 16px; }
-@media (max-width: 980px) { .view.active { grid-template-columns: 1fr; } }
-.col h2, .col h3, .activity h2 { margin: 0 0 10px; font-size: 15px; }
+.view.active { display: block; padding: 16px; }
+.col h2, .col h3, .activity summary { margin: 0 0 10px; font-size: 15px; }
+.muted-inline { color: var(--muted); font-size: 11px; font-weight: 400; }
+
+/* ---- Home dashboard: one box per LLM unit ---- */
+.unit-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 14px; }
+.unit-card {
+  background: var(--panel); border: 1px solid var(--line); border-radius: 12px;
+  padding: 14px; display: flex; flex-direction: column; gap: 8px;
+}
+.unit-card.offline { opacity: .55; border-style: dashed; }
+.unit-card.busy { border-color: var(--accent); }
+.uc-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.uc-name { font-size: 15px; font-weight: 700; cursor: pointer; }
+.uc-name:hover { color: var(--accent); text-decoration: underline; }
+.uc-kind {
+  font-size: 10px; font-weight: 700; letter-spacing: .5px; padding: 1px 6px;
+  border-radius: 5px; border: 1px solid var(--line); color: var(--muted);
+}
+.uc-kind.spark { color: var(--vllm); border-color: var(--vllm); }
+.uc-kind.gpu { color: var(--ollama); border-color: var(--ollama); }
+.uc-sub { color: var(--muted); font-size: 11px; margin-top: -4px; }
+.uc-loaded { font-size: 13px; font-weight: 600; word-break: break-word; }
+.uc-loaded.none { color: var(--muted); font-weight: 400; }
+.uc-switch { display: flex; gap: 6px; margin-top: 2px; }
+.uc-select {
+  flex: 1; min-width: 0; background: var(--panel2); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 12px;
+}
+.uc-switch .btn { padding: 6px 10px; font-size: 12px; }
 .hint { color: var(--muted); margin: 0 0 10px; font-size: 12px; }
 .header-hint { flex: 1; min-width: 200px; }
 
@@ -63,6 +90,8 @@ header {
 .lane-name { font-size: 16px; font-weight: 700; }
 .lane-head .loaded { flex: 1; min-width: 120px; }
 .lane-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+/* Spark units have a single catalog column (no Ollama/vLLM split). */
+.lane-cols.one { grid-template-columns: 1fr; }
 @media (max-width: 720px) { .lane-cols { grid-template-columns: 1fr; } }
 .actions { display: flex; align-items: center; gap: 6px; }
 .star { background: var(--panel2); color: var(--muted); padding: 7px 9px; }
@@ -87,10 +116,18 @@ header {
 .btn-warn { background: var(--warn); }
 .pull { display: flex; gap: 8px; margin-bottom: 10px; }
 .pull input { flex: 1; background: var(--panel2); color: var(--ink); border: 1px solid var(--line); border-radius: 8px; padding: 7px 10px; }
-.activity { position: sticky; top: 16px; }
+/* Shared activity drawer — one log for every view, collapsible so it stays out
+   of the way on Monitor. */
+.activity { margin: 0 16px 16px; border: 1px solid var(--line); border-radius: 12px; background: var(--panel); }
+.activity > summary {
+  cursor: pointer; padding: 10px 14px; font-weight: 700; font-size: 14px; list-style: none;
+}
+.activity > summary::-webkit-details-marker { display: none; }
+.activity > summary::before { content: "▸ "; color: var(--muted); }
+.activity[open] > summary::before { content: "▾ "; }
 .log {
-  background: #0a0c10; border: 1px solid var(--line); border-radius: 10px; padding: 10px;
-  height: 60vh; overflow: auto; white-space: pre-wrap; color: var(--muted); font-size: 12px;
+  background: #0a0c10; border-top: 1px solid var(--line); border-radius: 0 0 11px 11px; padding: 10px;
+  max-height: 32vh; overflow: auto; white-space: pre-wrap; color: var(--muted); font-size: 12px; margin: 0;
 }
 .err { color: var(--bad); font-size: 12px; min-height: 1em; }
 

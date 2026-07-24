@@ -12,10 +12,11 @@ from pathlib import Path
 import yaml
 
 from .config import PACKAGE_DIR, Settings, get_settings
-from .schemas import VllmAliasEntry
+from .schemas import SparkModelEntry, VllmAliasEntry
 
 DEFAULT_REGISTRY = PACKAGE_DIR / "data" / "vllm_models.default.yaml"
 DEFAULT_COMPANION_REGISTRY = PACKAGE_DIR / "data" / "vllm_models_companion.default.yaml"
+DEFAULT_SPARK_REGISTRY = PACKAGE_DIR / "data" / "spark_models.default.yaml"
 
 
 class Registry:
@@ -57,6 +58,66 @@ class Registry:
 
     # ---- mutations (model management) ----
     def upsert(self, entry: VllmAliasEntry) -> None:
+        self._entries[entry.alias] = entry
+        self.save()
+
+    def remove(self, alias: str) -> bool:
+        existed = self._entries.pop(alias, None) is not None
+        if existed:
+            self.save()
+        return existed
+
+
+class SparkRegistry:
+    """Curated per-node catalog of sparkrun recipes (data/spark_models_<unit>.yaml).
+
+    Same role as `Registry` plays for vLLM: sparkrun's synced registries carry
+    hundreds of recipes, so this is the small hand-maintained set a given Spark
+    actually serves. Seeded from the packaged default on first run, then editable
+    through the API/UI.
+    """
+
+    def __init__(self, path: Path, default_path: Path | None = None):
+        self.path = path
+        self.default_path = default_path or DEFAULT_SPARK_REGISTRY
+        self._entries: dict[str, SparkModelEntry] = {}
+        self.load()
+
+    # ---- persistence ----
+    def load(self) -> None:
+        if not self.path.exists():
+            self._seed()
+        raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
+        self._entries = {}
+        for item in raw.get("models", []) or []:
+            entry = SparkModelEntry(**item)
+            self._entries[entry.alias] = entry
+
+    def _seed(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        if self.default_path.exists():
+            shutil.copyfile(self.default_path, self.path)
+        else:  # no packaged seed — start empty rather than failing to boot
+            self.path.write_text("models: []\n", encoding="utf-8")
+
+    def save(self) -> None:
+        data = {"models": [e.model_dump() for e in self._entries.values()]}
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+
+    # ---- queries ----
+    def entries(self) -> list[SparkModelEntry]:
+        return list(self._entries.values())
+
+    def get(self, alias: str) -> SparkModelEntry | None:
+        return self._entries.get(alias)
+
+    def served_name(self, alias: str) -> str | None:
+        e = self.get(alias)
+        return (e.served_name or e.alias) if e else None
+
+    # ---- mutations ----
+    def upsert(self, entry: SparkModelEntry) -> None:
         self._entries[entry.alias] = entry
         self.save()
 
