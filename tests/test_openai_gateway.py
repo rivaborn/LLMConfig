@@ -2,6 +2,7 @@
 the non-stream short-circuit, and the model list — all with fake lane backends and
 a MockTransport upstream (no nvidia-smi / WSL / real Ollama or vLLM)."""
 import json
+import time
 
 import httpx
 from httpx import ASGITransport
@@ -13,11 +14,12 @@ from llmconfig.config import Settings
 from llmconfig.gpu import GpuInfo
 from llmconfig.jobs import JobManager
 from llmconfig.lane_state import LaneDefaults
+from llmconfig.leases import LeaseManager
 from llmconfig.openai_gateway import OpenAIGateway, build_gateway_router
 from llmconfig.orchestrator import Orchestrator
 from llmconfig.proc import CmdResult
 from llmconfig.registry import Registry
-from llmconfig.schemas import OllamaModel
+from llmconfig.schemas import LeaseClaimRequest, OllamaModel
 
 GiB = 1024 ** 3
 
@@ -153,11 +155,14 @@ def _build(monkeypatch, tmp_path):
     monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)
 
     captured: list[str] = []
-    gateway = OpenAIGateway(orch, jobs, s)
+    leases = LeaseManager(s, orch)
+    gateway = OpenAIGateway(orch, jobs, s, leases)
     gateway._http = httpx.AsyncClient(transport=ASGITransport(app=_upstream_app(captured)))
 
     app = FastAPI()
     app.include_router(build_gateway_router(gateway))
+    # Reachable from the lease tests without changing this helper's tuple arity.
+    app.state.leases = leases
     return app, orch, jobs, world, captured
 
 
@@ -274,3 +279,157 @@ async def test_nonstream_shortcircuits_during_a_different_load(monkeypatch, tmp_
     assert r.status_code == 200
     assert r.json()["choices"][0]["message"]["content"] == "", "must return an empty, immediate 200"
     assert captured == [], "must not forward upstream while a different load is in flight"
+
+
+# --------------------------------------------------------------------------- #
+# Lease admission on the inference path
+# --------------------------------------------------------------------------- #
+def _claim(app, holder="alice", unit="primary", **kw):
+    return app.state.leases.claim(LeaseClaimRequest(unit=unit, holder=holder, **kw))[0]
+
+
+def _chat(model="qwen3-coder:30b", **kw):
+    return {"model": model, "messages": [{"role": "user", "content": "hi"}], **kw}
+
+
+async def _load_ollama_tag(world, orch, tag="qwen3-coder:30b"):
+    """Make the lane already serve `tag` so requests take the forward fast path."""
+    world.ollama = {tag: (8 * GiB, 8 * GiB)}
+    world.used_mb = 9000
+
+
+async def test_unleased_traffic_allowed_when_nothing_is_claimed(monkeypatch, tmp_path):
+    """opencode sends no lease header — it must keep working exactly as before."""
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    await _load_ollama_tag(world, orch)
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat())
+    assert r.status_code == 200 and r.json()["marker"] == "UPSTREAM_OK"
+
+
+async def test_unleased_traffic_allowed_under_a_preemptible_lease(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    await _load_ollama_tag(world, orch)
+    _claim(app, preemptible=True)
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat())
+    assert r.status_code == 200, "a preemptible lease is advisory for other callers"
+
+
+async def test_unleased_traffic_refused_under_a_non_preemptible_lease(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    await _load_ollama_tag(world, orch)
+    _claim(app, holder="nightly-eval", preemptible=False)
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat())
+    assert r.status_code == 409
+    err = r.json()["error"]
+    assert err["code"] == "lease_required" and "nightly-eval" in err["message"]
+    assert captured == [], "a refused request must never reach the backend"
+
+
+async def test_valid_lease_header_forwards_and_records_use(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    await _load_ollama_tag(world, orch)
+    lease = _claim(app, holder="alice", preemptible=False)
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat(),
+                         headers={"X-LLM-Lease": lease.id})
+    assert r.status_code == 200 and r.json()["marker"] == "UPSTREAM_OK"
+    assert lease.requests == 1 and lease.last_seen_at is not None
+
+
+async def test_revoked_lease_header_is_refused_and_names_the_new_holder(monkeypatch, tmp_path):
+    """Requirement 4 on the inference path: the displaced holder learns in-band."""
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    await _load_ollama_tag(world, orch)
+    first = _claim(app, holder="alice", priority=1)
+    _claim(app, holder="bob", priority=9)          # preempts alice
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat(),
+                         headers={"X-LLM-Lease": first.id})
+    assert r.status_code == 409
+    err = r.json()["error"]
+    assert err["code"] == "lease_revoked" and "bob" in err["message"]
+    assert err["lease"]["revoked_reason"] == "preempted"
+    assert captured == []
+
+
+async def test_unknown_lease_header_reports_server_restarted(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    await _load_ollama_tag(world, orch)
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat(),
+                         headers={"X-LLM-Lease": "a" * 12})
+    assert r.status_code == 409
+    assert "server_restarted" in r.json()["error"]["message"]
+
+
+async def test_lease_for_a_different_unit_is_refused(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    await _load_ollama_tag(world, orch)
+    orch.units["companion"] = orch.units["primary"]  # give the manager a 2nd unit id
+    lease = _claim(app, unit="companion")
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat(),
+                         headers={"X-LLM-Lease": lease.id})
+    assert r.status_code == 409 and r.json()["error"]["code"] == "lease_wrong_unit"
+
+
+async def test_expired_lease_still_serves_its_holder_inside_the_grace_window(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    await _load_ollama_tag(world, orch)
+    lease = _claim(app, holder="alice")
+    lease._deadline = time.monotonic() - 1          # lapsed, but within the 30 s grace
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat(),
+                         headers={"X-LLM-Lease": lease.id})
+    assert r.status_code == 200, "a slipped renew must not drop the holder mid-session"
+
+
+async def test_stream_rejection_returns_409_by_default(monkeypatch, tmp_path):
+    """The gate decides before any bytes are written, so a real status code is
+    available and strictly more correct than an in-band error chunk."""
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    await _load_ollama_tag(world, orch)
+    _claim(app, holder="nightly-eval", preemptible=False)
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat(stream=True))
+    assert r.status_code == 409 and r.json()["error"]["code"] == "lease_required"
+    assert captured == []
+
+
+async def test_stream_rejection_can_emit_an_sse_error_chunk(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    app.state.leases.s.lease_stream_reject_mode = "sse"
+    await _load_ollama_tag(world, orch)
+    _claim(app, holder="nightly-eval", preemptible=False)
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat(stream=True))
+    assert r.status_code == 200
+    assert "❌" in r.text and "[DONE]" in r.text
+    assert captured == []
+
+
+async def test_refused_request_does_not_touch_the_lane(monkeypatch, tmp_path):
+    """A rejected request never reached a backend, so it must not extend the lane's
+    idle window (the mirror of test_gateway_request_touches_lane)."""
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    await _load_ollama_tag(world, orch)
+    _claim(app, holder="nightly-eval", preemptible=False)
+    lane = orch.primary
+    lane.last_activity = time.time() - 500
+    before = lane.last_activity
+    async with _client(app) as c:
+        await c.post("/v1/chat/completions", json=_chat())
+    assert lane.last_activity == before
+
+
+async def test_block_unleased_kill_switch_restores_old_behaviour(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    app.state.leases.s.lease_block_unleased = False
+    await _load_ollama_tag(world, orch)
+    _claim(app, holder="nightly-eval", preemptible=False)
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat())
+    assert r.status_code == 200

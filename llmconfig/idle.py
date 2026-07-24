@@ -39,6 +39,7 @@ from .config import Settings
 from .schemas import MANAGED_OWNERS, LaneStatus, LaneUsage, UnloadRequest
 
 if TYPE_CHECKING:
+    from .leases import LeaseManager
     from .monitor import Monitor
     from .orchestrator import Orchestrator, Unit
 
@@ -68,14 +69,21 @@ def classify_usage(st: LaneStatus, current_util_pct: float | None,
 
 
 class IdleReaper:
-    def __init__(self, settings: Settings, orch: "Orchestrator", monitor: "Monitor"):
+    def __init__(self, settings: Settings, orch: "Orchestrator", monitor: "Monitor",
+                 leases: "LeaseManager"):
         self.s = settings
         self.orch = orch
         self.monitor = monitor
+        # Required, not optional: a None default would let a future call site
+        # silently lose lease-awareness and reap a unit somebody had claimed.
+        self.leases = leases
         self.interval = max(5.0, float(settings.idle_unload_check_interval_s))
         self.timeout_s = max(60.0, float(settings.idle_unload_after_min) * 60.0)
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        # Log a lease-blocked skip once per (unit, lease) — otherwise a 45-minute
+        # lease emits 45 identical lines at the 60 s tick cadence.
+        self._lease_logged: dict[str, str] = {}
 
     # ---- lifecycle (mirrors Monitor) ----
     def start(self) -> None:
@@ -131,6 +139,17 @@ class IdleReaper:
         # Cheap guards before any HTTP/nvidia-smi probing.
         if not lane.cfg.enabled or not lane.cfg.idle_unload_enabled:
             return False
+        # A claimed unit is off-limits — including a *preemptible* claim, because the
+        # reaper is a power-saving optimisation, not a competing caller. Checked here
+        # so a leased lane costs no nvidia-smi/HTTP probe at all.
+        held = self.leases.blocks_idle_unload(lane.cfg.id)
+        if held is not None:
+            if self._lease_logged.get(lane.cfg.id) != held.id:
+                self._lease_logged[lane.cfg.id] = held.id
+                log.info("idle reaper: lane %s leased by '%s' (%s) — skipping",
+                         lane.cfg.id, held.holder, held.id)
+            return False
+        self._lease_logged.pop(lane.cfg.id, None)
         if lane._lock.locked() or lane._active_job_id:  # swap in progress
             return False
         idle = time.time() - lane.last_activity
@@ -141,9 +160,11 @@ class IdleReaper:
         if st.swap_in_progress or st.owner not in MANAGED_OWNERS:
             return False
         # Final sync re-check, then reap through the existing lock + eviction-wait
-        # path. No await between the check and unload(): an uncontended asyncio.Lock
-        # acquires without yielding, so a competing load can't interleave.
-        if lane._lock.locked():
+        # path. No await between these checks and unload(): an uncontended asyncio.Lock
+        # acquires without yielding and LeaseManager.blocks_idle_unload is pure dict
+        # access, so neither a competing load nor a lease claimed during the status
+        # probe above can interleave.
+        if lane._lock.locked() or self.leases.blocks_idle_unload(lane.cfg.id) is not None:
             return False
         model = st.loaded.model if st.loaded else "?"
         log.info("idle reaper: lane %s idle %.1f min — unloading %s (%s)",

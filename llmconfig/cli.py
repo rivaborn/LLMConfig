@@ -222,9 +222,202 @@ def doctor(local: bool = typer.Option(False, "--local", help="run in-process ins
 
 
 # --------------------------------------------------------------------------- #
+# leases — claim a unit so other callers know not to take it
+# --------------------------------------------------------------------------- #
+lease_app = typer.Typer(add_completion=False, help="Claim / inspect / release unit leases.")
+app.add_typer(lease_app, name="lease")
+
+
+def _lease_err(r: httpx.Response) -> None:
+    """Print a lease API error and exit 1. Bodies are {"detail": {...}}."""
+    try:
+        d = r.json().get("detail", {})
+    except ValueError:
+        d = {}
+    if isinstance(d, dict):
+        typer.secho(f"{d.get('error', r.status_code)}: {d.get('message', r.text)}", fg="red")
+        held = d.get("lease")
+        if held:
+            typer.secho(f"  held by '{held.get('holder')}' "
+                        f"({'non-preemptible' if not held.get('preemptible', True) else 'preemptible'}"
+                        f", priority {held.get('priority', 0)})", fg="yellow")
+    else:
+        typer.secho(f"{r.status_code}: {d or r.text}", fg="red")
+    raise typer.Exit(1)
+
+
+@lease_app.command("claim")
+def lease_claim(
+    holder: str = typer.Option(..., "--holder", help="who you are, e.g. nightly-eval"),
+    unit: str = typer.Option("primary", "--unit", help="unit id (primary | companion | spark1 …)"),
+    minutes: float = typer.Option(10.0, "--minutes", help="renewable leash (ttl)"),
+    expect_minutes: float = typer.Option(0.0, "--expect-minutes",
+                                         help="how long you'll really need it (hint only)"),
+    preempt: bool = typer.Option(True, "--preempt/--no-preempt",
+                                 help="--no-preempt = must not be interrupted"),
+    priority: int = typer.Option(0, "--priority", help="0..100; higher wins among preemptible"),
+    server: Optional[str] = typer.Option(None, "--server"),
+    model: str = typer.Option("", "--model"),
+    note: str = typer.Option("", "--note"),
+    force: bool = typer.Option(False, "--force", help="steal an equal-priority preemptible lease"),
+    free_on_preempt: bool = typer.Option(False, "--free-on-preempt",
+                                         help="also evict whatever is loaded, once granted"),
+    quiet: bool = typer.Option(False, "--quiet", help="print only the lease id"),
+) -> None:
+    """Claim a unit. Prints the lease id — send it as X-LLM-Lease on /v1 requests."""
+    body = {
+        "unit": unit, "holder": holder, "preemptible": preempt, "priority": priority,
+        "ttl_s": minutes * 60.0, "expected_duration_s": expect_minutes * 60.0,
+        "model": model, "note": note, "force": force, "free_on_preempt": free_on_preempt,
+    }
+    if server:
+        body["server"] = server
+    try:
+        with _client() as c:
+            r = c.post("/api/leases", json=body)
+    except httpx.HTTPError as e:
+        _bail(e)
+    if r.status_code >= 400:
+        _lease_err(r)
+    d = r.json()
+    lease = d["lease"]
+    if quiet:
+        typer.echo(lease["id"])
+        return
+    typer.secho(f"lease {lease['id']} on {lease['unit']} for '{lease['holder']}'", fg="green", bold=True)
+    typer.echo(f"  {'non-preemptible' if not lease['preemptible'] else 'preemptible'}"
+               f", priority {lease['priority']}, ttl {lease['ttl_s'] / 60:.0f}m")
+    if d.get("displaced"):
+        typer.secho(f"  displaced '{d['displaced']['holder']}' (lease {d['displaced']['id']})", fg="yellow")
+    if d.get("busy_with"):
+        # A non-preemptible lease is a FORWARD guarantee: work already running keeps
+        # the unit until it finishes.
+        typer.secho("  note: the unit is already busy — work in flight finishes first "
+                    f"({d['busy_with'].get('usage')})", fg="yellow")
+
+
+@lease_app.command("list")
+def lease_list(
+    unit: Optional[str] = typer.Option(None, "--unit"),
+    active: bool = typer.Option(False, "--active", help="only live leases"),
+) -> None:
+    try:
+        with _client() as c:
+            d = c.get("/api/leases", params={"unit": unit, "active": active}).json()
+    except httpx.HTTPError as e:
+        _bail(e)
+    leases = d.get("leases", [])
+    if not leases:
+        typer.secho("no leases", fg="bright_black")
+        return
+    for l in leases:
+        _print_lease(l)
+
+
+@lease_app.command("show")
+def lease_show(lease_id: str) -> None:
+    try:
+        with _client() as c:
+            r = c.get(f"/api/leases/{lease_id}")
+    except httpx.HTTPError as e:
+        _bail(e)
+    if r.status_code == 404:
+        _lease_err(r)
+    _print_lease(r.json(), verbose=True)
+
+
+@lease_app.command("renew")
+def lease_renew(lease_id: str, minutes: Optional[float] = typer.Option(None, "--minutes")) -> None:
+    body = {} if minutes is None else {"ttl_s": minutes * 60.0}
+    try:
+        with _client() as c:
+            r = c.post(f"/api/leases/{lease_id}/renew", json=body)
+    except httpx.HTTPError as e:
+        _bail(e)
+    if r.status_code >= 400:
+        _lease_err(r)
+    typer.secho(f"renewed {lease_id} (+{r.json()['ttl_s'] / 60:.0f}m)", fg="green")
+
+
+@lease_app.command("release")
+def lease_release(lease_id: str) -> None:
+    try:
+        with _client() as c:
+            r = c.delete(f"/api/leases/{lease_id}")
+    except httpx.HTTPError as e:
+        _bail(e)
+    if r.status_code >= 400:
+        _lease_err(r)
+    typer.secho(f"released {lease_id}", fg="green")
+
+
+@lease_app.command("revoke")
+def lease_revoke(
+    lease_id: str,
+    reason: str = typer.Option("admin", "--reason"),
+    by: str = typer.Option("operator", "--by"),
+    free: bool = typer.Option(False, "--free", help="also evict whatever is loaded"),
+) -> None:
+    """Operator break-glass — takes a unit back even from a non-preemptible lease."""
+    try:
+        with _client() as c:
+            r = c.post(f"/api/leases/{lease_id}/revoke",
+                       json={"reason": reason, "by": by, "free": free})
+    except httpx.HTTPError as e:
+        _bail(e)
+    if r.status_code >= 400:
+        _lease_err(r)
+    typer.secho(f"revoked {lease_id}", fg="yellow")
+
+
+@lease_app.command("wait")
+def lease_wait(lease_id: str) -> None:
+    """Block until the lease ends, then exit with a code saying HOW it ended.
+
+    This is the scriptable half of "was my job kicked off a unit?":
+      0 released · 3 revoked · 4 expired · 2 unreachable/unknown
+    """
+    try:
+        with _client() as c:
+            while True:
+                r = c.get(f"/api/leases/{lease_id}")
+                if r.status_code == 404:
+                    typer.secho(f"lease {lease_id} is unknown (server restarted?)", fg="red")
+                    raise typer.Exit(2)
+                l = r.json()
+                if l["state"] != "active":
+                    _print_lease(l, verbose=True)
+                    raise typer.Exit({"released": 0, "revoked": 3, "expired": 4}.get(l["state"], 1))
+                time.sleep(2.0)
+    except httpx.HTTPError as e:
+        _bail(e)
+
+
+# --------------------------------------------------------------------------- #
 # helpers
 # --------------------------------------------------------------------------- #
 _USAGE_COLORS = {"free": "green", "idle": "yellow", "active": "cyan"}
+_LEASE_COLORS = {"active": "cyan", "released": "green", "revoked": "red", "expired": "yellow"}
+
+
+def _print_lease(l: dict, verbose: bool = False) -> None:
+    color = _LEASE_COLORS.get(l["state"], "white")
+    kind = "non-preemptible" if not l.get("preemptible", True) else "preemptible"
+    typer.secho(f"[{l['unit']}] {l['id']}  {l['state']}  '{l['holder']}' ({kind})",
+                fg=color, bold=True)
+    if l.get("revoked_by") or l.get("revoked_reason"):
+        typer.secho(f"  taken by '{l.get('revoked_by') or '?'}' — {l.get('revoked_reason') or ''}",
+                    fg="red")
+    if not verbose:
+        return
+    if l.get("model"):
+        typer.echo(f"  model: {l['model']} [{l.get('server') or '?'}]")
+    typer.echo(f"  ttl {l['ttl_s'] / 60:.0f}m, renewed {l.get('renew_count', 0)}×, "
+               f"{l.get('requests', 0)} request(s)")
+    if l.get("expected_duration_s"):
+        typer.echo(f"  expected duration: {l['expected_duration_s'] / 60:.0f}m")
+    if l.get("note"):
+        typer.secho(f"  note: {l['note']}", fg="bright_black")
 
 
 def _idle_suffix(idle_s: object) -> str:
@@ -258,6 +451,11 @@ def _print_lane(l: dict) -> None:
         typer.echo("  model: none")
     if l.get("swap_in_progress"):
         typer.secho(f"  swap in progress (job {l.get('active_job_id')})", fg="yellow")
+    held = l.get("lease")
+    if held:
+        kind = "non-preemptible" if not held.get("preemptible", True) else "preemptible"
+        typer.secho(f"  lease: '{held['holder']}' ({kind}, {held.get('expires_in_s', 0) / 60:.0f}m left)"
+                    f" [{held['id']}]", fg="magenta")
     typer.echo(f"  ollama_up={l['ollama_up']}  vllm_up={l['vllm_up']}")
 
 

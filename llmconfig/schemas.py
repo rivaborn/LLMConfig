@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PrivateAttr
 
 ServerName = Literal["ollama", "vllm", "spark"]
 Owner = Literal["free", "ollama", "vllm", "spark", "unknown"]
@@ -16,6 +16,10 @@ LaneUsage = Literal["free", "idle", "active"]
 UnitKind = Literal["gpu", "spark"]
 # The set of owners that mean "something we manage holds this unit".
 MANAGED_OWNERS: tuple[str, ...] = ("ollama", "vllm", "spark")
+# Lease lifecycle. `released` = the holder handed it back; `revoked` = someone took
+# it away (preemption or an operator). They stay distinct so a displaced holder can
+# see *why* it lost the unit.
+LeaseState = Literal["active", "released", "revoked", "expired"]
 
 
 # --------------------------------------------------------------------------- #
@@ -203,6 +207,10 @@ class LaneStatus(BaseModel):
     # free/idle/active classification — populated by the REST layer (it needs the
     # Monitor's current util, which the orchestrator doesn't hold); None in-process.
     usage: Optional[LaneUsage] = None
+    # The live claim on this unit, if any. ADDITIVE — `usage` deliberately keeps its
+    # three values because off-box consumers switch on it; a lease is never a
+    # fourth usage state.
+    lease: Optional["LeaseBrief"] = None
 
 
 class StatusResponse(BaseModel):
@@ -226,6 +234,7 @@ class LaneUsageOut(BaseModel):
     state: LaneUsage
     model: Optional[str] = None   # None when free
     idle_s: Optional[float] = None
+    lease: Optional["LeaseBrief"] = None   # additive; see LaneStatus.lease
 
 
 class UsageResponse(BaseModel):
@@ -234,6 +243,7 @@ class UsageResponse(BaseModel):
     state: LaneUsage
     model: Optional[str] = None
     idle_s: Optional[float] = None
+    lease: Optional["LeaseBrief"] = None   # additive; mirrors the requested lane
     lanes: list[LaneUsageOut] = Field(default_factory=list)
 
 
@@ -268,3 +278,112 @@ class Job(BaseModel):
     error: str = ""
     created_at: float = 0.0
     finished_at: Optional[float] = None
+
+
+# --------------------------------------------------------------------------- #
+# Leases (resource sharing — see leases.py)
+# --------------------------------------------------------------------------- #
+class Lease(BaseModel):
+    """One caller's claim on one unit.
+
+    Two distinct durations, deliberately: `expected_duration_s` is the honest
+    "I need this for N hours" hint (recorded and displayed, never enforced), while
+    `ttl_s` is a short renewable leash that must be refreshed to prove the holder
+    is still alive. A long job can declare its real shape without a crashed client
+    pinning the unit for hours.
+    """
+
+    id: str
+    unit: str
+    holder: str
+    preemptible: bool = True
+    priority: int = 0            # 0..100, clamped; only breaks ties among preemptible leases
+    ttl_s: float                 # enforcement window — renew before it lapses
+    expected_duration_s: float = 0.0   # honest hint; displayed, never enforced
+    acquired_at: float
+    expires_at: float            # wall clock, for display
+    state: LeaseState = "active"
+    # What the holder loaded / intends to load (advisory, recorded for humans).
+    server: Optional[ServerName] = None
+    model: str = ""
+    note: str = ""
+    # "Give me this unit with nothing loaded on it" — queues a deferred unload once
+    # the claim is granted (an external CUDA job, Wait-GpuIdle). Default off: a load
+    # already evicts the card itself, so freeing first is usually a wasted
+    # drain/refill plus a window for a third party to grab the empty card.
+    free_on_preempt: bool = False
+    # Lifecycle bookkeeping
+    renewed_at: Optional[float] = None
+    renew_count: int = 0
+    released_at: Optional[float] = None
+    revoked_at: Optional[float] = None
+    revoked_by: str = ""          # holder label of whoever took it
+    revoked_lease_id: str = ""    # the lease that displaced this one
+    revoked_reason: str = ""      # preempted | admin | expired | unused | server_restarted
+    # Observability — the evidence trail behind "was my job kicked off?"
+    last_seen_at: Optional[float] = None
+    requests: int = 0
+
+    # Monotonic deadline: authoritative for liveness, never serialized. Wall clock
+    # is for display only — an NTP step must not mass-expire or mass-extend leases
+    # (same reasoning as Lane._wait_vram_free using time.monotonic()).
+    _deadline: float = PrivateAttr(default=0.0)
+
+    def is_live(self, now_mono: float) -> bool:
+        return self.state == "active" and now_mono < self._deadline
+
+    def in_grace(self, now_mono: float, grace_s: float) -> bool:
+        """Past the deadline but still inside the renew/allow window."""
+        return self.state in ("active", "expired") and now_mono < self._deadline + grace_s
+
+
+class LeaseBrief(BaseModel):
+    """Compact projection carried on /api/status and /api/usage."""
+
+    id: str
+    holder: str
+    preemptible: bool = True
+    priority: int = 0
+    expires_at: float = 0.0
+    expires_in_s: float = 0.0
+    model: str = ""
+
+
+class LeaseClaimRequest(BaseModel):
+    unit: str = "primary"
+    holder: str
+    preemptible: bool = True     # False = "must not be interrupted"
+    priority: int = 0
+    ttl_s: Optional[float] = None            # defaults from settings; clamped
+    expected_duration_s: float = 0.0
+    server: Optional[ServerName] = None
+    model: str = ""
+    note: str = ""
+    force: bool = False          # steal an equal/higher-priority PREEMPTIBLE lease
+    free_on_preempt: bool = False   # also evict whatever is loaded, once granted
+
+
+class LeaseClaimResponse(BaseModel):
+    lease: Lease
+    displaced: Optional[LeaseBrief] = None
+    # Set when the unit was already mid-generation as the claim landed. A
+    # non-preemptible lease is a FORWARD guarantee only — work already running
+    # keeps the unit until it finishes (there is no job cancellation).
+    busy_with: Optional[dict] = None
+
+
+class LeaseRenewRequest(BaseModel):
+    ttl_s: Optional[float] = None
+
+
+class LeaseRevokeRequest(BaseModel):
+    reason: str = "admin"
+    by: str = "operator"
+    free: bool = False           # also queue a deferred unload of the unit
+
+
+class LeaseListResponse(BaseModel):
+    leases: list[Lease] = Field(default_factory=list)
+    # Leases are in-memory: a restart drops them all. Clients use this to tell
+    # "your lease was revoked" apart from "the server restarted".
+    server_started_at: float = 0.0

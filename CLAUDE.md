@@ -94,6 +94,11 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
   companion is exempt by default (it idles in P8 anyway; `COMPANION_IDLE_UNLOAD_ENABLED`
   opts it in). Also `classify_usage()` — the shared free/idle/active classification
   behind `GET /api/usage` and the `usage` field on `/api/status` lanes.
+- `leases.py` — `LeaseManager` + `LeaseSweeper`: **resource sharing between callers**.
+  A lease records who holds a unit, whether their work may be interrupted, and a
+  renewable TTL; a displaced holder learns via `state=revoked` on poll **and** an
+  in-band 409 on its next `/v1` call. Every method is **sync on purpose** — see
+  invariant 11.
 - `registry.py` — `Registry`: the editable vLLM **alias catalog** (YAML at
   `data/vllm_models.yaml`, seeded from the package default). vLLM can't enumerate what
   it *could* serve, so this is that list.
@@ -163,7 +168,19 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 10. **`sparkrun` command templates live in `Settings`, not in code.** Its flags shift
    between releases, so `SPARK_RUN_CMD` / `SPARK_STOP_CMD` / `SPARK_SSH_CMD` are
    `.env`-tunable. Fix a flag mismatch there, not by hardcoding a new argv.
-11. **Adding a vLLM model needs a `serve.sh` case, not just a registry row.** The
+11. **`LeaseManager`'s query/mutation methods must stay synchronous.** `idle.py`'s
+   final guard and `LeaseSweeper._free_unit` both rely on there being **no await**
+   between the last check and `Unit.unload()` — an uncontended `asyncio.Lock`
+   acquires without yielding, so that pair is atomic. Make `active_for` (or any of
+   its siblings) a coroutine and a competing load can interleave and have its
+   freshly loaded model unloaded out from under it.
+   `tests/test_leases.py::test_query_methods_are_sync` pins this.
+12. **A lease is additive on the API, never a fourth `usage` value.** `LaneUsage`
+   stays `free|idle|active` because off-box consumers switch on it (see invariant 8);
+   the claim rides alongside as `lanes[].lease`. Leases are also **advisory** —
+   direct-to-Ollama clients are ungated — and a non-preemptible lease is a *forward*
+   guarantee only: work already running keeps the unit (there is no job cancellation).
+13. **Adding a vLLM model needs a `serve.sh` case, not just a registry row.** The
    registry's `launch_args` / `managed_by: registry` fields are currently **unwired** —
    `_load_vllm` always launches via `vllm@<alias>` → `serve.sh <alias>`, whose hardcoded
    `case` sets the args. A user-added model = add a `case` to `deploy/serve.sh` **and**

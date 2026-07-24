@@ -10,11 +10,12 @@ from llmconfig.config import Settings
 from llmconfig.gpu import GpuInfo
 from llmconfig.idle import IdleReaper, classify_usage
 from llmconfig.jobs import JobManager
+from llmconfig.leases import LeaseManager
 from llmconfig.monitor import Monitor
 from llmconfig.orchestrator import Orchestrator
 from llmconfig.proc import CmdResult
 from llmconfig.registry import Registry
-from llmconfig.schemas import GpuOut, LaneStatus, LoadedModel, OllamaModel
+from llmconfig.schemas import GpuOut, LaneStatus, LeaseClaimRequest, LoadedModel, OllamaModel
 
 GiB = 1024 ** 3
 BASE_MB = 400
@@ -133,7 +134,9 @@ def _make(monkeypatch, tmp_path, *, two_lanes=False, mon=None, **overrides):
     monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)
     monkeypatch.setattr(orch_mod, "query_all_gpus", fake_query_all)
 
-    reaper = IdleReaper(settings, orch, mon if mon is not None else FakeMonitor())
+    leases = LeaseManager(settings, orch)
+    reaper = IdleReaper(settings, orch, mon if mon is not None else FakeMonitor(), leases)
+    reaper.leases_mgr = leases  # convenience handle for the lease-aware tests below
     return worlds, orch, reaper, keepalive
 
 
@@ -210,6 +213,103 @@ async def test_disabled_flag_noops(monkeypatch, tmp_path):
     _, _, reaper, _ = _make(monkeypatch, tmp_path, idle_unload_enabled=False)
     reaper.start()
     assert reaper._task is None
+
+
+# --------------------------------------------------------------------------- #
+# Leases vs the reaper
+# --------------------------------------------------------------------------- #
+def _claim(reaper, holder="alice", unit="primary", **kw):
+    return reaper.leases_mgr.claim(LeaseClaimRequest(unit=unit, holder=holder, **kw))[0]
+
+
+async def test_leased_lane_not_reaped(monkeypatch, tmp_path):
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path)
+    lane = orch.primary
+    _load_ollama(worlds["primary"], lane)
+    lane.last_activity = time.time() - IDLE
+    _claim(reaper, preemptible=False)
+
+    await reaper._tick()
+
+    assert "qwen3:32b" in worlds["primary"].ollama, "a claimed lane must not be reaped"
+
+
+async def test_preemptible_lease_also_blocks_reaping(monkeypatch, tmp_path):
+    """The reaper is a power optimisation, not a competing caller — 'preemptible'
+    means another *caller* may take the unit, not that the reaper may."""
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path)
+    lane = orch.primary
+    _load_ollama(worlds["primary"], lane)
+    lane.last_activity = time.time() - IDLE
+    _claim(reaper, preemptible=True)
+
+    await reaper._tick()
+
+    assert "qwen3:32b" in worlds["primary"].ollama
+
+
+async def test_expired_lease_stops_blocking_the_reaper(monkeypatch, tmp_path):
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path)
+    lane = orch.primary
+    _load_ollama(worlds["primary"], lane)
+    lane.last_activity = time.time() - IDLE
+    lease = _claim(reaper)
+    lease._deadline = time.monotonic() - 1  # lapsed
+
+    await reaper._tick()
+
+    assert worlds["primary"].ollama == {}, "a lapsed lease must not keep blocking"
+
+
+async def test_lease_claimed_during_status_probe_blocks_the_reap(monkeypatch, tmp_path):
+    """The fused post-await re-check. A claim can land during `await lane.status()`;
+    without re-checking, the new holder's unit would be unloaded underneath it."""
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path)
+    lane = orch.primary
+    _load_ollama(worlds["primary"], lane)
+    lane.last_activity = time.time() - IDLE
+
+    real_status = lane.status
+
+    async def status_then_claim(*a, **kw):
+        st = await real_status(*a, **kw)
+        _claim(reaper, holder="late-arrival")  # lands mid-probe
+        return st
+
+    monkeypatch.setattr(lane, "status", status_then_claim)
+
+    await reaper._tick()
+
+    assert "qwen3:32b" in worlds["primary"].ollama, "reaped a lane claimed mid-probe"
+
+
+async def test_lease_blocking_still_folds_the_util_signal(monkeypatch, tmp_path):
+    """The monitor fold-in sits ABOVE the lease guard, so a leased lane's idle_s
+    keeps tracking reality and it's immediately reapable once the lease lapses."""
+    mon = FakeMonitor()
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path, mon=mon)
+    lane = orch.primary
+    _load_ollama(worlds["primary"], lane)
+    lane.last_activity = time.time() - IDLE
+    spike = time.time() - 5
+    mon.spikes["GPU-x"] = spike
+    _claim(reaper)
+
+    await reaper._tick()
+
+    assert lane.last_activity >= spike, "util signal must fold in even for a leased lane"
+
+
+async def test_lease_blocks_idle_unload_kill_switch(monkeypatch, tmp_path):
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path, lease_blocks_idle_unload=False)
+    lane = orch.primary
+    _load_ollama(worlds["primary"], lane)
+    lane.last_activity = time.time() - IDLE
+    _claim(reaper, preemptible=False)
+
+    await reaper._tick()
+
+    assert worlds["primary"].ollama == {}, "kill switch must restore the old behaviour"
 
 
 async def test_free_lane_not_reaped(monkeypatch, tmp_path):

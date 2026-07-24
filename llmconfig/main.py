@@ -9,7 +9,7 @@ import shlex
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -19,6 +19,7 @@ from .config import PACKAGE_DIR, get_settings
 from .gpu import query_gpu
 from .idle import IdleReaper, classify_usage
 from .jobs import JobManager
+from .leases import LeaseConflict, LeaseError, LeaseManager, LeaseNotActive, LeaseSweeper, UnknownUnit
 from .monitor import Monitor
 from .openai_gateway import OpenAIGateway, build_gateway_router
 from .orchestrator import Orchestrator
@@ -27,6 +28,13 @@ from .schemas import (
     GpuOut,
     Job,
     LaneUsageOut,
+    Lease,
+    LeaseBrief,
+    LeaseClaimRequest,
+    LeaseClaimResponse,
+    LeaseListResponse,
+    LeaseRenewRequest,
+    LeaseRevokeRequest,
     LoadRequest,
     ModelsResponse,
     SparkModelEntry,
@@ -46,9 +54,11 @@ def create_app() -> FastAPI:
     registry = make_registry(settings)
     jobs = JobManager()
     orch = Orchestrator(settings, registry, jobs)
-    gateway = OpenAIGateway(orch, jobs, settings)
+    leases = LeaseManager(settings, orch)
+    gateway = OpenAIGateway(orch, jobs, settings, leases)
     monitor = Monitor(settings, orch)
-    reaper = IdleReaper(settings, orch, monitor)
+    reaper = IdleReaper(settings, orch, monitor, leases)
+    sweeper = LeaseSweeper(settings, orch, leases)
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
@@ -56,7 +66,9 @@ def create_app() -> FastAPI:
         orch.autoload_defaults()
         monitor.start()  # begin sampling GPU/LLM telemetry for the Monitor tab
         reaper.start()   # idle auto-unload policy (reads the monitor's util samples)
+        sweeper.start()  # lease expiry + deferred preemption frees
         yield
+        await sweeper.stop()
         await reaper.stop()  # before the monitor: the reaper reads its samples
         await monitor.stop()
         # Release the WSL keepalive so the distro can idle-shut-down cleanly when
@@ -74,6 +86,8 @@ def create_app() -> FastAPI:
     app.state.gateway = gateway
     app.state.monitor = monitor
     app.state.reaper = reaper
+    app.state.leases = leases
+    app.state.sweeper = sweeper
 
     async def require_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         if settings.auth_enabled and x_api_key != settings.llmconfig_api_key:
@@ -98,6 +112,9 @@ def create_app() -> FastAPI:
         resp = await orch.status()
         for ls in resp.lanes:
             ls.usage = classify_usage(ls, _current_util(orch.lane(ls.id).cfg.gpu_uuid), settings)
+            # Additive — `usage` keeps its three values because off-box consumers
+            # switch on it; the lease is reported alongside, never as a 4th state.
+            ls.lease = leases.brief(ls.id)  # sync, no await
         return resp
 
     if (WEB_DIR / "static").is_dir():
@@ -144,13 +161,14 @@ def create_app() -> FastAPI:
                 state=ls.usage or "free",
                 model=ls.loaded.model if ls.loaded else None,
                 idle_s=ls.idle_s,
+                lease=ls.lease,
             )
             for ls in resp.lanes
         ]
         mirror = next((u for u in lanes if u.lane == lane), lanes[0])
         return UsageResponse(
             lane=mirror.lane, state=mirror.state, model=mirror.model,
-            idle_s=mirror.idle_s, lanes=lanes,
+            idle_s=mirror.idle_s, lease=mirror.lease, lanes=lanes,
         )
 
     @app.get("/api/models", response_model=ModelsResponse)
@@ -349,6 +367,106 @@ def create_app() -> FastAPI:
             return {"repo": repo, "output": r.out[-500:]}
 
         return jobs.start(job, run)
+
+    # ------------------------------------------------------------------ #
+    # Leases — resource sharing between callers (see leases.py)
+    #
+    # ADVISORY: clients that bypass LLMConfig (direct Ollama on :11434/:11435, the
+    # vLLM relay on :11437) are ungated, so a non-preemptible lease is a cooperation
+    # contract, not a hard exclusivity guarantee.
+    # ------------------------------------------------------------------ #
+    def _lease_http(e: LeaseError) -> HTTPException:
+        status = 400 if isinstance(e, UnknownUnit) else 409
+        detail: dict = {"error": e.code, "message": e.message}
+        if e.lease is not None:
+            brief = leases.brief(e.lease.unit)
+            detail["unit"] = e.lease.unit
+            # HTTPException.detail is plain-json encoded, so hand it dicts.
+            detail["lease"] = brief.model_dump() if brief else e.lease.model_dump()
+        return HTTPException(status_code=status, detail=detail)
+
+    @app.post("/api/leases", response_model=LeaseClaimResponse, status_code=201,
+              dependencies=write)
+    async def api_lease_claim(req: LeaseClaimRequest, response: Response) -> LeaseClaimResponse:
+        try:
+            lease, displaced = leases.claim(req)
+        except LeaseError as e:
+            raise _lease_http(e)
+        if lease.renew_count:
+            response.status_code = 200  # same holder re-claiming → extended in place
+
+        # A non-preemptible lease is a FORWARD guarantee: work already running keeps
+        # the unit until it finishes (there is no job cancellation). Report that so
+        # the new holder can choose to wait rather than assume exclusivity now.
+        busy = None
+        try:
+            st = next((l for l in (await _status_with_usage()).lanes if l.id == lease.unit), None)
+            if st is not None and (st.swap_in_progress or st.usage == "active"):
+                busy = {
+                    "active_job_id": st.active_job_id,
+                    "usage": st.usage,
+                    "swap_in_progress": st.swap_in_progress,
+                    "loaded": st.loaded.model_dump() if st.loaded else None,
+                }
+        except Exception:  # noqa: BLE001 — a status hiccup must not fail the claim
+            pass
+        return LeaseClaimResponse(
+            lease=lease,
+            displaced=(
+                None if displaced is None else
+                LeaseBrief(id=displaced.id, holder=displaced.holder,
+                           preemptible=displaced.preemptible, priority=displaced.priority,
+                           expires_at=displaced.expires_at, model=displaced.model)
+            ),
+            busy_with=busy,
+        )
+
+    @app.get("/api/leases", response_model=LeaseListResponse)
+    async def api_leases(unit: Optional[str] = None, active: bool = False) -> LeaseListResponse:
+        return LeaseListResponse(
+            leases=leases.list(unit=unit, active_only=active),
+            server_started_at=leases.started_at,
+        )
+
+    @app.get("/api/leases/{lease_id}", response_model=Lease)
+    async def api_lease(lease_id: str) -> Lease:
+        lease = leases.get(lease_id)
+        if lease is None:
+            # Distinguish "never existed" from "lost in a restart" — leases are
+            # in-memory, so a restart is a normal reason for a valid id to vanish.
+            raise HTTPException(status_code=404, detail={
+                "error": "lease_unknown",
+                "message": f"no lease '{lease_id}'"
+                           + (" (the server restarted; re-claim and retry)"
+                              if leases.looks_like_pre_restart(lease_id) else ""),
+                "server_started_at": leases.started_at,
+            })
+        return lease
+
+    @app.post("/api/leases/{lease_id}/renew", response_model=Lease, dependencies=write)
+    async def api_lease_renew(lease_id: str, req: LeaseRenewRequest) -> Lease:
+        try:
+            return leases.renew(lease_id, req.ttl_s)
+        except UnknownUnit as e:
+            raise HTTPException(status_code=404, detail={"error": "lease_unknown", "message": e.message})
+        except LeaseNotActive as e:
+            raise _lease_http(e)
+
+    @app.delete("/api/leases/{lease_id}", response_model=Lease, dependencies=write)
+    async def api_lease_release(lease_id: str) -> Lease:
+        try:
+            return leases.release(lease_id)  # idempotent
+        except UnknownUnit as e:
+            raise HTTPException(status_code=404, detail={"error": "lease_unknown", "message": e.message})
+
+    @app.post("/api/leases/{lease_id}/revoke", response_model=Lease, dependencies=write)
+    async def api_lease_revoke(lease_id: str, req: LeaseRevokeRequest) -> Lease:
+        """Operator break-glass — takes a unit back even from a non-preemptible lease
+        (which `force` on a claim deliberately cannot do)."""
+        try:
+            return leases.revoke(lease_id, by=req.by, reason=req.reason, free=req.free)
+        except UnknownUnit as e:
+            raise HTTPException(status_code=404, detail={"error": "lease_unknown", "message": e.message})
 
     # ------------------------------------------------------------------ #
     # OpenAI-compatible /v1 gateway (auto-loads on first request, then proxies).

@@ -160,6 +160,51 @@ require `X-API-Key` only when `LLMCONFIG_API_KEY` is set. Read endpoints take
 | `DELETE /api/ollama/{name}`             | Delete an Ollama model                                        |
 | `GET/POST/PUT/DELETE /api/vllm/aliases` | The vLLM alias registry for a lane (add/edit/remove)          |
 | `POST /api/vllm/download`               | HuggingFace-download a model into the WSL cache               |
+| `POST /api/leases`                      | Claim a unit → a lease id (409 when it's held)                |
+| `GET /api/leases`, `GET /api/leases/{id}` | List / poll leases (incl. why one ended)                    |
+| `POST /api/leases/{id}/renew`           | Push the TTL out; `DELETE /api/leases/{id}` hands it back     |
+| `POST /api/leases/{id}/revoke`          | Operator break-glass — take a unit back                       |
+
+## Leases — sharing a unit between callers
+
+`swap_in_progress` only answers *"is a swap running right now?"*. A **lease** is a
+real claim: a caller says who it is, **whether its work may be interrupted**, and
+**how long it needs the unit** — and finds out if it gets displaced.
+
+```bash
+LEASE=$(llmconfig lease claim --holder nightly-eval --no-preempt \
+                              --minutes 10 --expect-minutes 45 --quiet)
+curl -H "X-LLM-Lease: $LEASE" ... /v1/chat/completions     # your traffic
+llmconfig lease renew  $LEASE                              # before the TTL lapses
+llmconfig lease release $LEASE                             # hand it back
+```
+
+- **Two durations on purpose.** `--expect-minutes` is the honest "I'll need this
+  for 45 minutes" (recorded, displayed, never enforced); `--minutes` is a short
+  renewable leash proving you're alive. A crashed client frees the unit in minutes
+  instead of pinning it for its whole declared duration.
+- **Preemption.** A `--no-preempt` lease is never taken by another claim (not even
+  with `--force`); a preemptible one yields to a higher `--priority` claim. Equal
+  priority is first-come-first-served unless `--force`.
+- **Being displaced** shows up two ways: `GET /api/leases/{id}` reports
+  `state=revoked` with who took it and why, and your next `/v1` request returns
+  `409 lease_revoked`. `llmconfig lease wait <id>` blocks and exits **0** released
+  / **3** revoked / **4** expired, so a shell driver can react.
+- **Effect on others.** Un-leased `/v1` traffic keeps working normally (opencode
+  needs no changes) *except* against a non-preemptible lease, which refuses it with
+  `409 lease_required`. Set `LEASE_BLOCK_UNLEASED=false` to disable that.
+- **Effect on idle-unload.** Any live lease stops the [idle reaper](#idle-auto-unload),
+  so a holder pausing between bursts keeps its model resident — at the cost of the
+  card staying in P0 for up to one lease period.
+- **Expiry releases the claim; it does not unload anything.** The model stays
+  resident and the reaper simply resumes its normal timer.
+
+> **Advisory, not enforced.** Clients that bypass LLMConfig (direct Ollama on
+> `:11434`/`:11435`, the vLLM relay on `:11437`) are ungated, so a non-preemptible
+> lease is a cooperation contract rather than a hard exclusivity guarantee. It is
+> also a **forward** guarantee only: work already running when you claim keeps the
+> unit until it finishes (there is no job cancellation) — the claim response reports
+> that as `busy_with`.
 
 ## OpenAI `/v1` gateway — auto-load on first request
 
@@ -198,6 +243,9 @@ llmconfig unload --lane companion             # free the companion GPU
 llmconfig companion-default ollama qwen3:4b   # set a lane's auto-load-on-startup default
 llmconfig pull qwen3:4b                        # pull an Ollama model
 llmconfig doctor                               # verify the box (add --local to run in-process)
+llmconfig lease claim --holder me --minutes 30 # claim a unit (--no-preempt = don't interrupt me)
+llmconfig lease list --active                  # who holds what right now
+llmconfig lease wait <id>                      # block; exit 0 released / 3 revoked / 4 expired
 llmconfig serve                                # run the API + web UI here
 ```
 

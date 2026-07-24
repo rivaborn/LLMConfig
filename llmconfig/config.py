@@ -204,6 +204,35 @@ class Settings(BaseSettings):
     # and the `usage` field on /api/status lanes).
     usage_active_window_s: float = 60.0
 
+    # --- leases (resource sharing between callers — see leases.py) ---
+    # A lease is a caller's claim on one unit: "I'm using this, and here's whether
+    # you may take it from me." Advisory by design — clients that bypass LLMConfig
+    # (direct Ollama on :11434/:11435) can't be stopped, so a non-preemptible lease
+    # is a cooperation contract, not a hard exclusivity guarantee.
+    lease_enabled: bool = True
+    lease_default_ttl_s: float = 600.0     # renewable leash when the claim omits ttl_s
+    lease_min_ttl_s: float = 30.0
+    lease_max_ttl_s: float = 7200.0        # claims are CLAMPED to this, never refused
+    # Past expiry a lease immediately stops blocking others, but for this long its
+    # own requests still succeed and `renew` can revive it — absorbs a holder whose
+    # renew timer slipped behind a long generation.
+    lease_expiry_grace_s: float = 30.0
+    lease_sweep_interval_s: float = 5.0
+    lease_max_history: int = 100           # terminal leases kept for the "why" poll
+    # Any live lease blocks the idle reaper, so a holder pausing between bursts keeps
+    # its model resident. Cost: the card stays in P0 for up to one lease period.
+    lease_blocks_idle_unload: bool = True
+    # Whether a non-preemptible lease 409s un-leased /v1 traffic. The kill switch if
+    # it ever surprises a client: false ⇒ leases only affect the reaper and other claimants.
+    lease_block_unleased: bool = True
+    # Auto-expire a lease whose holder never used it and whose unit sits free (a
+    # claim whose load failed would otherwise 409 traffic on an empty card). 0 disables.
+    lease_unused_release_s: float = 300.0
+    # How to refuse a rejected `stream: true` request. "http" (a real 409) is correct
+    # because the gate decides before any bytes are written; "sse" emits an in-band
+    # error chunk at HTTP 200 for clients that can't surface a non-200 on a stream.
+    lease_stream_reject_mode: str = "http"
+
     # --- HuggingFace (vLLM downloads) ---
     hf_token: str = ""
 

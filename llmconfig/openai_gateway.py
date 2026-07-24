@@ -19,7 +19,7 @@ import asyncio
 import json
 import time
 import uuid
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import httpx
 from fastapi import APIRouter, HTTPException, Request
@@ -32,14 +32,19 @@ from .orchestrator import Orchestrator, Unit
 from .schemas import LoadRequest
 from .spark_unit import SparkUnit
 
+if TYPE_CHECKING:
+    from .leases import LeaseManager
+
 
 class OpenAIGateway:
     """Holds the long-lived forwarding client + the resolve/load/forward logic."""
 
-    def __init__(self, orch: Orchestrator, jobs: JobManager, settings: Settings):
+    def __init__(self, orch: Orchestrator, jobs: JobManager, settings: Settings,
+                 leases: "LeaseManager | None" = None):
         self.orch = orch
         self.jobs = jobs
         self.s = settings
+        self.leases = leases
         self._http: httpx.AsyncClient | None = None
 
     # ---- forwarding client (no read timeout: chat generations can run long) ----
@@ -103,6 +108,91 @@ class OpenAIGateway:
             if model in names:
                 return ("ollama", model, lane.cfg.ollama_url)
         return None
+
+    # ---- lease admission (see leases.py) ----
+    def _lease_gate(self, unit_id: str, lease_id: str):
+        """Decide whether this request may use the unit. Returns None to allow, or
+        `(code, message, lease)` to refuse.
+
+        Fully synchronous on purpose: it runs before any await in the request path,
+        so a lease cannot be claimed or revoked underneath the decision.
+
+        Un-leased traffic keeps working (opencode sends no lease header) EXCEPT
+        against a non-preemptible claim — that is the one behavioural change, and
+        `LEASE_BLOCK_UNLEASED=false` disables it.
+        """
+        if self.leases is None or not self.s.lease_enabled:
+            return None
+
+        if not lease_id:
+            blocker = self.leases.blocks_unleased(unit_id)
+            if blocker is None:
+                return None
+            return ("lease_required",
+                    f"unit '{unit_id}' is held by '{blocker.holder}' with a "
+                    f"non-preemptible lease — claim one (POST /api/leases) or wait",
+                    blocker)
+
+        lease = self.leases.get(lease_id)
+        if lease is None:
+            reason = ("server_restarted" if self.leases.looks_like_pre_restart(lease_id)
+                      else "unknown")
+            return ("lease_revoked",
+                    f"lease {lease_id} is not known to this server ({reason}) — re-claim and retry",
+                    None)
+        if lease.unit != unit_id:
+            return ("lease_wrong_unit",
+                    f"lease {lease_id} is for unit '{lease.unit}', not '{unit_id}'", lease)
+
+        now_mono = time.monotonic()
+        if lease.is_live(now_mono):
+            self.leases.note_request(lease.id)
+            return None
+        # Past the deadline but inside the grace window: still serve this holder (its
+        # renew timer may just have slipped behind a long generation). Note the
+        # asymmetry — it no longer blocks anyone else.
+        if lease.state in ("active", "expired") and lease.in_grace(
+                now_mono, self.s.lease_expiry_grace_s):
+            self.leases.note_request(lease.id)
+            return None
+        if lease.state == "revoked":
+            who = f" by '{lease.revoked_by}'" if lease.revoked_by else ""
+            why = f" ({lease.revoked_reason})" if lease.revoked_reason else ""
+            return ("lease_revoked",
+                    f"lease {lease.id} was revoked{who}{why} — re-claim before retrying", lease)
+        if lease.state == "released":
+            return ("lease_released",
+                    f"lease {lease.id} was released — claim a new one", lease)
+        return ("lease_expired",
+                f"lease {lease.id} expired — renew sooner or claim a new one", lease)
+
+    def _lease_reject(self, code: str, message: str, lease, *, is_chat: bool, stream: bool):
+        """Refuse a request that failed the lease gate.
+
+        A rejected stream gets a real HTTP 409 by default: the gate decides before a
+        single byte is written, so the status line is still available. (The existing
+        `❌ load failed` case is different — bytes had already gone out.) Set
+        LEASE_STREAM_REJECT_MODE=sse for clients that can't surface a non-200 here.
+        """
+        payload = {"error": {"message": message, "type": "invalid_request_error", "code": code}}
+        if lease is not None:
+            # Additive sibling — strict OpenAI clients read error.message and ignore this.
+            payload["error"]["lease"] = {
+                "id": lease.id, "state": lease.state, "unit": lease.unit,
+                "holder": lease.holder, "revoked_by": lease.revoked_by,
+                "revoked_reason": lease.revoked_reason, "revoked_at": lease.revoked_at,
+            }
+        if stream and self.s.lease_stream_reject_mode == "sse":
+            cid = ("chatcmpl-" if is_chat else "cmpl-") + uuid.uuid4().hex[:12]
+            created = int(time.time())
+
+            async def _gen():
+                yield self._progress_chunk(cid, created, "", f"❌ {message}\n", is_chat)
+                yield self._final_chunk(cid, created, "", is_chat)
+                yield b"data: [DONE]\n\n"
+
+            return StreamingResponse(_gen(), media_type="text/event-stream")
+        return JSONResponse(status_code=409, content=payload)
 
     def _ensure_load_job(self, lane: Lane, status, target_kind: str, server: str,
                          load_arg: str, stream: bool):
@@ -281,6 +371,13 @@ class OpenAIGateway:
             raise HTTPException(status_code=400, detail="request body must be a JSON object")
         model = body.get("model") or ""
         stream = bool(body.get("stream"))
+
+        # Admission BEFORE resolve() and before the first lane.touch(): the decision
+        # shouldn't depend on model resolution, and a refused request must not extend
+        # the lane's idle window (it never reached a backend).
+        reject = self._lease_gate(lane.cfg.id, (request.headers.get("x-llm-lease") or "").strip())
+        if reject is not None:
+            return self._lease_reject(*reject, is_chat=is_chat, stream=stream)
 
         resolved = await self.resolve(lane, model)
         if resolved is None:
