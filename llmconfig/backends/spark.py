@@ -98,6 +98,7 @@ class SparkBackend:
                 cluster=self.s.spark_cluster,
                 host=self.cfg.host,
                 user=self.cfg.ssh_user,
+                port=self.cfg.api_port,
                 **kw,
             ).strip()
         except (KeyError, IndexError) as e:
@@ -105,12 +106,19 @@ class SparkBackend:
                 f"bad sparkrun command template {template!r}: unknown placeholder {e}"
             ) from e
 
-    async def run_recipe(self, recipe: str, tp: int = 1, extra: list[str] | None = None):
-        """Launch a workload on this node. Returns the raw CmdResult."""
+    async def run_recipe(self, recipe: str, tp: int = 1, extra: list[str] | None = None,
+                         served: str = ""):
+        """Launch a workload on this node. Returns the raw CmdResult.
+
+        `served` pins `--served-model-name`, so the node reports exactly the name
+        this app waits for and the /v1 resolver matches — rather than whatever the
+        recipe happens to default to.
+        """
         cmd = self._fmt(
             self.s.spark_run_cmd,
             recipe=shlex.quote(recipe),
             tp=int(tp or 1),
+            served=shlex.quote(served or recipe),
             extra=" ".join(extra or []),
         )
         # Generous timeout: sparkrun pulls the image/weights on a cold node.

@@ -198,8 +198,9 @@ class SparkUnit:
             self.jobs.log(job, f"stop reported rc={stop.rc}: {stop.text()[:200]}")
 
         recipe = entry.recipe or entry.alias
-        self.jobs.log(job, f"launching {recipe} on {self.cfg.name} (tp={entry.tp})…")
-        r = await self.spark.run_recipe(recipe, tp=entry.tp, extra=entry.extra_args)
+        self.jobs.log(job, f"launching {recipe} on {self.cfg.name} as '{target}' (tp={entry.tp})…")
+        r = await self.spark.run_recipe(recipe, tp=entry.tp, extra=entry.extra_args,
+                                        served=target)
         if not r.ok:
             if r.rc == 127:
                 raise RuntimeError(

@@ -4,42 +4,53 @@
 # node through the UI / API. sparkrun's synced registries carry ~147 models; this
 # is the small set this lab actually serves, mirroring the vLLM alias registry.
 #
+# `recipe` must be a name sparkrun can resolve — they are NAMESPACED by registry
+# (`@eugr/…`, `@official/…`, `@sparkrun-transitional/…`). Check with
+# `sparkrun search <text>` or `sparkrun list`; a bare guess fails with
+# "Recipe '<name>' not found".
+#
+# `served_name` is pinned onto the launch via `--served-model-name`, so the node
+# reports exactly this string and readiness/`/v1` resolution can't drift from
+# whatever the recipe would otherwise default to. It is also the id you use as
+# `model` against the /v1 gateway.
+#
 # tp = node count. Everything here is tp: 1 — the 200G switch has not been
 # delivered, so the four Sparks run as independent single-node servers. Raise tp
-# only after the fabric is up (see the wiki runbook).
+# only after the fabric is up (see the wiki runbook), and only for a recipe whose
+# `Nodes` column in `sparkrun list` supports it.
 #
 # status: "unverified" until it has been launched and recall-tested on THIS
 # cluster. The decode figures in the notes are community numbers from the Spark
 # Arena leaderboard, not measurements from this lab.
 models:
   - alias: gpt-oss-120b
-    recipe: gpt-oss-120b
+    recipe: "@eugr/openai-gpt-oss-120b"
     served_name: gpt-oss-120b
     tp: 1
     status: unverified
-    notes: "MXFP4. Community 1-node decode ~58.8 t/s, strong prefill (~6000 t/s)."
+    notes: "MXFP4 via vllm-distributed. Community 1-node decode ~58.8 t/s, strong prefill (~6000 t/s)."
     load_timeout_s: 1200
 
   - alias: qwen3-coder-next
-    recipe: Qwen3-Coder-Next
-    served_name: Qwen3-Coder-Next
+    recipe: "@official/qwen3-coder-next-int4-autoround-vllm"
+    served_name: qwen3-coder-next
     tp: 1
     status: unverified
-    notes: "INT4/FP8. Community 1-node decode ~73.3 t/s — fastest on a single node."
+    notes: "INT4 AutoRound. Community 1-node decode ~73.3 t/s — fastest on a single node."
     load_timeout_s: 900
 
   - alias: qwen35-35b-a3b
-    recipe: Qwen3.5-35B-A3B
-    served_name: Qwen3.5-35B-A3B
+    recipe: "@sparkrun-transitional/qwen3.5-35b-a3b-fp8-sglang"
+    served_name: qwen35-35b-a3b
     tp: 1
     status: unverified
-    notes: "FP8 MoE. ~50.8 t/s single-stream, ~196 t/s aggregate at c10."
+    notes: "FP8 MoE on SGLang. ~50.8 t/s single-stream, ~196 t/s aggregate at c10."
     load_timeout_s: 900
 
-  - alias: gemma-4-26b
-    recipe: gemma-4-26B-A4B-it
-    served_name: gemma-4-26B-A4B-it
+  - alias: qwen35-27b
+    recipe: "@sparkrun-transitional/qwen3.5-27b-fp8-sglang"
+    served_name: qwen35-27b
     tp: 1
     status: unverified
-    notes: "FP8. ~47.4 t/s on one node."
+    notes: "FP8 dense 27B on SGLang, single node."
     load_timeout_s: 900

@@ -214,6 +214,43 @@ async def test_load_stops_then_runs_then_waits(cfg, calls):
 
 
 @respx.mock
+async def test_launch_command_matches_verified_sparkrun_flags(cfg, calls):
+    """Pins the three flags verified against sparkrun 0.2.40 on the live cluster.
+
+    Each was wrong in the first cut and each fails differently:
+      --cluster with --hosts  → without the cluster, sparkrun SSHes as the local
+                                WSL user and every node returns Permission denied
+      --no-follow             → without it `run` tails logs and never returns, so
+                                the load hangs until its timeout
+      --port/--served-model-name → without them the node may serve a different
+                                name/port than this app probes for
+    """
+    models_route("served-1")
+    u = make_unit(cfg)
+    await wait_job(u.load(LoadRequest(server="spark", model="m1", lane="spark1", force=True)))
+
+    run = next(c for c in calls if "sparkrun run" in c)
+    assert "--cluster" in run and "--hosts" in run, "cluster supplies the ssh user"
+    assert "--no-follow" in run, "without this the launch never returns"
+    assert f"--port {PORT}" in run
+    assert "--served-model-name served-1" in run, "pin the served name to the catalog"
+
+    stop = next(c for c in calls if "sparkrun stop" in c)
+    assert "--all" in stop, "sparkrun stop errors without a TARGET or --all"
+
+
+def test_seeded_recipes_are_namespaced():
+    """sparkrun resolves registry recipes by namespaced name (@registry/name); a
+    bare guess fails with "Recipe '<name>' not found"."""
+    reg = SparkRegistry(__import__("pathlib").Path(__file__).parent / "_seed_check.yaml")
+    try:
+        for e in reg.entries():
+            assert e.recipe.startswith("@"), f"{e.alias}: recipe '{e.recipe}' is not namespaced"
+    finally:
+        reg.path.unlink(missing_ok=True)
+
+
+@respx.mock
 async def test_load_already_serving_short_circuits(cfg, calls):
     models_route("served-1")
     u = make_unit(cfg)

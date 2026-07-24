@@ -170,9 +170,24 @@ class Settings(BaseSettings):
     spark_idle_unload_enabled: bool = False
     # sparkrun command templates. Kept configurable because the exact flags differ
     # across sparkrun releases — correct them in .env rather than patching code.
-    # Placeholders: {cluster} {host} {recipe} {tp} {extra}
-    spark_run_cmd: str = "sparkrun run {recipe} --cluster {cluster} --hosts {host} --tp {tp} {extra}"
-    spark_stop_cmd: str = "sparkrun stop --cluster {cluster} --hosts {host}"
+    # Placeholders: {cluster} {host} {recipe} {tp} {port} {served} {user} {extra}
+    #
+    # Verified against sparkrun 0.2.40 on .40 (2026-07-24). Three details are
+    # load-bearing, all confirmed by `--dry-run` on the live cluster:
+    #   --cluster AND --hosts together: the cluster supplies the SSH user, --hosts
+    #     narrows to one node. With --hosts alone sparkrun falls back to the local
+    #     WSL user and every connection fails "folar@…: Permission denied".
+    #   --no-follow: without it `run` tails the container logs and never returns,
+    #     so the load would sit until its timeout instead of reporting success.
+    #   --port/--served-model-name: pin what the node serves to what this app
+    #     probes, so readiness and the /v1 resolver can't drift from the recipe.
+    spark_run_cmd: str = (
+        "sparkrun run {recipe} --cluster {cluster} --hosts {host} --tp {tp} "
+        "--port {port} --served-model-name {served} --no-follow {extra}"
+    )
+    # `stop` requires a TARGET or --all; without either it exits "Must specify
+    # TARGET or --all." and nothing is stopped.
+    spark_stop_cmd: str = "sparkrun stop --all --cluster {cluster} --hosts {host}"
     spark_status_cmd: str = "sparkrun status --cluster {cluster}"
     # Remote telemetry: plain SSH to the node (the control node's WSL already has
     # passwordless key auth to every Spark).

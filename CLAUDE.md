@@ -168,6 +168,15 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 10. **`sparkrun` command templates live in `Settings`, not in code.** Its flags shift
    between releases, so `SPARK_RUN_CMD` / `SPARK_STOP_CMD` / `SPARK_SSH_CMD` are
    `.env`-tunable. Fix a flag mismatch there, not by hardcoding a new argv.
+   Verified against **sparkrun 0.2.40** (2026-07-24) by `--dry-run` on the live
+   cluster; three flags are load-bearing and each fails differently if dropped:
+   **`--cluster` alongside `--hosts`** (the cluster carries the SSH user — with
+   `--hosts` alone sparkrun uses the local WSL user and every node returns
+   *Permission denied*), **`--no-follow`** (otherwise `run` tails container logs
+   and never returns, so the load hangs to its timeout), and **`--all` on `stop`**
+   (without a TARGET it exits *"Must specify TARGET or --all."*). Recipe names are
+   **namespaced** (`@eugr/…`, `@official/…`) — find them with `sparkrun search`.
+   `tests/test_spark.py::test_launch_command_matches_verified_sparkrun_flags` pins this.
 11. **`LeaseManager`'s query/mutation methods must stay synchronous.** `idle.py`'s
    final guard and `LeaseSweeper._free_unit` both rely on there being **no await**
    between the last check and `Unit.unload()` — an uncontended `asyncio.Lock`
