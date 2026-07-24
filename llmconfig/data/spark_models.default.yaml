@@ -23,6 +23,24 @@
 # cluster. The decode figures in the notes are community numbers from the Spark
 # Arena leaderboard, not measurements from this lab.
 models:
+  # The first model actually launched on this cluster (shakedown 2026-07-24).
+  # The recipe defaults to tensor_parallel: 2 and max_model_len: 262144 — sized for
+  # two nodes. On one node that KV cache does not fit beside the weights at
+  # gpu_memory_utilization 0.8, so tp is 1 here and the context is pinned in
+  # extra_args. Raise both only after the 200G switch makes multi-node real.
+  - alias: gemma-4-26b
+    recipe: "@eugr/gemma4-26b-a4b"
+    served_name: gemma-4-26b
+    tp: 1
+    status: unverified
+    extra_args: ["--max-model-len", "65536"]
+    notes: >-
+      google/gemma-4-26B-A4B-it, MoE 26B/4B-active, served fp8 with fp8 KV.
+      65536 ctx clears opencode's ~24.5k baseline with room. Weights download as
+      ~48 GB bf16 and are quantized at load, so the FIRST load on a node is a long
+      pull; later loads hit the local HF cache.
+    load_timeout_s: 3600
+
   - alias: gpt-oss-120b
     recipe: "@eugr/openai-gpt-oss-120b"
     served_name: gpt-oss-120b
