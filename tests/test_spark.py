@@ -66,7 +66,7 @@ def make_unit(cfg, seed=True) -> SparkUnit:
     if seed:
         reg.upsert(SparkModelEntry(alias="m1", recipe="recipe-1", served_name="served-1",
                                    tp=1, load_timeout_s=5))
-    return SparkUnit(Settings(), cfg, reg, JobManager())
+    return SparkUnit(Settings(_env_file=None), cfg, reg, JobManager())
 
 
 async def wait_job(job, timeout: float = 10.0):
@@ -93,12 +93,13 @@ def test_parse_spark_nodes_and_skips_malformed():
 
 
 def test_sparks_disabled_by_default():
-    assert Settings().sparks() == []
-    assert [c.id for c in Settings().units()] == ["primary"]
+    s = Settings(_env_file=None)   # isolate: the box's .env sets COMPANION_ENABLED=1
+    assert s.sparks() == []
+    assert [c.id for c in s.units()] == ["primary"]
 
 
 def test_units_includes_lanes_then_sparks():
-    s = Settings(spark_enabled=True, companion_enabled=True)
+    s = Settings(_env_file=None, spark_enabled=True, companion_enabled=True)
     ids = [c.id for c in s.units()]
     assert ids == ["primary", "companion", "spark1", "spark2", "spark3", "spark4"]
     assert [c.host for c in s.sparks()] == [
@@ -263,7 +264,7 @@ async def test_unload_stops_workload(cfg, calls):
 # Cross-cutting: a spark owner must count as "managed", not "free"
 # --------------------------------------------------------------------------- #
 def test_classify_usage_treats_spark_as_managed():
-    s = Settings()
+    s = Settings(_env_file=None)
     base = dict(id="spark1", name="s", kind="spark", owner="spark",
                 ollama_up=False, vllm_up=False)
     idle = LaneStatus(**base, idle_s=s.usage_active_window_s + 100)
