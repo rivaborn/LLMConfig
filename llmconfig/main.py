@@ -133,11 +133,11 @@ def create_app() -> FastAPI:
         # browsers heuristically serve a stale style.css/app.js after a redeploy
         # (the tab rules would be missing → views stack). Tag each asset URL with
         # the newest static-file mtime so a changed file always fetches fresh.
-        static_files = list((WEB_DIR / "static").glob("*.*"))
         try:
+            static_files = list((WEB_DIR / "static").glob("*.*"))
             token = str(int(max(p.stat().st_mtime for p in static_files)))
-        except (ValueError, OSError):
-            token = __version__
+        except (ValueError, OSError):  # missing static dir / empty — degrade, never 500
+            static_files, token = [], __version__
         # Derived from what's actually on disk rather than a hardcoded list, so a
         # newly added asset can't silently ship un-busted.
         for asset in sorted(p.name for p in static_files):
@@ -251,12 +251,47 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------ #
     # Write endpoints (X-API-Key when configured)
     # ------------------------------------------------------------------ #
+    def _require_lease_ok(unit_id: str, x_llm_lease: Optional[str]) -> None:
+        """Honour a non-preemptible lease on the load/unload endpoints too.
+
+        Without this the /v1 gate is hollow: chat traffic gets a 409 while anyone
+        can POST /api/load a different model over the held unit — the biggest
+        interruption there is. The holder passes by sending its own lease id as
+        X-LLM-Lease; preemptible leases stay advisory here, like on /v1.
+        """
+        if not settings.lease_enabled:
+            return
+        blocker = leases.blocks_unleased(unit_id)
+        if blocker is None or (x_llm_lease or "").strip() == blocker.id:
+            return
+        brief = leases.brief(unit_id)
+        raise HTTPException(status_code=409, detail={
+            "error": "lease_held",
+            "message": f"unit '{unit_id}' is held by '{blocker.holder}' with a "
+                       f"non-preemptible lease — pass its id as X-LLM-Lease, or "
+                       f"revoke it (POST /api/leases/{blocker.id}/revoke)",
+            "unit": unit_id,
+            "lease": brief.model_dump() if brief else None,
+        })
+
     @app.post("/api/load", response_model=Job, dependencies=write)
-    async def api_load(req: LoadRequest) -> Job:
+    async def api_load(req: LoadRequest,
+                       x_llm_lease: Optional[str] = Header(default=None)) -> Job:
+        unit = _lane(req.lane)
+        # Catch the kind mismatch here — otherwise server="spark" on a GPU lane
+        # falls into the vLLM path and fails with a misleading "unknown alias".
+        if isinstance(unit, SparkUnit) != (req.server == "spark"):
+            want = "'spark'" if isinstance(unit, SparkUnit) else "'ollama' or 'vllm'"
+            raise HTTPException(status_code=400,
+                                detail=f"unit '{req.lane}' takes server {want}, not '{req.server}'")
+        _require_lease_ok(req.lane, x_llm_lease)
         return orch.load(req)
 
     @app.post("/api/unload", response_model=StatusResponse, dependencies=write)
-    async def api_unload(req: UnloadRequest) -> StatusResponse:
+    async def api_unload(req: UnloadRequest,
+                         x_llm_lease: Optional[str] = Header(default=None)) -> StatusResponse:
+        _lane(req.lane)
+        _require_lease_ok(req.lane, x_llm_lease)
         return await orch.unload(req)
 
     @app.post("/api/ollama/pull", response_model=Job, dependencies=write)
@@ -400,11 +435,14 @@ def create_app() -> FastAPI:
         # the new holder can choose to wait rather than assume exclusivity now.
         busy = None
         try:
-            st = next((l for l in (await _status_with_usage()).lanes if l.id == lease.unit), None)
-            if st is not None and (st.swap_in_progress or st.usage == "active"):
+            # Only the claimed unit — a full _status_with_usage() would probe every
+            # unit (local nvidia-smi + each Spark) just to inspect this one.
+            st = await orch.unit(lease.unit).status()
+            usage = classify_usage(st, _current_util(orch.unit(lease.unit).cfg.gpu_uuid), settings)
+            if st.swap_in_progress or usage == "active":
                 busy = {
                     "active_job_id": st.active_job_id,
-                    "usage": st.usage,
+                    "usage": usage,
                     "swap_in_progress": st.swap_in_progress,
                     "loaded": st.loaded.model_dump() if st.loaded else None,
                 }
@@ -423,8 +461,10 @@ def create_app() -> FastAPI:
 
     @app.get("/api/leases", response_model=LeaseListResponse)
     async def api_leases(unit: Optional[str] = None, active: bool = False) -> LeaseListResponse:
+        # `?unit=` (empty) means "all units", not "units named ''" — httpx clients
+        # serialize params={"unit": None} as an empty string, not an absent param.
         return LeaseListResponse(
-            leases=leases.list(unit=unit, active_only=active),
+            leases=leases.list(unit=unit or None, active_only=active),
             server_started_at=leases.started_at,
         )
 

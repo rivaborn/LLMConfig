@@ -180,6 +180,9 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    the claim rides alongside as `lanes[].lease`. Leases are also **advisory** —
    direct-to-Ollama clients are ungated — and a non-preemptible lease is a *forward*
    guarantee only: work already running keeps the unit (there is no job cancellation).
+   A non-preemptible lease gates `/v1` **and** `POST /api/load`/`/api/unload` (the
+   holder authorizes itself via `X-LLM-Lease`) — guarding only `/v1` would let anyone
+   swap the model over the held unit through the REST path.
 13. **Adding a vLLM model needs a `serve.sh` case, not just a registry row.** The
    registry's `launch_args` / `managed_by: registry` fields are currently **unwired** —
    `_load_vllm` always launches via `vllm@<alias>` → `serve.sh <alias>`, whose hardcoded

@@ -192,7 +192,10 @@ llmconfig lease release $LEASE                             # hand it back
   / **3** revoked / **4** expired, so a shell driver can react.
 - **Effect on others.** Un-leased `/v1` traffic keeps working normally (opencode
   needs no changes) *except* against a non-preemptible lease, which refuses it with
-  `409 lease_required`. Set `LEASE_BLOCK_UNLEASED=false` to disable that.
+  `409 lease_required`. The same rule guards `POST /api/load` and `POST /api/unload`
+  (the holder passes by sending its lease id as `X-LLM-Lease`) — otherwise anyone
+  could swap the model right over the held unit. Set `LEASE_BLOCK_UNLEASED=false`
+  to disable both.
 - **Effect on idle-unload.** Any live lease stops the [idle reaper](#idle-auto-unload),
   so a holder pausing between bursts keeps its model resident — at the cost of the
   card staying in P0 for up to one lease period.

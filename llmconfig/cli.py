@@ -301,9 +301,14 @@ def lease_list(
     unit: Optional[str] = typer.Option(None, "--unit"),
     active: bool = typer.Option(False, "--active", help="only live leases"),
 ) -> None:
+    # Only send `unit` when set: httpx serializes None as `unit=` (empty string),
+    # which the server would read as a unit literally named "".
+    params: dict = {"active": active}
+    if unit:
+        params["unit"] = unit
     try:
         with _client() as c:
-            d = c.get("/api/leases", params={"unit": unit, "active": active}).json()
+            d = c.get("/api/leases", params=params).json()
     except httpx.HTTPError as e:
         _bail(e)
     leases = d.get("leases", [])

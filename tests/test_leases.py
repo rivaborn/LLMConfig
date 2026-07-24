@@ -371,6 +371,18 @@ async def test_unused_reaper_spares_a_used_lease():
     assert lease.state == "active"
 
 
+async def test_unused_reaper_spares_a_renewing_holder():
+    """Renewing is proof of life — a holder staging work (claimed, renewing, no
+    traffic yet) must not lose its claim as 'unused'."""
+    mgr, orch, s = _mgr(lease_unused_release_s=1)
+    lease, _ = _claim(mgr, preemptible=False)
+    lease.acquired_at = time.time() - 60          # old claim, zero requests...
+    mgr.renew(lease.id)                           # ...but the holder just renewed
+    orch.units["primary"].owner = "free"
+    await _sweeper(mgr, orch, s)._tick()
+    assert lease.state == "active", "an actively-renewing holder is not a ghost"
+
+
 async def test_sweeper_disabled_flag_noops():
     mgr, orch, s = _mgr(lease_enabled=False)
     sw = _sweeper(mgr, orch, s)

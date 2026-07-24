@@ -477,5 +477,8 @@ async function boot() {
 }
 
 boot();
-setInterval(() => { if (!anyBusy()) refreshStatus(); }, 2500);
+// Status is read-only and disabled-state is computed per unit, so keep polling even
+// while a unit is busy — a 15-minute Spark load must not freeze the other five
+// units' cards. The model catalog (which rebuilds DOM lists) still waits.
+setInterval(() => refreshStatus(), 2500);
 setInterval(() => { if (!anyBusy()) refreshModels(); }, 12000);

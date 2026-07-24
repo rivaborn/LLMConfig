@@ -537,7 +537,12 @@ class LeaseSweeper:
             return
         now = time.time()
         for lease in self.leases.list(active_only=True):
-            if lease.requests or (now - lease.acquired_at) < window:
+            # Renewing IS proof of life: a holder staging work (claimed, renewing,
+            # no traffic yet) must not lose its claim as "unused". Only a lease
+            # with no requests AND no renewals for the whole window is a ghost.
+            alive_at = max(lease.acquired_at, lease.renewed_at or 0.0,
+                           lease.last_seen_at or 0.0)
+            if lease.requests or (now - alive_at) < window:
                 continue
             unit = self.orch.units.get(lease.unit)
             if unit is None:
