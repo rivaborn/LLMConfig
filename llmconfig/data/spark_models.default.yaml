@@ -32,13 +32,15 @@ models:
     recipe: "@eugr/gemma4-26b-a4b"
     served_name: gemma-4-26b
     tp: 1
-    status: unverified
+    status: ok
     extra_args: ["--max-model-len", "65536"]
     notes: >-
       google/gemma-4-26B-A4B-it, MoE 26B/4B-active, served fp8 with fp8 KV.
-      65536 ctx clears opencode's ~24.5k baseline with room. Weights download as
-      ~48 GB bf16 and are quantized at load, so the FIRST load on a node is a long
-      pull; later loads hit the local HF cache.
+      65536 ctx clears opencode's ~24.5k baseline with room. VERIFIED on all four
+      nodes 2026-07-24 — real completions through the LLMConfig /v1 gateway in
+      0.6-1.1 s, ~85-89% of the 122 GB unified pool resident. Weights download as
+      ~48 GB bf16 and are quantized at load, so a node's FIRST load is a long pull
+      (~50 min cold); later loads hit the local HF cache (~7 min).
     load_timeout_s: 3600
 
   - alias: gpt-oss-120b
