@@ -439,6 +439,96 @@ class OpenAIGateway:
         lane.touch()  # generation finished — a long answer shouldn't count as idle time
         return resp
 
+    async def handle_pooling(self, request: Request, sub_path: str):
+        """`/v1/embeddings` and `/v1/rerank` — pooling runners, not chat.
+
+        Shares the whole admission path with `handle_completion` (lane header →
+        lease gate → resolve → ensure-loaded → forward) but differs in two ways
+        that matter:
+
+        * **Never streams.** Pooling endpoints have no SSE form, so none of the
+          progress-chunk machinery applies and a cold load simply blocks.
+        * **Never fabricates a response.** The chat path answers a mid-load
+          request with an empty `200` so opencode's title-gen doesn't hang for
+          minutes — harmless there, but an empty embedding written into a vector
+          store is silent data corruption, and an empty rerank silently reorders
+          nothing. Every not-ready case here is an explicit 503 instead.
+        """
+        lane = self.lane(request.headers.get("x-llm-lane") or "primary")
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="request body must be JSON")
+        if not isinstance(body, dict):
+            raise HTTPException(status_code=400, detail="request body must be a JSON object")
+        model = body.get("model") or ""
+
+        # Same ordering as the chat path: admission before resolve() and before the
+        # first touch(), so a refusal neither depends on resolution nor extends the
+        # lane's idle window. `stream` is always False — see the docstring.
+        reject = self._lease_gate(lane.cfg.id, (request.headers.get("x-llm-lease") or "").strip())
+        if reject is not None:
+            return self._lease_reject(*reject, is_chat=False, stream=False)
+
+        resolved = await self.resolve(lane, model)
+        if resolved is None:
+            return JSONResponse(
+                status_code=404,
+                content={"error": {"message": f"model '{model}' not found on lane '{lane.cfg.id}'",
+                                    "type": "invalid_request_error", "code": "model_not_found"}},
+            )
+        server, load_arg, backend = resolved
+
+        # Ollama's OpenAI surface has /v1/embeddings but no rerank endpoint. Say so
+        # here rather than letting the backend return a confusing 404.
+        if sub_path == "/rerank" and server == "ollama":
+            return JSONResponse(
+                status_code=501,
+                content={"error": {"message": "rerank is not supported by the Ollama backend; "
+                                              "use a vLLM or Spark pooling model",
+                                    "type": "invalid_request_error", "code": "rerank_unsupported"}},
+            )
+
+        lane.touch()
+
+        status = await lane.status()
+        if status.loaded and status.loaded.server == server and status.loaded.model == model:
+            resp = await self.forward(backend, sub_path, body, request.headers)
+            lane.touch()
+            return resp
+
+        target_kind = f"load:{lane.cfg.id}:{server}:{load_arg}"
+        job, short_circuit = self._ensure_load_job(lane, status, target_kind, server, load_arg,
+                                                   stream=False)
+        if short_circuit or job is None:
+            # A *different* model is mid-load. Never answer with an empty vector.
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": f"unit '{lane.cfg.id}' is loading another model; "
+                                              f"retry once '{model}' is resident",
+                                    "type": "server_error", "code": "unit_busy_loading"}},
+            )
+
+        if server == "spark":
+            entry = lane.registry.get(load_arg)
+            timeout = float(entry.load_timeout_s if entry else lane.cfg.load_timeout_s) + 60.0
+        elif server == "vllm":
+            entry = lane.registry.get(load_arg)
+            base = float(entry.load_timeout_s if entry else self.s.default_vllm_load_timeout_s)
+            timeout = base + self.s.vllm_ready_grace_s + 30.0
+        else:
+            timeout = 600.0
+        ok, err = await self._wait_job(job.id, timeout)
+        if not ok:
+            return JSONResponse(
+                status_code=503,
+                content={"error": {"message": f"failed to load '{model}': {err}",
+                                    "type": "server_error", "code": "model_load_failed"}},
+            )
+        resp = await self.forward(backend, sub_path, body, request.headers)
+        lane.touch()
+        return resp
+
     async def models(self, request: Request) -> dict:
         lane = self.lane(request.headers.get("x-llm-lane") or "primary")
         # Track the backend each id came from (the gateway's own source of truth), so
@@ -482,5 +572,19 @@ def build_gateway_router(gateway: OpenAIGateway) -> APIRouter:
     @router.post("/completions")
     async def v1_completions(request: Request):
         return await gateway.handle_completion(request, "/completions", is_chat=False)
+
+    @router.post("/embeddings")
+    async def v1_embeddings(request: Request):
+        return await gateway.handle_pooling(request, "/embeddings")
+
+    # vLLM serves rerank at /v1/rerank; /v1/score is the same scorer under the name
+    # some clients (and the Jina/Cohere-style SDKs) expect. Both are plain passthrough.
+    @router.post("/rerank")
+    async def v1_rerank(request: Request):
+        return await gateway.handle_pooling(request, "/rerank")
+
+    @router.post("/score")
+    async def v1_score(request: Request):
+        return await gateway.handle_pooling(request, "/score")
 
     return router

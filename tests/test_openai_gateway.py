@@ -141,6 +141,10 @@ def _upstream_app(captured):
 
     up.post("/v1/chat/completions")(_handle)
     up.post("/v1/completions")(_handle)
+    # pooling runners — same passthrough, no streaming form
+    up.post("/v1/embeddings")(_handle)
+    up.post("/v1/rerank")(_handle)
+    up.post("/v1/score")(_handle)
     return up
 
 
@@ -440,3 +444,92 @@ async def test_block_unleased_kill_switch_restores_old_behaviour(monkeypatch, tm
     async with _client(app) as c:
         r = await c.post("/v1/chat/completions", json=_chat())
     assert r.status_code == 200
+
+
+# --------------------------------------------------------------------------- #
+# Pooling endpoints: /v1/embeddings, /v1/rerank, /v1/score
+# --------------------------------------------------------------------------- #
+async def test_embeddings_fast_path_forwards_to_relay(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    world.vllm = "qwen3-coder-30b"
+    world.used_mb = 16000
+    async with _client(app) as c:
+        r = await c.post("/v1/embeddings", json={"model": "qwen3-coder-30b", "input": ["a", "b"]})
+    assert r.status_code == 200
+    assert r.json()["marker"] == "UPSTREAM_OK"
+    assert any(u.endswith("/v1/embeddings") for u in captured), "must hit the embeddings sub-path"
+    assert any(":11437" in u for u in captured)
+    assert jobs.list() == [], "fast path must not create a load job"
+
+
+async def test_rerank_and_score_reach_their_own_sub_paths(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    world.vllm = "qwen3-coder-30b"
+    world.used_mb = 16000
+    async with _client(app) as c:
+        r1 = await c.post("/v1/rerank",
+                          json={"model": "qwen3-coder-30b", "query": "q", "documents": ["d"]})
+        r2 = await c.post("/v1/score", json={"model": "qwen3-coder-30b", "text_1": "a", "text_2": "b"})
+    assert r1.status_code == 200 and r2.status_code == 200
+    assert any(u.endswith("/v1/rerank") for u in captured)
+    assert any(u.endswith("/v1/score") for u in captured)
+
+
+async def test_rerank_against_ollama_is_501_not_a_confusing_404(monkeypatch, tmp_path):
+    """Ollama's OpenAI surface has /v1/embeddings but no rerank. Say so plainly."""
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    world.ollama = {"qwen3-coder:30b": (2 * GiB, 2 * GiB)}
+    world.used_mb = 2000
+    async with _client(app) as c:
+        r = await c.post("/v1/rerank",
+                         json={"model": "qwen3-coder:30b", "query": "q", "documents": ["d"]})
+    assert r.status_code == 501
+    assert r.json()["error"]["code"] == "rerank_unsupported"
+    assert captured == [], "must not forward a rerank to Ollama"
+
+
+async def test_embeddings_never_return_an_empty_vector_mid_load(monkeypatch, tmp_path):
+    """The chat path answers a mid-load request with an empty 200 so title-gen does
+    not hang. Doing that here would write an empty embedding into a vector store —
+    silent corruption. Must be an explicit 503 instead."""
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    lane = orch.primary
+    other = jobs.create(kind="load:primary:vllm:coder32")
+    other.state = "running"
+    real_status = lane.status
+
+    async def fake_status(gpu=None):
+        st = await real_status(gpu=gpu)
+        st.swap_in_progress = True
+        st.active_job_id = other.id
+        return st
+
+    monkeypatch.setattr(lane, "status", fake_status)
+    async with _client(app) as c:
+        r = await c.post("/v1/embeddings", json={"model": "qwen3-coder-30b", "input": ["a"]})
+    assert r.status_code == 503, "must refuse, not fabricate"
+    assert r.json()["error"]["code"] == "unit_busy_loading"
+    assert captured == [], "must not forward while a different load is in flight"
+
+
+async def test_embeddings_unknown_model_404(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    async with _client(app) as c:
+        r = await c.post("/v1/embeddings", json={"model": "nope-not-a-model", "input": ["a"]})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "model_not_found"
+    assert captured == []
+
+
+async def test_embeddings_respect_a_non_preemptible_lease(monkeypatch, tmp_path):
+    """The lease gate is shared with the chat path — pooling traffic must not be a
+    way around a non-preemptible claim."""
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    world.vllm = "qwen3-coder-30b"
+    world.used_mb = 16000
+    _claim(app, holder="someone-else", preemptible=False)
+    async with _client(app) as c:
+        r = await c.post("/v1/embeddings", json={"model": "qwen3-coder-30b", "input": ["a"]})
+    assert r.status_code == 409
+    assert r.json()["error"]["code"] == "lease_required"
+    assert captured == [], "a refused request must never reach the backend"
