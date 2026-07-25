@@ -245,11 +245,15 @@ function modelCard(unitId, server, name, meta, status, loaded) {
 // ---- status --------------------------------------------------------------
 function describeLoaded(lm) {
   if (!lm) return "no model loaded";
+  // Served names are chosen per unit and CAN collide (the 3090 and a Spark both
+  // served "gemma-4-26b" from different weights), so show the backend's root
+  // whenever it differs — that's the only thing that identifies the real build.
+  const root = lm.root && lm.root !== lm.model ? `  ←  ${lm.root}` : "";
   if (lm.server === "ollama") {
     const spill = lm.spilled ? `, ${GIB(lm.on_cpu_bytes)} CPU` : " (all GPU)";
-    return `${lm.model} · ollama · ${GIB(lm.on_gpu_bytes)} GPU${spill}`;
+    return `${lm.model} · ollama · ${GIB(lm.on_gpu_bytes)} GPU${spill}${root}`;
   }
-  return `${lm.model} · ${lm.server}`;
+  return `${lm.model} · ${lm.server}${root}`;
 }
 
 async function refreshStatus() {

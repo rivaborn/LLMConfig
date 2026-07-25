@@ -71,16 +71,16 @@ class SparkUnit:
     # ------------------------------------------------------------------ #
     # Status
     # ------------------------------------------------------------------ #
-    async def _served(self) -> Optional[str]:
-        """`spark.served()` behind the backoff breaker (see `_served_fails`)."""
+    async def _served(self) -> tuple[Optional[str], str]:
+        """`spark.served_info()` behind the backoff breaker (see `_served_fails`)."""
         now = time.time()
         if (self._served_fails >= self._fails_before_backoff
                 and now - self._served_ts < self._probe_backoff_s):
-            return None  # presumed still down; re-probe once the backoff expires
+            return None, ""  # presumed still down; re-probe once the backoff expires
         self._served_ts = now
-        result = await self.spark.served()
+        result, root = await self.spark.served_info()
         self._served_fails = 0 if result else self._served_fails + 1
-        return result
+        return result, root
 
     def _refresh_gpu_soon(self) -> None:
         """Kick a background nvidia-smi refresh if the cached sample is stale."""
@@ -110,7 +110,7 @@ class SparkUnit:
 
         Only the fast HTTP probe is awaited here — see `_refresh_gpu_soon`.
         """
-        served = await self._served()
+        served, root = await self._served()
         self._refresh_gpu_soon()
         remote_gpu = self._gpu_cached or GpuInfo(
             found=False, uuid=self.cfg.gpu_uuid, error="awaiting first telemetry sample"
@@ -127,6 +127,7 @@ class SparkUnit:
             loaded = LoadedModel(
                 server="spark",
                 model=served,
+                root=root,
                 gpu_vram_pct=remote_gpu.vram_pct,
                 fully_on_gpu=True,
             )

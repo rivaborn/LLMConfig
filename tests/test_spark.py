@@ -118,6 +118,31 @@ def test_units_includes_lanes_then_sparks():
     ]
 
 
+def test_display_name_is_ordinal_with_chassis_hostname():
+    """"Spark 1 (spark-cc9b)" — the ordinal is what a human uses day to day, the
+    chassis hostname is what identifies the box in NetBox and `sparkrun status`."""
+    s = Settings(_env_file=None, spark_enabled=True)
+    assert [c.name for c in s.sparks()] == [
+        "Spark 1 (spark-cc9b)", "Spark 2 (spark-4cd0)",
+        "Spark 3 (spark-b984)", "Spark 4 (spark-f04a)",
+    ]
+
+
+def test_display_name_without_a_hostname_is_just_the_ordinal():
+    s = Settings(_env_file=None, spark_enabled=True, spark_nodes="spark7=10.0.0.7")
+    assert [c.name for c in s.sparks()] == ["Spark 7"]
+
+
+def test_seeded_served_names_do_not_collide_with_the_3090_alias(tmp_path):
+    """The 3090 serves `gemma-4-26b` from an AWQ-4bit build at 32k ctx. A Spark
+    serving that same bare name made an un-laned /v1 request resolve silently to
+    the wrong weights and half the context."""
+    reg = SparkRegistry(tmp_path / "seed.yaml")
+    served = {e.served_name for e in reg.entries()}
+    assert "gemma-4-26b" not in served, "bare name collides with the 3090's alias"
+    assert "gemma-4-26b-fp8" in served
+
+
 def test_spark_config_derived_fields(cfg):
     assert cfg.api_base == BASE
     assert cfg.gpu_uuid == "spark:spark1"   # synthetic — not a local nvidia-smi UUID
@@ -144,6 +169,23 @@ def test_registry_roundtrip(tmp_path):
 # --------------------------------------------------------------------------- #
 # Status
 # --------------------------------------------------------------------------- #
+def models_route_with_root(served: str, root: str):
+    return respx.get(f"{BASE}/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": served, "root": root}]})
+    )
+
+
+@respx.mock
+async def test_status_carries_the_backend_root(cfg, calls):
+    """Two units can serve the SAME name from different weights, so the API must
+    expose the backend's `root` (the real HF repo) to tell them apart."""
+    models_route_with_root("gemma-4-26b", "google/gemma-4-26B-A4B-it")
+    u = make_unit(cfg)
+    st = await u.status()
+    assert st.loaded.model == "gemma-4-26b"
+    assert st.loaded.root == "google/gemma-4-26B-A4B-it"
+
+
 @respx.mock
 async def test_status_serving(cfg, calls):
     models_route("served-1")

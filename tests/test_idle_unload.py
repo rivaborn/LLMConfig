@@ -66,6 +66,12 @@ class FakeVllm:
     async def served(self):
         return self.w.vllm_served
 
+    async def served_info(self):
+        # (served_name, root) — root distinguishes same-named models on
+        # different units; the fake mirrors a real relay's /v1/models.
+        m = self.w.vllm_served
+        return m, (f"fake-org/{m}" if m else "")
+
     async def up(self):
         return self.w.vllm_served is not None
 

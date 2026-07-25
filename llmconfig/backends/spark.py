@@ -73,13 +73,23 @@ class SparkBackend:
     # ---- liveness / state ----
     async def served(self) -> Optional[str]:
         """The model this node is currently serving, or None when nothing is up."""
+        return (await self.served_info())[0]
+
+    async def served_info(self) -> tuple[Optional[str], str]:
+        """`(served_name, root)` — root is the actual HF repo behind that name.
+
+        Served names are chosen per unit and can collide across units, so the
+        root is what tells two same-named models apart (see `LoadedModel.root`).
+        """
         try:
             r = await self._client().get("/v1/models", timeout=self.s.vllm_probe_timeout_s)
             r.raise_for_status()
             data = r.json().get("data", []) or []
-            return data[0].get("id") if data else None
+            if not data:
+                return None, ""
+            return data[0].get("id"), (data[0].get("root") or "")
         except (httpx.HTTPError, KeyError, IndexError, ValueError):
-            return None
+            return None, ""
 
     async def up(self) -> bool:
         return (await self.served()) is not None

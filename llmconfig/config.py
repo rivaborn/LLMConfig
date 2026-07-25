@@ -321,11 +321,17 @@ class Settings(BaseSettings):
         if not self.spark_enabled:
             return []
         out: list[SparkConfig] = []
-        for node_id, host, name in _parse_spark_nodes(self.spark_nodes):
+        for idx, (node_id, host, name) in enumerate(_parse_spark_nodes(self.spark_nodes), start=1):
+            # Display as "Spark 1 (spark-cc9b)": the ordinal is what a human uses
+            # day to day, the chassis hostname is what identifies the physical box
+            # in NetBox and in `sparkrun status`, so keep both.
+            digits = "".join(ch for ch in node_id if ch.isdigit())
+            ordinal = int(digits) if digits else idx
+            label = f"Spark {ordinal}" + (f" ({name})" if name and name != node_id else "")
             out.append(
                 SparkConfig(
                     id=node_id,
-                    name=name,
+                    name=label,
                     host=host,
                     ssh_user=self.spark_ssh_user,
                     api_port=self.spark_api_port,

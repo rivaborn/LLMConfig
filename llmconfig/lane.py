@@ -81,18 +81,19 @@ class Lane:
         # `gpu` may be supplied by the Orchestrator (one nvidia-smi shared across
         # lanes); fetch this lane's card only when called standalone.
         if gpu is None:
-            served, ollama_loaded, ollama_up, gpu = await asyncio.gather(
-                self.vllm.served(),
+            served_info, ollama_loaded, ollama_up, gpu = await asyncio.gather(
+                self.vllm.served_info(),
                 self.ollama.loaded(),
                 self.ollama.up(),
                 self._gpu(),
             )
         else:
-            served, ollama_loaded, ollama_up = await asyncio.gather(
-                self.vllm.served(),
+            served_info, ollama_loaded, ollama_up = await asyncio.gather(
+                self.vllm.served_info(),
                 self.ollama.loaded(),
                 self.ollama.up(),
             )
+        served, served_root = served_info
 
         loaded: Optional[LoadedModel] = None
         if served:
@@ -100,6 +101,7 @@ class Lane:
             loaded = LoadedModel(
                 server="vllm",
                 model=served,
+                root=served_root,
                 gpu_vram_pct=gpu.vram_pct,
                 fully_on_gpu=True,
             )

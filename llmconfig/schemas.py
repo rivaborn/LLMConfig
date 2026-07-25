@@ -170,6 +170,13 @@ class GpuOut(BaseModel):
 class LoadedModel(BaseModel):
     server: ServerName
     model: str
+    # The backend's own `root` — the actual HF repo behind the served name.
+    # Served names are chosen per unit and CAN collide across units: the 3090
+    # served `gemma-4-26b` from cyankiwi/…-AWQ-4bit at 32k ctx while the Sparks
+    # served the same name from google/gemma-4-26B-A4B-it at 65k, and nothing in
+    # the API distinguished them. Both backends already report `root` on
+    # /v1/models; carrying it here makes the real artifact visible.
+    root: str = ""
     size_bytes: int = 0
     on_gpu_bytes: int = 0
     on_cpu_bytes: int = 0
