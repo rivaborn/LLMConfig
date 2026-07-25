@@ -86,11 +86,32 @@ models:
     notes: "FP8 MoE on SGLang. ~50.8 t/s single-stream, ~196 t/s aggregate at c10."
     load_timeout_s: 900
 
-  - alias: qwen35-27b
-    recipe: "@sparkrun-transitional/qwen3.5-27b-fp8-sglang"
-    served_name: qwen35-27b
+  # Qwen3.6 pair. These replace the Qwen3.5 27B that was originally curated: the
+  # @official 3.6 recipes are single-node, run on vLLM rather than SGLang, carry the
+  # qwen3_coder tool parser, and add MTP speculative decoding (2 tokens) — the right
+  # lever on a GB10, where decode is bound by memory bandwidth on active params.
+  # They also halve the KV cost of their 3.5 equivalents, per `sparkrun show`:
+  #   3.6-35B-A3B  KV 10 GB vs 20 GB, total 44.9 GB, ceiling 1.62M tokens
+  #   3.6-27B      KV 32 GB vs 64 GB, total 60.8 GB, ceiling  557k tokens
+  # Both therefore take the full 262144 window comfortably.
+  - alias: qwen36-35b-a3b
+    recipe: "@official/qwen3.6-35b-a3b-fp8-mtp-vllm"
+    served_name: qwen36-35b-a3b
     tp: 1
     status: unverified
-    extra_args: ["--max-model-len", "65536"]
-    notes: "FP8 dense 27B on SGLang, single node."
-    load_timeout_s: 900
+    extra_args: ["--max-model-len", "262144"]
+    notes: >-
+      Qwen/Qwen3.6-35B-A3B-FP8 with MTP speculative decoding. 34.89 GB weights,
+      10 GB KV at 262144 — 44.89 GB of the 121 GB pool.
+    load_timeout_s: 1800
+
+  - alias: qwen36-27b
+    recipe: "@official/qwen3.6-27b-fp8-mtp-vllm"
+    served_name: qwen36-27b
+    tp: 1
+    status: unverified
+    extra_args: ["--max-model-len", "262144"]
+    notes: >-
+      Qwen/Qwen3.6-27B-FP8 with MTP speculative decoding. Dense 27B: 28.75 GB
+      weights but a heavier 32 GB KV at 262144 — 60.75 GB total.
+    load_timeout_s: 1800
