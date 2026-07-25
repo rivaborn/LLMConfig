@@ -81,6 +81,9 @@ class OllamaBackend:
                     modified=str(m.get("modified_at", "") or ""),
                     loaded=ps is not None,
                     size_vram_bytes=int((ps or {}).get("size_vram", 0) or 0),
+                    # Runtime window, not the model's architectural maximum —
+                    # OLLAMA_CONTEXT_LENGTH truncates it (4096 on this box).
+                    context_len=int((ps or {}).get("context_length", 0) or 0),
                 )
             )
         return out
@@ -94,6 +97,7 @@ class OllamaBackend:
                     size_bytes=int(m.get("size", 0) or 0),
                     loaded=True,
                     size_vram_bytes=int(m.get("size_vram", 0) or 0),
+                    context_len=int(m.get("context_length", 0) or 0),
                 )
             )
         return out

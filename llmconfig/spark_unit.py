@@ -24,7 +24,8 @@ from .config import Settings, SparkConfig
 from .gpu import GpuInfo
 from .jobs import JobManager
 from .registry import SparkRegistry
-from .schemas import GpuOut, Job, LaneStatus, LoadedModel, LoadRequest, UnloadRequest
+from .schemas import (GpuOut, Job, LaneStatus, LoadedModel, LoadRequest, ServedModel,
+                      UnloadRequest)
 
 
 class SparkUnit:
@@ -71,16 +72,16 @@ class SparkUnit:
     # ------------------------------------------------------------------ #
     # Status
     # ------------------------------------------------------------------ #
-    async def _served(self) -> tuple[Optional[str], str]:
+    async def _served(self) -> ServedModel:
         """`spark.served_info()` behind the backoff breaker (see `_served_fails`)."""
         now = time.time()
         if (self._served_fails >= self._fails_before_backoff
                 and now - self._served_ts < self._probe_backoff_s):
-            return None, ""  # presumed still down; re-probe once the backoff expires
+            return ServedModel()  # presumed still down; re-probe once the backoff expires
         self._served_ts = now
-        result, root = await self.spark.served_info()
-        self._served_fails = 0 if result else self._served_fails + 1
-        return result, root
+        info = await self.spark.served_info()
+        self._served_fails = 0 if info.name else self._served_fails + 1
+        return info
 
     def _refresh_gpu_soon(self) -> None:
         """Kick a background nvidia-smi refresh if the cached sample is stale."""
@@ -110,7 +111,8 @@ class SparkUnit:
 
         Only the fast HTTP probe is awaited here — see `_refresh_gpu_soon`.
         """
-        served, root = await self._served()
+        info = await self._served()
+        served = info.name
         self._refresh_gpu_soon()
         remote_gpu = self._gpu_cached or GpuInfo(
             found=False, uuid=self.cfg.gpu_uuid, error="awaiting first telemetry sample"
@@ -127,7 +129,8 @@ class SparkUnit:
             loaded = LoadedModel(
                 server="spark",
                 model=served,
-                root=root,
+                root=info.root,
+                context_len=info.context_len,
                 gpu_vram_pct=remote_gpu.vram_pct,
                 fully_on_gpu=True,
             )

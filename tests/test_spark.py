@@ -412,3 +412,25 @@ def test_classify_usage_treats_spark_as_managed():
     busy = LaneStatus(**base, idle_s=1.0)
     assert classify_usage(idle, None, s) == "idle"   # would be "free" if spark were unmanaged
     assert classify_usage(busy, None, s) == "active"
+
+
+@respx.mock
+async def test_status_reports_the_served_context_window(cfg, calls):
+    """The window a client's prompt budget must respect — vLLM/Spark serve at
+    whatever --max-model-len the launch set, NOT the model's architectural max."""
+    respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(200, json={
+        "data": [{"id": "gemma-4-26b-fp8", "root": "google/gemma-4-26B-A4B-it",
+                  "max_model_len": 65536}]}))
+    u = make_unit(cfg)
+    st = await u.status()
+    assert st.loaded.context_len == 65536
+
+
+@respx.mock
+async def test_missing_context_is_zero_not_a_crash(cfg, calls):
+    """A backend that omits max_model_len must degrade to 'unknown', not raise."""
+    respx.get(f"{BASE}/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": [{"id": "m"}]}))
+    u = make_unit(cfg)
+    st = await u.status()
+    assert st.loaded.context_len == 0 and st.loaded.root == ""

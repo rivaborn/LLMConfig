@@ -31,7 +31,7 @@ import httpx
 from ..config import Settings, SparkConfig
 from ..gpu import GPU_QUERY, METRICS_QUERY, GpuInfo, GpuMetric, _parse_float, _parse_int
 from ..registry import SparkRegistry
-from ..schemas import SparkModel
+from ..schemas import ServedModel, SparkModel
 from ..wsl import run_wsl
 
 LogCb = Callable[[str], None]
@@ -73,10 +73,10 @@ class SparkBackend:
     # ---- liveness / state ----
     async def served(self) -> Optional[str]:
         """The model this node is currently serving, or None when nothing is up."""
-        return (await self.served_info())[0]
+        return (await self.served_info()).name
 
-    async def served_info(self) -> tuple[Optional[str], str]:
-        """`(served_name, root)` — root is the actual HF repo behind that name.
+    async def served_info(self) -> ServedModel:
+        """What this backend is serving: name, real HF repo, and context window.
 
         Served names are chosen per unit and can collide across units, so the
         root is what tells two same-named models apart (see `LoadedModel.root`).
@@ -86,10 +86,15 @@ class SparkBackend:
             r.raise_for_status()
             data = r.json().get("data", []) or []
             if not data:
-                return None, ""
-            return data[0].get("id"), (data[0].get("root") or "")
-        except (httpx.HTTPError, KeyError, IndexError, ValueError):
-            return None, ""
+                return ServedModel()
+            d = data[0]
+            return ServedModel(
+                name=d.get("id"),
+                root=d.get("root") or "",
+                context_len=int(d.get("max_model_len") or 0),
+            )
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
+            return ServedModel()
 
     async def up(self) -> bool:
         return (await self.served()) is not None

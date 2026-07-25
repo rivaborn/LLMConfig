@@ -102,6 +102,7 @@ function buildCard(unit) {
     </div>
     <div class="uc-sub">${unit.kind === "spark" ? esc(unit.host) : "local"}</div>
     <div class="uc-loaded">…</div>
+    <div class="uc-ctx"></div>
     <div class="vram"><div class="vram-bar"><div class="vram-fill"></div></div><span class="vram-text"></span></div>
     <div class="uc-switch">
       <select class="uc-select" aria-label="Model for ${esc(unit.name || unit.id)}"></select>
@@ -110,7 +111,7 @@ function buildCard(unit) {
     </div>`;
   const q = (s) => el.querySelector(s);
   const refs = {
-    owner: q(".owner"), loaded: q(".uc-loaded"),
+    owner: q(".owner"), loaded: q(".uc-loaded"), ctx: q(".uc-ctx"),
     vramFill: q(".vram-fill"), vramText: q(".vram-text"),
     select: q(".uc-select"), load: q(".uc-load"), unload: q(".uc-unload"),
   };
@@ -243,6 +244,10 @@ function modelCard(unitId, server, name, meta, status, loaded) {
 }
 
 // ---- status --------------------------------------------------------------
+// Context windows are quoted in thousands the way model docs are (32k, 65k), so
+// an operator can compare against a client's configured budget at a glance.
+const CTX = (n) => (!n ? "" : n >= 1024 ? `${Math.round(n / 1024)}k` : String(n));
+
 function describeLoaded(lm) {
   if (!lm) return "no model loaded";
   // Served names are chosen per unit and CAN collide (the 3090 and a Spark both
@@ -254,6 +259,14 @@ function describeLoaded(lm) {
     return `${lm.model} · ollama · ${GIB(lm.on_gpu_bytes)} GPU${spill}${root}`;
   }
   return `${lm.model} · ${lm.server}${root}`;
+}
+
+// The window the model is ACTUALLY served at — vLLM/Spark --max-model-len, or
+// Ollama's per-run context_length (which OLLAMA_CONTEXT_LENGTH can silently
+// truncate well below what the model supports). "" when nothing is loaded.
+function describeContext(lm) {
+  if (!lm || !lm.context_len) return "";
+  return `${CTX(lm.context_len)} ctx`;
 }
 
 async function refreshStatus() {
@@ -273,6 +286,7 @@ async function refreshStatus() {
       c.refs.owner.className = "badge owner " + (offline ? "unknown" : l.owner);
       c.refs.loaded.textContent = l.loaded ? describeLoaded(l.loaded) : "None";
       c.refs.loaded.classList.toggle("none", !l.loaded);
+      c.refs.ctx.textContent = describeContext(l.loaded);
       c.refs.vramFill.style.width = (g.found ? g.vram_pct : 0) + "%";
       c.refs.vramText.textContent = vramText;
       c.refs.unload.disabled = isBusy(l.id) || !l.loaded;
@@ -286,7 +300,8 @@ async function refreshStatus() {
       r.owner.className = "badge owner " + (offline ? "unknown" : l.owner);
       r.vramFill.style.width = (g.found ? g.vram_pct : 0) + "%";
       r.vramText.textContent = vramText;
-      r.loaded.textContent = describeLoaded(l.loaded);
+      const ctx = describeContext(l.loaded);
+      r.loaded.textContent = describeLoaded(l.loaded) + (ctx ? `  ·  ${ctx}` : "");
       if (r.ollamaDot) r.ollamaDot.className = "dot ollama-dot" + (l.ollama_up ? " up" : "");
       if (r.vllmDot) r.vllmDot.className = "dot vllm-dot" + (l.vllm_up ? " up" : "");
       r.unload.disabled = isBusy(l.id);

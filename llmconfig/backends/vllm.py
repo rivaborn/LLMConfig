@@ -15,7 +15,7 @@ import httpx
 
 from ..config import Settings
 from ..registry import Registry
-from ..schemas import VllmAlias
+from ..schemas import ServedModel, VllmAlias
 from ..wsl import run_wsl, user_journalctl, user_systemctl
 
 LogCb = Callable[[str], None]
@@ -60,21 +60,27 @@ class VllmBackend:
     # ---- liveness / state ----
     async def served(self) -> Optional[str]:
         """The currently-served model name (from the relay), or None if vLLM is down."""
-        return (await self.served_info())[0]
+        return (await self.served_info()).name
 
-    async def served_info(self) -> tuple[Optional[str], str]:
-        """`(served_name, root)` — root is the actual HF repo behind that name,
-        which is what distinguishes two units serving the same name from
-        different weights (see `LoadedModel.root`)."""
+    async def served_info(self) -> ServedModel:
+        """What this backend is serving: name, real HF repo, and context window.
+
+        `root` distinguishes two units serving the same name from different
+        weights; `context_len` is the launched --max-model-len."""
         try:
             r = await self._client().get("/v1/models", timeout=self.s.vllm_probe_timeout_s)
             r.raise_for_status()
             data = r.json().get("data", []) or []
             if not data:
-                return None, ""
-            return data[0].get("id"), (data[0].get("root") or "")
-        except (httpx.HTTPError, KeyError, IndexError, ValueError):
-            return None, ""
+                return ServedModel()
+            d = data[0]
+            return ServedModel(
+                name=d.get("id"),
+                root=d.get("root") or "",
+                context_len=int(d.get("max_model_len") or 0),
+            )
+        except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
+            return ServedModel()
 
     async def up(self) -> bool:
         return (await self.served()) is not None

@@ -71,6 +71,8 @@ header {
 .uc-sub { color: var(--muted); font-size: 11px; margin-top: -4px; }
 .uc-loaded { font-size: 13px; font-weight: 600; word-break: break-word; }
 .uc-loaded.none { color: var(--muted); font-weight: 400; }
+/* Served context window — the number a client's prompt budget must respect. */
+.uc-ctx { font-size: 11px; color: var(--accent); font-family: var(--mono); margin-top: -4px; min-height: 1em; }
 .uc-switch { display: flex; gap: 6px; margin-top: 2px; }
 .uc-select {
   flex: 1; min-width: 0; background: var(--panel2); color: var(--ink);

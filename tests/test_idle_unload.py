@@ -15,7 +15,7 @@ from llmconfig.monitor import Monitor
 from llmconfig.orchestrator import Orchestrator
 from llmconfig.proc import CmdResult
 from llmconfig.registry import Registry
-from llmconfig.schemas import GpuOut, LaneStatus, LeaseClaimRequest, LoadedModel, OllamaModel
+from llmconfig.schemas import GpuOut, LaneStatus, LeaseClaimRequest, LoadedModel, OllamaModel, ServedModel
 
 GiB = 1024 ** 3
 BASE_MB = 400
@@ -67,10 +67,11 @@ class FakeVllm:
         return self.w.vllm_served
 
     async def served_info(self):
-        # (served_name, root) — root distinguishes same-named models on
-        # different units; the fake mirrors a real relay's /v1/models.
+        # Mirrors a real relay's /v1/models: name, root (which distinguishes
+        # same-named models on different units) and the served context window.
         m = self.w.vllm_served
-        return m, (f"fake-org/{m}" if m else "")
+        return ServedModel(name=m, root=(f"fake-org/{m}" if m else ""),
+                           context_len=32768 if m else 0)
 
     async def up(self):
         return self.w.vllm_served is not None

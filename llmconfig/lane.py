@@ -93,7 +93,7 @@ class Lane:
                 self.ollama.loaded(),
                 self.ollama.up(),
             )
-        served, served_root = served_info
+        served, served_root = served_info.name, served_info.root
 
         loaded: Optional[LoadedModel] = None
         if served:
@@ -102,6 +102,7 @@ class Lane:
                 server="vllm",
                 model=served,
                 root=served_root,
+                context_len=served_info.context_len,
                 gpu_vram_pct=gpu.vram_pct,
                 fully_on_gpu=True,
             )
@@ -112,6 +113,7 @@ class Lane:
             loaded = LoadedModel(
                 server="ollama",
                 model=m.name,
+                context_len=m.context_len,
                 size_bytes=m.size_bytes,
                 on_gpu_bytes=m.size_vram_bytes,
                 on_cpu_bytes=on_cpu,

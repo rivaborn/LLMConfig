@@ -32,6 +32,19 @@ class OllamaModel(BaseModel):
     modified: str = ""
     loaded: bool = False
     size_vram_bytes: int = 0  # portion on GPU when loaded (size_vram < size_bytes ⇒ spilled)
+    context_len: int = 0      # /api/ps context_length — the RUNTIME window, 0 when not loaded
+
+
+class ServedModel(BaseModel):
+    """What an OpenAI-style backend reports it is currently serving.
+
+    A record rather than a tuple so new fields (root, context) don't keep
+    changing the arity every call site has to unpack.
+    """
+
+    name: Optional[str] = None
+    root: str = ""           # the real HF repo behind `name` (names can collide across units)
+    context_len: int = 0     # max_model_len as launched
 
 
 class VllmAlias(BaseModel):
@@ -177,6 +190,12 @@ class LoadedModel(BaseModel):
     # the API distinguished them. Both backends already report `root` on
     # /v1/models; carrying it here makes the real artifact visible.
     root: str = ""
+    # Context window the model is ACTUALLY being served at — vLLM/Spark
+    # `max_model_len`, Ollama's per-run `context_length` from /api/ps. Not the
+    # architectural maximum: Ollama truncates to OLLAMA_CONTEXT_LENGTH (4096 on
+    # this box) and vLLM to whatever --max-model-len the launch set, so this is
+    # the number a client's prompt budget must actually respect. 0 = unknown.
+    context_len: int = 0
     size_bytes: int = 0
     on_gpu_bytes: int = 0
     on_cpu_bytes: int = 0
