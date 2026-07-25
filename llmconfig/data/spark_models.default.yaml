@@ -115,3 +115,37 @@ models:
       Qwen/Qwen3.6-27B-FP8 with MTP speculative decoding. Dense 27B: 28.75 GB
       weights but a heavier 32 GB KV at 262144 — 60.75 GB total.
     load_timeout_s: 1800
+
+  # --- RAG services (pooling runners, NOT chat models) -------------------------
+  # Both are `--runner pooling`, Nodes 1-1, and tiny for this hardware: ~20 GB of a
+  # 121 GB node. That is deliberate waste -- one sparkrun workload per node means a
+  # reranker occupies a whole Spark at ~17% utilisation. Worth it only on a node
+  # that would otherwise idle.
+  #
+  # !! LLMConfig's /v1 gateway exposes ONLY /v1/models, /v1/chat/completions and
+  # /v1/completions -- there is NO /v1/embeddings and no rerank route. These load
+  # fine, but nothing can reach them THROUGH the gateway; a client must address the
+  # node directly (http://192.168.1.5x:8000/v1/embeddings). Same pre-existing gap as
+  # the 3090's `qwen3-embed` alias. Wire the gateway routes before relying on these.
+  - alias: qwen3-vl-embedding-8b
+    recipe: "@official/qwen3-vl-embedding-8b-vllm"
+    served_name: qwen3-vl-embedding-8b
+    tp: 1
+    status: unverified
+    extra_args: ["--max-model-len", "32768"]
+    notes: >-
+      Qwen/Qwen3-VL-Embedding-8B, pooling runner. 15.17 GB weights + 4.50 GB KV at
+      32768 = 19.67 GB. Multimodal embeddings (text + image) for RAG.
+    load_timeout_s: 900
+
+  - alias: qwen3-vl-reranker-8b
+    recipe: "@official/qwen3-vl-reranker-8b-vllm"
+    served_name: qwen3-vl-reranker-8b
+    tp: 1
+    status: unverified
+    extra_args: ["--max-model-len", "32768"]
+    notes: >-
+      Qwen/Qwen3-VL-Reranker-8B, pooling runner. 16.33 GB weights + 4.50 GB KV at
+      32768 = 20.83 GB. Cross-encoder reranking -- usually a bigger RAG quality win
+      than swapping the embedder. The lab had no reranker before this.
+    load_timeout_s: 900
