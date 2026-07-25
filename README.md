@@ -1,15 +1,19 @@
 # LLMConfig
 
-A small **GPU-arbitrated control plane** that lets you pick *which model runs on the
-GPU* and *on which server* — **Ollama** or **vLLM** — and guarantees the chosen model
-is the **only** thing in VRAM, so it never spills to system RAM prematurely. One Web
-UI + REST API + OpenAI-`/v1` gateway + CLI over both servers, across one or two GPUs.
+A control plane for every **LLM unit** in the lab. It answers *what can run, what is
+running, and where* — and it makes switching models a single click or one API call,
+with the guarantee that a model gets the hardware to itself.
 
-Built for `192.168.1.40` (`Alien-3070-TI`, Windows 11) with an **RTX 3090 (24 GB)** as
-the primary card and an optional **RTX 3070 Ti (8 GB)** as a second lane. It runs
-Windows-native and reaches vLLM inside **WSL2**.
+Two kinds of unit sit behind one Web UI + REST API + OpenAI-`/v1` gateway + CLI:
 
----
+- **GPU lanes** — a local card arbitrated **Ollama ⇄ vLLM**, with an eviction-wait gate
+  that guarantees the chosen model is the *only* thing in VRAM so it never spills to
+  system RAM prematurely. The **RTX 3090 (24 GB)** and an optional **RTX 3070 Ti (8 GB)**.
+- **DGX Spark nodes** — remote **GB10** boxes driven by [`sparkrun`](https://sparkrun.dev/).
+  The node *is* the unit: it runs one workload, so a swap is stop → run → wait-ready.
+
+Runs Windows-native on `192.168.1.40` (`Alien-3070-TI`, Windows 11), reaching vLLM
+inside **WSL2** and the Sparks over the LAN.
 
 ## The problem it solves
 
@@ -26,33 +30,58 @@ so it packs 100 % of VRAM before any CPU spill.
 
 ## Features
 
-- **Pick + load** a model on Ollama or vLLM, GPU-arbitrated, via Web UI / REST / CLI.
-- **Query** available models (Ollama tags + vLLM alias catalog), what's loaded, on
-  which server, and live VRAM — per GPU lane.
-- **Guaranteed packing:** evict → confirm-freed → load. Reports on-GPU vs on-CPU bytes
-  and flags *premature* spill; `--max-pack` pushes `num_gpu` to fill VRAM first.
-- **OpenAI `/v1` gateway** with **auto-load on first request** — a client's `/model`
-  picker can switch models with no manual swap.
-- **Two independent GPU lanes:** the 3090 can serve a big vLLM model while the 3070 Ti
-  serves a small Ollama/vLLM model concurrently, with no cross-lane eviction.
-- **Monitor tab:** live GPU thermals (core + hotspot + GDDR6X junction), power, VRAM,
-  and Ollama GPU/CPU split, with a rolling history persisted across restarts.
-- **Model management:** pull/delete Ollama models, edit the vLLM alias registry,
+- **One dashboard for every unit.** A Home tab with a box per unit — loaded model, the
+  real HF repo behind it, served context window, memory bar — plus a quick-switch
+  dropdown. Then one control tab per unit, and a Monitor covering all of them.
+- **Pick + load** a model on any unit via Web UI / REST / CLI, as a streamed job.
+- **Guaranteed packing (GPU lanes):** evict → confirm-freed via `nvidia-smi` → load.
+  Reports on-GPU vs on-CPU bytes and flags *premature* spill; `--max-pack` pushes
+  `num_gpu` to fill VRAM first.
+- **Leases** — a real claim on a unit: who holds it, whether their work may be
+  interrupted, how long they need it, and an in-band answer when they get displaced.
+- **OpenAI `/v1` gateway** with **auto-load on first request**, so a client's `/model`
+  picker switches models with no manual swap. `X-LLM-Lane` selects the unit.
+- **Served context window** surfaced per unit — the window a prompt budget must
+  actually respect, not the model's architectural maximum.
+- **Independent units.** The 3090 can serve a big vLLM model while the 3070 Ti serves a
+  small one and all four Sparks serve their own — no cross-unit eviction.
+- **Monitor:** live thermals (core + hotspot + GDDR6X junction), power, memory and the
+  Ollama GPU/CPU split, with rolling history persisted across restarts.
+- **Idle auto-unload** so an unused card drops to P8 (~115 W → ~30 W measured).
+- **Model management:** pull/delete Ollama models, edit the vLLM and Spark catalogs,
   trigger HuggingFace downloads — all as streamed jobs.
 - **`doctor`:** read-only recon that verifies every on-box assumption before you trust
   a swap.
 
 ## Topology
 
-|             | Ollama                 | vLLM                                   |
-| ----------- | ---------------------- | -------------------------------------- |
-| Runs in     | Windows 11 native      | WSL2 Ubuntu 24.04                      |
-| Reach       | `127.0.0.1:11434`      | `127.0.0.1:11437` (socat relay)        |
-| Model swap  | REST `keep_alive`      | one model/process — `serve.sh <alias>` |
-| State via   | `/api/ps`              | relay `/v1/models`                     |
+|            | Ollama              | vLLM                                   | DGX Spark                          |
+| ---------- | ------------------- | -------------------------------------- | ---------------------------------- |
+| Runs in    | Windows 11 native   | WSL2 Ubuntu 24.04                      | the remote GB10 node (Docker)      |
+| Reach      | `127.0.0.1:11434`   | `127.0.0.1:11437` (socat relay)        | `http://192.168.1.5x:8000`         |
+| Model swap | REST `keep_alive`   | one model/process — `serve.sh <alias>` | `sparkrun stop` → `sparkrun run`   |
+| State via  | `/api/ps`           | relay `/v1/models`                     | the node's own `/v1/models`        |
+| Catalog    | `ollama list` tags  | `data/vllm_models.yaml`                | `data/spark_models_<unit>.yaml`    |
 
-The control app itself listens on **`:11430`** (UI + REST + `/v1`). All endpoints are
-**LAN-only** with no auth unless you set `LLMCONFIG_API_KEY`.
+The control app listens on **`:11430`** (UI + REST + `/v1`). Everything is **LAN-only**
+with no auth unless you set `LLMCONFIG_API_KEY`.
+
+### The units
+
+| Unit id                 | Hardware                     | Arbitration                                 | Telemetry                        |
+| ----------------------- | ---------------------------- | ------------------------------------------- | -------------------------------- |
+| `primary`               | RTX 3090, 24 GB              | eviction-wait gate, Ollama **XOR** vLLM     | local `nvidia-smi` by UUID       |
+| `companion`             | RTX 3070 Ti, 8 GB (opt-in)   | same, fully independent of `primary`        | local `nvidia-smi` by UUID       |
+| `spark1`…`spark4`       | DGX Spark GB10, 128 GB       | none needed — one workload per node         | remote `nvidia-smi` over SSH     |
+
+`settings.units()` = `lanes()` + `sparks()`. Sparks are **off by default**
+(`SPARK_ENABLED=true` to enable). Both kinds satisfy the same duck-typed contract, so
+the UI, CLI, gateway and idle reaper treat them through one code path.
+
+> **GB10 has no private VRAM.** The GPU shares the host's unified LPDDR5X pool, so
+> `nvidia-smi` returns `[N/A]` for *every* memory field on a Spark — occupancy is read
+> from the node's `/proc/meminfo` instead. Without that fallback a fully-loaded node
+> reports 0 %.
 
 ## How it works
 
@@ -61,18 +90,19 @@ The control app itself listens on **`:11430`** (UI + REST + `/v1`). All endpoint
                                 │
                     FastAPI (Windows-native, :11430)
                                 │
-                         Orchestrator
-              ┌─────────────────┴──────────────────┐
-          Lane: primary (RTX 3090)         Lane: companion (RTX 3070 Ti)
-          ┌──────┴───────┐                 ┌──────┴───────┐
-     OllamaBackend   VllmBackend      OllamaBackend   VllmBackend
-     httpx :11434    relay :11437     httpx :11435    relay :11438
-     Win service     wsl.exe →        NSSM service    wsl.exe →
-     control         serve.sh /       control         serve-companion.sh
-                     systemctl --user
-          └──────┬───────┘                 └──────┬───────┘
-     nvidia-smi (3090 by UUID)         nvidia-smi (3070 Ti by UUID)
-     eviction-wait gate                eviction-wait gate
+                 Orchestrator  ·  LeaseManager  ·  IdleReaper
+        ┌───────────────────────┼───────────────────────────┐
+        │                       │                           │
+  Lane: primary          Lane: companion            SparkUnit ×4
+  (RTX 3090)             (RTX 3070 Ti)              (GB10 nodes)
+  ┌─────┴─────┐          ┌─────┴─────┐              ┌────┴────┐
+Ollama     vLLM        Ollama     vLLM          status    lifecycle
+:11434    relay :11437 :11435   relay :11438    HTTP      sparkrun
+Win svc   wsl.exe →    NSSM svc  wsl.exe →      :8000     via wsl.exe
+          serve.sh               serve-comp.sh            └ telemetry:
+  └─────┬─────┘          └─────┬─────┘                      ssh nvidia-smi
+ nvidia-smi by UUID     nvidia-smi by UUID                  + /proc/meminfo
+ eviction-wait gate     eviction-wait gate                 (no gate needed)
 ```
 
 - A **Lane** binds one Ollama+vLLM pair to **one GPU, matched by UUID** (indices are
@@ -83,8 +113,14 @@ The control app itself listens on **`:11430`** (UI + REST + `/v1`). All endpoint
   any spill.
 - vLLM serves **one model per process**; a swap restarts the `vllm@<alias>` systemd
   unit (which runs `serve.sh`). vLLM status is read from the socat relay's `/v1/models`.
+- A **SparkUnit** needs no gate — the node runs one workload, so a swap is
+  stop → run → wait-ready. It reads status over HTTP, drives lifecycle through the
+  `sparkrun` CLI, and takes telemetry over SSH; **`status()` never awaits SSH**, because
+  the UI polls it every 2.5 s and one powered-off node would otherwise add seconds to
+  every call for every client.
 - The Orchestrator holds a **shared WSL keepalive** (`wsl.exe … sleep infinity`) so the
-  distro — and any loaded vLLM model + relay — survives WSL2's idle-shutdown.
+  distro — and any loaded vLLM model + relay — survives WSL2's idle-shutdown. Sparks
+  need no keepalive: their workload lives on the node.
 
 ## Quickstart (on the box)
 
@@ -231,29 +267,24 @@ the switch happens on the inference path.
 Point a provider's `baseURL` at `http://192.168.1.40:11430/v1`. The always-on app must
 be **restarted** to pick up a new gateway build.
 
+## Web UI
+
+`http://192.168.1.40:11430/` — tabs are built at runtime from `/api/lanes`, so a unit
+appearing in config appears in the UI with no front-end change.
+
+| Tab             | What it is                                                                             |
+| --------------- | -------------------------------------------------------------------------------------- |
+| **Home**        | One box per unit: owner badge, loaded model + its real HF repo, served context, memory bar, and a **quick-switch dropdown**. Clicking a unit's name jumps to its tab. |
+| **Per unit**    | One tab each for the 3090, 3070 Ti and every Spark. GPU lanes show the Ollama ⇄ vLLM split with per-model Load / star-as-default buttons and an Ollama pull box; Spark tabs show the curated recipe list. |
+| **Monitor**     | Every unit's thermals, power, memory and the Ollama GPU/CPU split, over a selectable window. |
+
+Units that are configured but unreachable render greyed rather than disappearing, so a
+powered-off Spark is visibly *offline* instead of silently absent. Load/unload state is
+tracked **per unit**, so a 15-minute Spark load never freezes the other five boxes.
+
+A shared **Activity** drawer at the bottom streams the log of whichever job is running.
+
 ## CLI
-
-The `llmconfig` command is a thin client over the REST API (plus `serve` to launch it).
-
-```bash
-llmconfig status                              # every lane: owner, VRAM, loaded model
-llmconfig models --lane companion             # Ollama tags + vLLM aliases for a lane
-llmconfig gpu                                 # nvidia-smi state for a lane's GPU
-llmconfig load vllm coder30-awq               # swap the PRIMARY 3090 to a vLLM alias
-llmconfig load --lane companion ollama qwen3:4b   # load a model on the 3070 Ti
-llmconfig load ollama qwen3-coder:30b --max-pack  # fill VRAM before spilling
-llmconfig unload --lane companion             # free the companion GPU
-llmconfig companion-default ollama qwen3:4b   # set a lane's auto-load-on-startup default
-llmconfig pull qwen3:4b                        # pull an Ollama model
-llmconfig doctor                               # verify the box (add --local to run in-process)
-llmconfig lease claim --holder me --minutes 30 # claim a unit (--no-preempt = don't interrupt me)
-llmconfig lease list --active                  # who holds what right now
-llmconfig lease wait <id>                      # block; exit 0 released / 3 revoked / 4 expired
-llmconfig serve                                # run the API + web UI here
-```
-
-Point it at the box with `--url http://192.168.1.40:11430` or `$LLMCONFIG_URL`; pass
-`--api-key` / `$LLMCONFIG_API_KEY` when auth is on.
 
 ## Monitor (telemetry)
 
@@ -298,12 +329,23 @@ field on each `/api/status` lane, plus `llmconfig usage`) classifies every lane 
 `USAGE_ACTIVE_WINDOW_S` (default 60 s), a currently-visible GPU-utilization sample, or
 a swap in flight.
 
-## Context size (Ollama)
+## Context windows
 
-`/api/load` (and the `/v1` auto-load) do **not** take a context-length parameter — an
-Ollama model loads at the `num_ctx` baked into its Modelfile, so the KV-cache VRAM
-footprint is fixed by the *tag* you load, not the caller. To run a smaller context
-(to leave VRAM headroom on the 24 GB card), bake a context-specific tag:
+Every unit reports the context it is **actually serving at** — surfaced on each Home
+box and on `/api/status` → `lanes[].loaded.context_len`. This is deliberately the
+*runtime* window, not the model's architectural maximum, because it is the number a
+client's prompt budget has to respect:
+
+| Backend | Source                        | Set by                                     |
+| ------- | ----------------------------- | ------------------------------------------ |
+| Ollama  | `/api/ps` → `context_length`  | the tag's baked `num_ctx`, capped by `OLLAMA_CONTEXT_LENGTH` |
+| vLLM    | relay `/v1/models`            | `--max-model-len` in that alias's `serve.sh` case |
+| Spark   | the node's `/v1/models`       | `--max-model-len`, pinned from the catalog entry  |
+
+**Ollama takes no context parameter at load time.** `/api/load` and the `/v1` auto-load
+deliberately do not accept one — a model loads at the `num_ctx` baked into its
+Modelfile, so the KV-cache footprint is fixed by the *tag*, not the caller. To change
+it, bake a tag:
 
 ```bash
 # Modelfile:  FROM <model>  +  PARAMETER num_ctx 65536
@@ -311,9 +353,10 @@ ollama create <model>-64k -f Modelfile    # reuses the existing weights blob
 llmconfig load ollama <model>-64k
 ```
 
-Also note Ollama's global default `OLLAMA_CONTEXT_LENGTH=4096` **silently truncates**
-every model — raise it on the service (see the deploy guide) so served context clears
-your workloads.
+> `OLLAMA_CONTEXT_LENGTH` (per NSSM service, in `AppEnvironmentExtra`) **silently
+> truncates** any model without a baked `num_ctx`. An *absent* variable is the easy
+> miss — it falls back to Ollama's built-in 4096 and looks identical to a correct
+> setting until you read `/api/ps`. Both services on `.40` are at 32768.
 
 ## vLLM alias registry
 
@@ -365,19 +408,22 @@ gotchas, is in [`deploy/README-deploy.md`](deploy/README-deploy.md).
 
 ```
 llmconfig/
-  config.py         Settings + LaneConfig (all box-specific values)
+  config.py         Settings + LaneConfig/SparkConfig (all box-specific values)
   main.py           FastAPI app: REST endpoints + static UI + lifespan
-  orchestrator.py   coordinates lanes; shared WSL keepalive + defaults
+  orchestrator.py   coordinates every unit; shared WSL keepalive + defaults
   lane.py           per-GPU arbitration state machine (eviction-wait gate)
-  lane_state.py     persisted per-lane default model
+  spark_unit.py     a remote DGX Spark as a unit (same contract, no eviction gate)
+  leases.py         LeaseManager + LeaseSweeper (resource sharing between callers)
+  lane_state.py     persisted per-unit default model
   backends/
     ollama.py       Ollama REST client + Windows service control
     vllm.py         vLLM relay status + serve.sh/systemctl lifecycle over wsl.exe
+    spark.py        sparkrun over WSL + node HTTP status + remote nvidia-smi
   gpu.py            nvidia-smi truth (by UUID) + Monitor metric sampling
   nvapi.py          NVAPI hotspot + GDDR6X junction temps (ctypes)
   monitor.py        telemetry sampler + SQLite history
-  idle.py           idle auto-unload policy (reap an unused lane → GPU drops to P8)
-  registry.py       vLLM alias catalog (YAML)
+  idle.py           idle auto-unload policy (reap an unused unit → GPU drops to P8)
+  registry.py       vLLM alias + Spark recipe catalogs (YAML)
   schemas.py        pydantic models
   jobs.py           async job manager (streamed logs)
   wsl.py            wsl.exe bridge + WslKeepalive
@@ -404,12 +450,23 @@ anywhere — **no GPU required**. `asyncio_mode = auto` (see `pyproject.toml`).
 
 ## Status
 
-**Live-verified on `.40`.** `doctor --local` green; both paths exercised end-to-end on
-the RTX 3090 (Ollama load/unload, vLLM load that evicts → packs VRAM → serves through
-the relay → unloads to 0 MiB). The companion 3070 Ti lane is proven for Ollama;
-companion vLLM is optional and installed separately. Telemetry is persisted across
-restarts. See the homelab wiki (`hosts/ollama-host/services/llmconfig`) for the
-deployed-state details.
+**Live-verified on `.40`.**
+
+- **GPU lanes** — `doctor --local` green; both paths exercised end to end on the 3090
+  (Ollama load/unload; vLLM load that evicts → packs VRAM → serves through the relay →
+  unloads to 0 MiB). The 3070 Ti lane is proven for Ollama; companion vLLM is optional
+  and installed separately.
+- **DGX Sparks** — first cluster load **2026-07-24**: `gemma-4-26b-fp8` on all four
+  nodes, verified with real completions through the `/v1` gateway (0.6–1.1 s), ~85–90 %
+  of each 122 GB unified pool resident. Weights are staged between nodes over the LAN
+  with a doubling tree rather than downloaded per node.
+- **Leases** — full lifecycle proven against live inference: un-leased traffic allowed →
+  non-preemptible claim → `409 lease_required` → holder passes with `X-LLM-Lease` →
+  revoke → `409 lease_revoked`.
+- **Telemetry** persisted across restarts.
+
+See the homelab wiki (`hosts/ollama-host/services/llmconfig`) for deployed-state detail
+and `runbooks/local-llm-server-dgx-spark` for the cluster.
 
 ## License
 
