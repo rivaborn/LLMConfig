@@ -196,6 +196,22 @@ async def test_status_never_awaits_ssh(cfg, calls):
     assert any("nvidia-smi" in c for c in calls), "telemetry should refresh in background"
 
 
+def test_stats_command_quotes_the_separator():
+    """The probe must survive a real shell, not just the parser.
+
+    `echo #MEM#` unquoted makes `#` open a comment: the marker never prints and
+    the grep sharing that line never runs, silently degrading the probe to a bare
+    nvidia-smi — which is what left every Spark reporting 0 % memory even after
+    the meminfo fallback was written. The earlier test mocked the command's
+    *output*, so it could not catch a bug in the command itself.
+    """
+    for cmd in (spark_mod._STATS_CMD, spark_mod._METRICS_CMD):
+        assert f"echo '{spark_mod._STATS_SEP}'" in cmd, f"separator must be quoted: {cmd}"
+        assert "/proc/meminfo" in cmd
+        # Nothing may sit unquoted after a bare '#'.
+        assert "echo #" not in cmd
+
+
 @respx.mock
 async def test_unified_memory_falls_back_to_meminfo(cfg, calls):
     """Regression: a GB10 serving a 26B model reported vram 0 %.

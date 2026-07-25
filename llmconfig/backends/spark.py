@@ -40,14 +40,13 @@ LogCb = Callable[[str], None]
 # memory field from nvidia-smi ([N/A]) because the GPU shares the host's unified
 # LPDDR5X pool, so /proc/meminfo is the only honest source for occupancy.
 _STATS_SEP = "#MEM#"
-_STATS_CMD = (
-    f"nvidia-smi {GPU_QUERY} 2>/dev/null; echo {_STATS_SEP}; "
-    "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null"
-)
-_METRICS_CMD = (
-    f"nvidia-smi {METRICS_QUERY} 2>/dev/null; echo {_STATS_SEP}; "
-    "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null"
-)
+# The separator MUST stay single-quoted: unquoted, `#` opens a shell comment, so
+# the marker never prints *and* the grep after it on the same line never runs —
+# which silently reduced this to a plain nvidia-smi call and left every Spark
+# reporting 0 % memory. Pinned by test_stats_command_quotes_the_separator.
+_MEMINFO = "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null"
+_STATS_CMD = f"nvidia-smi {GPU_QUERY} 2>/dev/null; echo '{_STATS_SEP}'; {_MEMINFO}"
+_METRICS_CMD = f"nvidia-smi {METRICS_QUERY} 2>/dev/null; echo '{_STATS_SEP}'; {_MEMINFO}"
 
 
 class SparkBackend:
