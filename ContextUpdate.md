@@ -47,11 +47,29 @@ Mirror what `coder30-awq` already does:
   params), so don't assume 65536 everywhere — tune per alias with a canary recall test (like the
   28K/50K canaries you already ran for coder30-awq).
 
-## Ollama, too (separate, also box-side)
-The primary `Ollama` NSSM service sets **`OLLAMA_CONTEXT_LENGTH=4096`** (in its `AppEnvironmentExtra`).
-That **silently truncates** Ollama models to 4 k — including opencode's **default**
-`ollama/qwen3-coder:30b`. Raise it (e.g. 32768+) so the default model actually sees opencode's context.
-(Same for `OllamaCompanion` if you want big-context Ollama models on the 3070 Ti.)
+## Ollama, too (separate, also box-side) — DONE 2026-07-24
+`OLLAMA_CONTEXT_LENGTH` lives in each NSSM service's `AppEnvironmentExtra` and **silently
+truncates** any model without a baked `num_ctx`. Verified and corrected on the box:
+
+| Service           | Was                       | Now       | Verified                                                                       |
+| ----------------- | ------------------------- | --------- | ------------------------------------------------------------------------------ |
+| `Ollama` (3090)   | already `32768`           | unchanged | `qwen3-coder:30b` -> `context_length=32768`, **20.2 GB fully on GPU, no spill** |
+| `OllamaCompanion` | **unset** -> Ollama's 4096 | `32768`   | `qwen2.5:1.5b` -> `context_length=32768` (was 4096)                            |
+
+Two corrections to what this doc previously claimed: the primary was **already** at 32768, and
+the companion's problem was that the variable was **absent entirely**, so it fell back to
+Ollama's built-in 4096 default — which is why the `/swap` relay model served at 4 k.
+
+The primary was checked against the **running process** (load a model, read `/api/ps`), not the
+registry, since a registry edit only takes effect on service restart.
+
+The effective window is now visible per unit in the UI and on `/api/status` ->
+`lanes[].loaded.context_len`, sourced from `/api/ps` `context_length` — the *runtime* window, not
+the architectural maximum that `/api/show` reports.
+
+> Tagged models with a baked `num_ctx` (`qwen3.6:27b-64k`, `qwen2.5-coder:32b-12k`, …) are
+> unaffected: the Modelfile wins over the service default, and baking a tag remains the way to
+> exceed it (hard invariant 6 — never add a context arg to the load path).
 
 ## opencode.json contract (already in place)
 - `context = served − output`, because opencode uses `output` as a fixed `max_tokens` and caps the
