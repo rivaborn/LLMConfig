@@ -62,9 +62,20 @@ models:
     served_name: qwen3-coder-next
     tp: 1
     status: unverified
-    extra_args: ["--max-model-len", "65536"]
-    notes: "INT4 AutoRound. Community 1-node decode ~73.3 t/s — fastest on a single node."
-    load_timeout_s: 900
+    # 262144 rather than the 65536 the other recipes carry, because this one has
+    # room for it and is the coding model: `sparkrun show` puts weights at 40.53 GB
+    # (INT4) and the KV at only 12.00 GB for the full 262144 window — the arch is a
+    # Mamba-hybrid with 2 KV heads, so KV is cheap. 52.53 GB of the 121 GB pool, and
+    # sparkrun's own ceiling is ~965k tokens (3.7x this). Pinning 65536 here would
+    # throw away most of what makes the model useful for agentic coding.
+    extra_args: ["--max-model-len", "262144"]
+    notes: >-
+      Intel/Qwen3-Coder-Next-int4-AutoRound, MoE ~3B active — decode on a GB10 is
+      bandwidth-bound on ACTIVE params, so this is the fastest single-node option
+      (community ~73.3 t/s). Recipe ships --enable-auto-tool-choice with the
+      qwen3_coder parser plus prefix caching and chunked prefill, which is the right
+      shape for agentic coding. 262144 ctx; weights ~40 GB, first load downloads them.
+    load_timeout_s: 1800
 
   - alias: qwen35-35b-a3b
     recipe: "@sparkrun-transitional/qwen3.5-35b-a3b-fp8-sglang"
