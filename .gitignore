@@ -34,3 +34,6 @@ Thumbs.db
 
 # Logs
 *.log
+
+# serena MCP per-project cache/config (machine-local)
+.serena/
