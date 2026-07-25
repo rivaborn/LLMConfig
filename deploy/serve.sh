@@ -58,6 +58,22 @@ fi
 #   first request takes ~30s extra to warm, subsequent requests get ~20-30% throughput.
 
 case "$ALIAS" in
+  qwen3-embed)
+    # Qwen3-Embedding-0.6B embeddings server (vLLM 0.20.2: --runner pooling; native
+    # last-token pooling). Big --max-num-batched-tokens + --max-num-seqs so vLLM packs
+    # many ~1k-token story chunks into each forward pass -- the default 2048 cap made
+    # the one-time LitRank backfill GPU-bound at a tiny effective batch. Tiny model, no
+    # KV-cache growth, so 0.60 util is plenty. Queries/incremental use Ollama.
+    exec vllm serve Qwen/Qwen3-Embedding-0.6B \
+      --host "$HOST" \
+      --port "$PORT" \
+      --served-model-name qwen3-embedding-0.6b \
+      --runner pooling \
+      --max-model-len 8192 \
+      --max-num-batched-tokens 32768 \
+      --max-num-seqs 256 \
+      --gpu-memory-utilization 0.60
+    ;;
   smoke)
     exec vllm serve Qwen/Qwen2.5-0.5B-Instruct \
       --host "$HOST" \
