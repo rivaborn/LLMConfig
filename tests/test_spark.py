@@ -25,6 +25,17 @@ BASE = f"http://{HOST}:{PORT}"
 
 SMI_ROW = "GPU-abc, 122880, 40960, 81920, 17\n"
 
+# What a REAL GB10 prints while serving a 26B model (measured on the cluster
+# 2026-07-24): the GPU shares the host's unified pool, so nvidia-smi withholds
+# every memory field. Occupancy has to come from /proc/meminfo instead.
+GB10_ROW = "GPU-abc, [N/A], [N/A], [N/A], 0\n"
+MEMINFO = "MemTotal:       126950000 kB\nMemAvailable:    18000000 kB\n"
+
+
+def gb10_result(query_row: str) -> CmdResult:
+    """The combined nvidia-smi + /proc/meminfo probe, as the node returns it."""
+    return CmdResult(0, query_row + "#MEM#\n" + MEMINFO, "")
+
 
 # --------------------------------------------------------------------------- #
 # Fixtures
@@ -183,6 +194,41 @@ async def test_status_never_awaits_ssh(cfg, calls):
     if u._gpu_task:
         await u._gpu_task
     assert any("nvidia-smi" in c for c in calls), "telemetry should refresh in background"
+
+
+@respx.mock
+async def test_unified_memory_falls_back_to_meminfo(cfg, calls):
+    """Regression: a GB10 serving a 26B model reported vram 0 %.
+
+    nvidia-smi returns `[N/A]` for memory.total, memory.used AND memory.free on
+    GB10 — the first cut only had a fallback for `total`, so used stayed 0 and the
+    UI showed a fully-loaded node as empty. Occupancy now comes from /proc/meminfo.
+    """
+    models_route(None)
+    calls.plan["nvidia-smi"] = gb10_result(GB10_ROW)
+    u = make_unit(cfg)
+    await u.status()
+    if u._gpu_task:
+        await u._gpu_task
+    g = (await u.status()).gpu
+
+    assert g.found is True
+    assert g.total_mb == 126950000 // 1024                  # from MemTotal
+    assert g.used_mb == (126950000 - 18000000) // 1024       # MemTotal - MemAvailable
+    assert 80 < g.vram_pct < 90, f"expected a loaded node, got {g.vram_pct}%"
+
+
+@respx.mock
+async def test_real_nvidia_smi_numbers_still_win(cfg, calls):
+    """On a card that does report memory, nvidia-smi must take precedence."""
+    models_route(None)
+    calls.plan["nvidia-smi"] = gb10_result(SMI_ROW)
+    u = make_unit(cfg)
+    await u.status()
+    if u._gpu_task:
+        await u._gpu_task
+    g = (await u.status()).gpu
+    assert g.total_mb == 122880 and g.used_mb == 40960
 
 
 @respx.mock

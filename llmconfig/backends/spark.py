@@ -36,6 +36,19 @@ from ..wsl import run_wsl
 
 LogCb = Callable[[str], None]
 
+# One SSH round-trip for both halves of a Spark's telemetry. GB10 withholds every
+# memory field from nvidia-smi ([N/A]) because the GPU shares the host's unified
+# LPDDR5X pool, so /proc/meminfo is the only honest source for occupancy.
+_STATS_SEP = "#MEM#"
+_STATS_CMD = (
+    f"nvidia-smi {GPU_QUERY} 2>/dev/null; echo {_STATS_SEP}; "
+    "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null"
+)
+_METRICS_CMD = (
+    f"nvidia-smi {METRICS_QUERY} 2>/dev/null; echo {_STATS_SEP}; "
+    "grep -E '^(MemTotal|MemAvailable):' /proc/meminfo 2>/dev/null"
+)
+
 
 class SparkBackend:
     def __init__(self, settings: Settings, cfg: SparkConfig, registry: SparkRegistry):
@@ -164,23 +177,27 @@ class SparkBackend:
     async def gpu(self) -> GpuInfo:
         """This node's GPU as a `GpuInfo`, so Spark units render like GPU lanes.
 
-        GB10 is unified memory and nvidia-smi reports `memory.total` as `[N/A]`,
-        so a zero total falls back to the configured pool size — otherwise every
-        Spark would show 0 % VRAM forever.
+        **GB10 reports memory.total, memory.used AND memory.free all as `[N/A]`**
+        (measured on the live cluster 2026-07-24 — a node serving a 26B model still
+        printed `[N/A], [N/A], [N/A]`). The GPU shares the host's LPDDR5X pool, so
+        the honest memory figure is the host's, not nvidia-smi's. One SSH round-trip
+        fetches both and `/proc/meminfo` supplies whatever nvidia-smi withholds —
+        otherwise a fully-loaded Spark reports 0 % forever.
         """
-        r = await self._ssh(f"nvidia-smi {GPU_QUERY}", timeout=20.0)
+        r = await self._ssh(_STATS_CMD, timeout=20.0)
         if not r.ok:
             return GpuInfo(
                 found=False,
                 uuid=self.cfg.gpu_uuid,
                 error=r.text() or f"{self.cfg.host}: nvidia-smi unreachable",
             )
-        for line in r.out.splitlines():
+        smi, mem_total, mem_used = self._split_stats(r.out)
+        for line in smi:
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 4:
                 continue
-            total = _parse_int(parts[1]) or self.cfg.vram_total_mb
-            used = _parse_int(parts[2])
+            total = _parse_int(parts[1]) or mem_total or self.cfg.vram_total_mb
+            used = _parse_int(parts[2]) or mem_used
             free = _parse_int(parts[3]) or max(0, total - used)
             return GpuInfo(
                 found=True,
@@ -192,6 +209,32 @@ class SparkBackend:
             )
         return GpuInfo(found=False, uuid=self.cfg.gpu_uuid, error="nvidia-smi returned no GPU rows")
 
+    @staticmethod
+    def _split_stats(out: str) -> tuple[list[str], int, int]:
+        """Split the combined probe into (nvidia-smi rows, total_mb, used_mb).
+
+        `used` is derived as MemTotal-MemAvailable, which on a dedicated inference
+        node is the figure that answers "would another model fit" — the unified pool
+        is shared between host and GPU, so there is no separate VRAM number to read.
+        """
+        smi_rows: list[str] = []
+        total_kb = avail_kb = 0
+        in_mem = False
+        for line in out.splitlines():
+            if line.strip() == _STATS_SEP:
+                in_mem = True
+                continue
+            if not in_mem:
+                if line.strip():
+                    smi_rows.append(line)
+            elif line.startswith("MemTotal:"):
+                total_kb = _parse_int(line.split(":", 1)[1])
+            elif line.startswith("MemAvailable:"):
+                avail_kb = _parse_int(line.split(":", 1)[1])
+        total_mb = total_kb // 1024
+        used_mb = max(0, (total_kb - avail_kb) // 1024) if total_kb else 0
+        return smi_rows, total_mb, used_mb
+
     async def metrics(self) -> Optional["GpuMetric"]:
         """One telemetry sample for the Monitor tab, or None when unreachable.
 
@@ -199,13 +242,18 @@ class SparkBackend:
         Sparks through the identical path; `index` is -1 because a remote node has
         no place in the local nvidia-smi ordering (and no NVAPI hotspot sensors).
         """
-        r = await self._ssh(f"nvidia-smi {METRICS_QUERY}", timeout=20.0)
+        r = await self._ssh(_METRICS_CMD, timeout=20.0)
         if not r.ok:
             return None
-        for line in r.out.splitlines():
+        smi, mem_total, mem_used = self._split_stats(r.out)
+        for line in smi:
             parts = [p.strip() for p in line.split(",")]
             if len(parts) < 9:
                 continue
+            # Same unified-memory fallback as gpu(): GB10 reports every memory
+            # field as [N/A], so the host pool is the real occupancy signal.
+            total = _parse_int(parts[6]) or mem_total or self.cfg.vram_total_mb
+            used = _parse_int(parts[7]) or mem_used
             return GpuMetric(
                 index=-1,
                 uuid=self.cfg.gpu_uuid,
@@ -213,9 +261,9 @@ class SparkBackend:
                 temp_c=_parse_float(parts[3]),
                 power_w=_parse_float(parts[4]),
                 util_pct=_parse_float(parts[5]),
-                mem_total_mb=_parse_int(parts[6]) or self.cfg.vram_total_mb,
-                mem_used_mb=_parse_int(parts[7]),
-                mem_free_mb=_parse_int(parts[8]),
+                mem_total_mb=total,
+                mem_used_mb=used,
+                mem_free_mb=_parse_int(parts[8]) or max(0, total - used),
             )
         return None
 
