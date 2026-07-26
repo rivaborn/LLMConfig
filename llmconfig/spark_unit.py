@@ -280,7 +280,7 @@ class SparkUnit:
                 await self.spark.stop()
                 slots, resident = {}, {}
 
-        self._admit(entry, slots)
+        await self._admit(entry, slots)
         port = self._free_slot(slots)
         if port is None:
             raise RuntimeError(
@@ -386,15 +386,24 @@ class SparkUnit:
         """Lowest unoccupied slot port, or None when the node is full."""
         return next((p for p in self.cfg.slot_ports if p not in slots), None)
 
-    def _admit(self, entry, slots: dict) -> None:
-        """Refuse a load whose declared budget will not fit beside the residents.
+    async def _admit(self, entry, slots: dict) -> None:
+        """Refuse a load that will not fit beside the residents.
 
-        A Spark has no eviction-wait gate — nothing observes memory before a
-        launch — so this declared-budget sum is the only thing standing between
-        co-residency and an OOM at load. `mem_fraction: 0.0` means "unset", which
-        is read as a whole-node claim: it neither fits beside anything nor lets
-        anything fit beside it, which keeps pre-multi-model catalogs behaving as
-        they always did.
+        Two checks, both needed:
+
+        1. **Declared budgets** — the planning contract. A Spark has no
+           eviction-wait gate, so the summed `mem_fraction` is what stands
+           between co-residency and an OOM at load. `mem_fraction: 0.0` means
+           "unset", read as a whole-node claim: it neither fits beside anything
+           nor lets anything fit beside it, which keeps pre-multi-model catalogs
+           behaving as they always did.
+        2. **Measured free memory** — because a declaration can be fiction. A
+           model launched BEFORE budgets existed ran at its recipe default
+           (~0.8 of the pool); its declared 0.40 passed the sum check while the
+           node had 11 GB free, and the new vLLM wedged silently at allocation
+           (live on spark4, 2026-07-26). One SSH probe inside the load job — not
+           the status path, so invariant 9 is untouched — catches that drift.
+           An unreachable probe degrades to the declared-only check.
         """
         want = entry.mem_fraction
         by_name = {sm.name: sm for sm in slots.values() if sm.name}
@@ -422,6 +431,20 @@ class SparkUnit:
                 f"{used:.2f}/{headroom:.2f} is already committed to "
                 f"{', '.join(sorted(budgets))}. Unload something or lower mem_fraction."
             )
+
+        gpu = await self.spark.gpu()
+        if gpu.found and gpu.total_mb > 0:
+            free_frac = gpu.free_mb / gpu.total_mb
+            # Small slack for page cache the kernel will surrender under pressure.
+            if want > free_frac + 0.05:
+                raise RuntimeError(
+                    f"'{entry.alias}' declares {want:.2f} of {self.cfg.name} but only "
+                    f"{free_frac:.2f} of the pool is actually free — a resident model "
+                    f"is using more than its declared mem_fraction (typically one "
+                    f"launched before budgets, at its recipe default). Reload the "
+                    f"resident through LLMConfig so its budget is enforced, or free "
+                    f"the node."
+                )
 
     async def aclose(self) -> None:
         if self._gpu_task is not None and not self._gpu_task.done():

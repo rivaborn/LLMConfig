@@ -899,3 +899,26 @@ async def test_unload_prunes_the_departed_models_clock(cfg, monkeypatch):
 
     await unit.unload(UnloadRequest(server=None, lane="spark1"))
     assert unit.model_activity == {}, "freeing the node drops every clock"
+
+
+@respx.mock
+async def test_admission_refuses_when_measured_free_memory_contradicts_the_budgets(cfg, monkeypatch):
+    """Declared budgets can be fiction: a model launched before budgets existed
+    runs at its recipe default (~0.8 of the pool). The declared sum passed while
+    the node had 11 GB free, and the new vLLM wedged silently at allocation
+    (spark4, 2026-07-26). Admission must believe the measurement over the claim."""
+    unit = two_model_unit(cfg, f1=0.4, f2=0.18)
+    state, calls = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+    # nvidia-smi says only ~9% of the pool is free — served-1 is way over its 0.4.
+    calls_low = "GPU-abc, 122880, 111573, 11307, 17\n"
+    async def fake_run_wsl(command, *, login=True, timeout=30.0, settings=None):
+        if "nvidia-smi" in command:
+            return CmdResult(0, calls_low, "")
+        return CmdResult(0, "ok", "")
+    monkeypatch.setattr(spark_mod, "run_wsl", fake_run_wsl)
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2", lane="spark1")))
+
+    assert job.state == "failed"
+    assert "actually free" in (job.error or ""), job.error
+    assert state == {8000: "served-1"}, "the resident must be untouched by the refusal"
