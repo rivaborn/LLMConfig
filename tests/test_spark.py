@@ -5,6 +5,8 @@ OpenAI endpoint via respx. No cluster required.
 """
 import asyncio
 import time
+from dataclasses import replace
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -12,11 +14,13 @@ import respx
 
 import llmconfig.backends.spark as spark_mod
 from llmconfig.config import Settings, SparkConfig, _parse_spark_nodes
-from llmconfig.idle import classify_usage
+from llmconfig.idle import IdleReaper, classify_usage
 from llmconfig.jobs import JobManager
+from llmconfig.leases import LeaseManager
 from llmconfig.proc import CmdResult
 from llmconfig.registry import SparkRegistry
-from llmconfig.schemas import LaneStatus, LoadRequest, SparkModelEntry, UnloadRequest
+from llmconfig.schemas import (LaneStatus, LeaseClaimRequest, LoadRequest,
+                               SparkModelEntry, UnloadRequest)
 from llmconfig.spark_unit import SparkUnit
 
 HOST = "10.9.9.9"
@@ -724,3 +728,121 @@ async def test_reloading_a_resident_model_reuses_its_slot(cfg, calls):
     assert "sparkrun stop recipe-2" in stop, "free only its own slot"
     run = next(c for c in calls if "sparkrun run" in c)
     assert "--port 8001" in run, "the freed slot is the lowest free one, so it is reused"
+
+
+# --------------------------------------------------------------------------- #
+# Per-model idle reaping — the unit clock is the MAX across models, so reaping
+# off it alone would let one busy model keep every idle neighbour resident.
+# --------------------------------------------------------------------------- #
+IDLE_S = 16 * 60  # past the 15-minute default
+
+
+def reaper_for(unit, **overrides):
+    """An IdleReaper driving exactly one Spark, with no Monitor signal."""
+    settings = Settings(_env_file=None, **overrides)
+    orch = SimpleNamespace(units={unit.cfg.id: unit}, lanes={}, keepalive=None)
+    monitor = SimpleNamespace(last_util_activity=lambda uuid, threshold, since: None)
+    # Sparks are reap-exempt by default; SparkConfig is frozen, so swap in a copy.
+    unit.cfg = replace(unit.cfg, idle_unload_enabled=True)
+    return IdleReaper(settings, orch, monitor, LeaseManager(settings, orch))
+
+
+@respx.mock
+async def test_reaping_an_idle_model_leaves_a_busy_neighbour_resident(cfg, monkeypatch):
+    """The whole point: m2 goes idle while m1 keeps working, and only m2 is evicted."""
+    unit = two_model_unit(cfg)
+    state, calls = stateful_node(monkeypatch, cfg, {8000: "served-1", 8001: "served-2"})
+    now = time.time()
+    unit.last_activity = now                      # the unit clock says "busy"...
+    unit.model_activity = {"m1": now, "m2": now - IDLE_S}   # ...but only m1 is
+
+    await reaper_for(unit)._tick()
+
+    assert state == {8000: "served-1"}, "only the idle model may be evicted"
+    assert not any("--all" in c for c in calls), "reaping one model must not sweep the node"
+    assert any("sparkrun stop recipe-2" in c for c in calls), "the stop must be targeted"
+
+
+@respx.mock
+async def test_a_busy_model_is_not_reaped(cfg, monkeypatch):
+    unit = two_model_unit(cfg)
+    state, _ = stateful_node(monkeypatch, cfg, {8000: "served-1", 8001: "served-2"})
+    unit.last_activity = unit.last_activity - IDLE_S
+    unit.model_activity = {"m1": time.time(), "m2": time.time()}
+
+    await reaper_for(unit)._tick()
+
+    assert state == {8000: "served-1", 8001: "served-2"}, "both models are in use"
+
+
+@respx.mock
+async def test_all_idle_models_are_reaped_over_successive_ticks(cfg, monkeypatch):
+    """One victim per tick — each reap gets its own lock acquisition and re-check."""
+    unit = two_model_unit(cfg)
+    state, _ = stateful_node(monkeypatch, cfg, {8000: "served-1", 8001: "served-2"})
+    stale = time.time() - IDLE_S
+    unit.last_activity = stale
+    unit.model_activity = {"m1": stale, "m2": stale - 60}
+    reaper = reaper_for(unit)
+
+    await reaper._tick()
+    assert state == {8000: "served-1"}, "the stalest model goes first"
+    unit.model_activity["m1"] = stale  # the reap touched only the victim's clock
+
+    await reaper._tick()
+    assert state == {}, "the second tick takes the remaining idle model"
+
+
+@respx.mock
+async def test_a_per_model_lease_shields_only_that_model_from_the_reaper(cfg, monkeypatch):
+    unit = two_model_unit(cfg)
+    state, _ = stateful_node(monkeypatch, cfg, {8000: "served-1", 8001: "served-2"})
+    stale = time.time() - IDLE_S
+    unit.last_activity = stale
+    unit.model_activity = {"m1": stale, "m2": stale}
+    reaper = reaper_for(unit)
+    reaper.leases.claim(LeaseClaimRequest(unit=cfg.id, holder="alice", model="m1"))
+
+    await reaper._tick()
+
+    assert state == {8000: "served-1"}, "the leased model survives, the unleased one does not"
+
+
+@respx.mock
+async def test_a_unit_wide_lease_shields_every_model(cfg, monkeypatch):
+    unit = two_model_unit(cfg)
+    state, _ = stateful_node(monkeypatch, cfg, {8000: "served-1", 8001: "served-2"})
+    stale = time.time() - IDLE_S
+    unit.last_activity = stale
+    unit.model_activity = {"m1": stale, "m2": stale}
+    reaper = reaper_for(unit)
+    reaper.leases.claim(LeaseClaimRequest(unit=cfg.id, holder="alice"))  # no model
+
+    await reaper._tick()
+
+    assert state == {8000: "served-1", 8001: "served-2"}
+
+
+@respx.mock
+async def test_activity_is_clocked_per_model_whatever_name_the_caller_uses(cfg, monkeypatch):
+    """The gateway touches with the requested id, a load with the alias, and the
+    reaper reads the node's served name — all three must land on one clock."""
+    unit = two_model_unit(cfg)
+    stateful_node(monkeypatch, cfg, {8000: "served-1"})
+    unit.touch(model="served-1")          # as the reaper/residency names it
+
+    assert set(unit.model_activity) == {"m1"}, "clocks are keyed by catalog alias"
+    assert unit.idle_for("m1") < 5 and unit.idle_for("served-1") < 5
+
+
+@respx.mock
+async def test_clocks_for_departed_models_are_forgotten(cfg, monkeypatch):
+    """A stale clock for a model that has left would be the oldest one forever,
+    defeating the reaper's cheap pre-probe guard on every tick."""
+    unit = two_model_unit(cfg)
+    stateful_node(monkeypatch, cfg, {8000: "served-1"})
+    unit.model_activity = {"m1": time.time(), "m2": time.time() - 99999}
+
+    await unit.status()
+
+    assert set(unit.model_activity) == {"m1"}

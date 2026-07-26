@@ -141,7 +141,7 @@ class OpenAIGateway:
         return default
 
     # ---- lease admission (see leases.py) ----
-    def _lease_gate(self, unit_id: str, lease_id: str):
+    def _lease_gate(self, unit_id: str, lease_id: str, model: str = ""):
         """Decide whether this request may use the unit. Returns None to allow, or
         `(code, message, lease)` to refuse.
 
@@ -156,11 +156,12 @@ class OpenAIGateway:
             return None
 
         if not lease_id:
-            blocker = self.leases.blocks_unleased(unit_id)
+            blocker = self.leases.blocks_unleased(unit_id, model or None)
             if blocker is None:
                 return None
+            what = f"model '{blocker.model}' on {unit_id}" if blocker.model else f"unit '{unit_id}'"
             return ("lease_required",
-                    f"unit '{unit_id}' is held by '{blocker.holder}' with a "
+                    f"{what} is held by '{blocker.holder}' with a "
                     f"non-preemptible lease — claim one (POST /api/leases) or wait",
                     blocker)
 
@@ -359,7 +360,7 @@ class OpenAIGateway:
                 yield chunk
         finally:
             if lane is not None:
-                lane.touch()
+                lane.touch(model=model)
 
     async def _stream_load_then_forward_inner(self, job_id: Optional[str], backend: str,
                                               sub_path: str, body: dict, model: str,
@@ -414,7 +415,9 @@ class OpenAIGateway:
         # Admission BEFORE resolve() and before the first lane.touch(): the decision
         # shouldn't depend on model resolution, and a refused request must not extend
         # the lane's idle window (it never reached a backend).
-        reject = self._lease_gate(lane.cfg.id, (request.headers.get("x-llm-lease") or "").strip())
+        reject = self._lease_gate(lane.cfg.id,
+                                  (request.headers.get("x-llm-lease") or "").strip(),
+                                  model)
         if reject is not None:
             return self._lease_reject(*reject, is_chat=is_chat, stream=stream)
 
@@ -426,7 +429,7 @@ class OpenAIGateway:
                                     "type": "invalid_request_error", "code": "model_not_found"}},
             )
         server, load_arg, backend = resolved
-        lane.touch()  # inference traffic on this lane — reset the idle-unload window
+        lane.touch(model=model)  # inference traffic — reset this model's idle-unload window
 
         # Fast path: this model is ALREADY resident → forward, no load. Membership
         # over loaded_models, not equality against the unit's primary occupant: on a
@@ -442,7 +445,7 @@ class OpenAIGateway:
                     media_type="text/event-stream",
                 )
             resp = await self.forward(backend, sub_path, body, request.headers)
-            lane.touch()  # generation finished — a long answer shouldn't count as idle time
+            lane.touch(model=model)  # generation finished — a long answer shouldn't count as idle time
             return resp
 
         # Need to load (cold / wrong model). Coalesce onto an identical in-flight load.
@@ -479,7 +482,7 @@ class OpenAIGateway:
                                     "type": "server_error", "code": "model_load_failed"}},
             )
         resp = await self.forward(backend, sub_path, body, request.headers)
-        lane.touch()  # generation finished — a long answer shouldn't count as idle time
+        lane.touch(model=model)  # generation finished — a long answer shouldn't count as idle time
         return resp
 
     async def handle_pooling(self, request: Request, sub_path: str):
@@ -509,7 +512,9 @@ class OpenAIGateway:
         # Same ordering as the chat path: admission before resolve() and before the
         # first touch(), so a refusal neither depends on resolution nor extends the
         # lane's idle window. `stream` is always False — see the docstring.
-        reject = self._lease_gate(lane.cfg.id, (request.headers.get("x-llm-lease") or "").strip())
+        reject = self._lease_gate(lane.cfg.id,
+                                  (request.headers.get("x-llm-lease") or "").strip(),
+                                  model)
         if reject is not None:
             return self._lease_reject(*reject, is_chat=False, stream=False)
 
@@ -532,13 +537,13 @@ class OpenAIGateway:
                                     "type": "invalid_request_error", "code": "rerank_unsupported"}},
             )
 
-        lane.touch()
+        lane.touch(model=model)
 
         status = await lane.status()
         backend = self._route(lane, server, model, status, backend)
         if any(m.server == server and m.model == model for m in status.loaded_models):
             resp = await self.forward(backend, sub_path, body, request.headers)
-            lane.touch()
+            lane.touch(model=model)
             return resp
 
         target_kind = f"load:{lane.cfg.id}:{server}:{load_arg}"
@@ -570,7 +575,7 @@ class OpenAIGateway:
                                     "type": "server_error", "code": "model_load_failed"}},
             )
         resp = await self.forward(backend, sub_path, body, request.headers)
-        lane.touch()
+        lane.touch(model=model)
         return resp
 
     async def models(self, request: Request) -> dict:

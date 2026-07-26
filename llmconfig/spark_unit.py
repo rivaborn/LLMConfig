@@ -46,6 +46,8 @@ class SparkUnit:
         self._lock = asyncio.Lock()
         self._active_job_id: Optional[str] = None
         self.last_activity: float = time.time()
+        # Per-model activity clocks, keyed by catalog alias; see touch()/idle_for().
+        self.model_activity: dict[str, float] = {}
         # Telemetry cache. `status()` is polled by the UI every ~2.5 s, but the
         # node's nvidia-smi is an SSH round-trip that costs seconds — and a
         # powered-off Spark costs the full connect timeout. So status() never
@@ -65,9 +67,45 @@ class SparkUnit:
         self._probe_backoff_s: float = 15.0
         self._fails_before_backoff: int = 3
 
-    def touch(self, ts: float | None = None) -> None:
-        """Record activity for the idle reaper. Never moves the clock backwards."""
-        self.last_activity = max(self.last_activity, time.time() if ts is None else ts)
+    def canonical_model(self, model: str) -> str:
+        """Fold any name for a model onto one key: its catalog alias.
+
+        Callers name a model three ways — the gateway passes whatever the client
+        asked for, a load passes the alias, and residency (so the idle reaper and
+        the UI) reports the node's *served* name. Anything keyed by model has to
+        agree on one of them or it silently splits in two: two activity clocks
+        that never look idle, or a lease on `m1` that fails to shield `served-1`.
+
+        Optional part of the unit contract — callers use
+        `getattr(unit, "canonical_model", None)`, and a `Lane` (one model, named
+        one way) simply doesn't need it.
+        """
+        entry = self.registry.get(model) or self.registry.find_by_served_name(model)
+        return entry.alias if entry else model
+
+    def touch(self, ts: float | None = None, model: str | None = None) -> None:
+        """Record activity for the idle reaper. Never moves the clock backwards.
+
+        Keeps a clock PER MODEL as well as for the unit. The unit clock is the max
+        across models, so on a multi-model node it says only "something here is
+        busy" — reaping off that alone would let one busy model keep every idle
+        neighbour resident forever, which on a shared 128 GB pool is exactly the
+        memory you wanted back.
+        """
+        now = time.time() if ts is None else ts
+        self.last_activity = max(self.last_activity, now)
+        if model:
+            key = self.canonical_model(model)
+            self.model_activity[key] = max(self.model_activity.get(key, 0.0), now)
+
+    def idle_for(self, model: str) -> float:
+        """Seconds since this model was last used.
+
+        Falls back to the unit clock for a model we have never seen used — a model
+        loaded before a restart, say — so an unknown model is treated as active
+        rather than instantly reapable.
+        """
+        return time.time() - self.model_activity.get(self.canonical_model(model), self.last_activity)
 
     # ------------------------------------------------------------------ #
     # Status
@@ -143,6 +181,14 @@ class SparkUnit:
             )
             for port, info in sorted(slots.items())
         ]
+        # Forget clocks for models that have left the node. Not doing so would leave a
+        # departed model's stale timestamp as the oldest one forever, defeating the idle
+        # reaper's cheap pre-probe guard on every tick. Only prune once we have seen the
+        # node serving something — an empty probe during a restart is not evidence.
+        if slots and self.model_activity:
+            resident = {self.canonical_model(m.model) for m in loaded_models}
+            for gone in [k for k in self.model_activity if k not in resident]:
+                self.model_activity.pop(gone, None)
         # `loaded` stays the primary occupant for every existing consumer; the list
         # is the additive surface (invariant 8/12).
         loaded: Optional[LoadedModel] = loaded_models[0] if loaded_models else None
@@ -183,7 +229,10 @@ class SparkUnit:
                     return await self._load(job, req)
                 finally:
                     self._active_job_id = None
-                    self.touch()
+                    # Clock the TARGET model, not just the unit: a fresh load must start
+                    # its own idle window, or the reaper would fall back to the unit clock
+                    # and treat it as busy for as long as any neighbour keeps that fresh.
+                    self.touch(model=req.model)
 
         return self.jobs.start(job, body)
 

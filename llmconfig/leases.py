@@ -127,6 +127,10 @@ class PendingFree:
     lease_id: str
     requested_at: float
     reason: str
+    # The model to free, canonical (see LeaseManager._canon), or "" for the whole
+    # unit. A per-model claim wants room for ITS model, not an empty node — freeing
+    # everything would evict a co-tenant the claimant never contended with.
+    model: str = ""
 
 
 class LeaseManager:
@@ -211,20 +215,48 @@ class LeaseManager:
             out.append(lease)
         return sorted(out, key=lambda l: l.acquired_at, reverse=True)
 
-    def active_for(self, unit_id: str) -> Optional[Lease]:
-        """The live lease on a unit, or None. Runs lazy expiry first.
+    def active_all(self, unit_id: str) -> list[Lease]:
+        """Every live lease on a unit. Runs lazy expiry first.
 
-        THIS MUST STAY SYNCHRONOUS — it is called from `idle.py`'s final
-        no-await-before-unload guard.
+        A unit can carry several claims at once now that one node hosts several
+        models: at most one WHOLE-UNIT lease (`model == ""`) plus one per model.
+
+        THIS MUST STAY SYNCHRONOUS — see `active_for`.
         """
         now_mono = time.monotonic()
+        out: list[Lease] = []
         for lease in self._leases.values():
             if lease.unit != unit_id:
                 continue
             self._expire_if_lapsed(lease, now_mono)
             if lease.state == "active":
-                return lease
-        return None
+                out.append(lease)
+        return out
+
+    def active_for(self, unit_id: str, model: Optional[str] = None) -> Optional[Lease]:
+        """The live lease GOVERNING (unit, model), or None. Runs lazy expiry first.
+
+        * `model=None` asks a unit-level question — "is anything claimed here?" —
+          and answers with the whole-unit lease if there is one, else any model
+          lease. This is what the pre-multi-model callers meant, so their
+          behaviour is unchanged.
+        * A named model is governed by a whole-unit lease (which covers
+          everything on the node) or by the lease naming that model. A lease on a
+          DIFFERENT model does not govern it — that is the point of per-model
+          leases.
+
+        THIS MUST STAY SYNCHRONOUS — it is called from `idle.py`'s final
+        no-await-before-unload guard, and from the gateway's admission check.
+        """
+        live = self.active_all(unit_id)
+        if not live:
+            return None
+        unit_wide = next((l for l in live if not l.model), None)
+        if model is None:
+            return unit_wide or live[0]
+        if unit_wide is not None:
+            return unit_wide
+        return next((l for l in live if l.model == model), None)
 
     def brief(self, unit_id: str) -> Optional[LeaseBrief]:
         lease = self.active_for(unit_id)
@@ -240,14 +272,32 @@ class LeaseManager:
             model=lease.model,
         )
 
-    def blocks_unleased(self, unit_id: str) -> Optional[Lease]:
-        """The live lease that should refuse un-leased traffic, if any."""
+    def _canon(self, unit_id: str, model: Optional[str]) -> str:
+        """Normalize a model name to the unit's canonical one (see
+        `SparkUnit.canonical_model`).
+
+        Applied to every model name entering this manager so a lease claimed under
+        an alias still governs traffic — and reaping — for the node's served name.
+        Stays pure dict/list access, so the sync guarantee in invariant 11 holds.
+        """
+        if not model:
+            return ""
+        unit = self.orch.units.get(unit_id)
+        fn = getattr(unit, "canonical_model", None)
+        return fn(model) if fn is not None else model
+
+    def blocks_unleased(self, unit_id: str, model: Optional[str] = None) -> Optional[Lease]:
+        """The live lease that should refuse un-leased traffic for `model`, if any.
+
+        Scoped to the model so a non-preemptible claim on one model does not 409
+        traffic for a co-resident model its holder never touched.
+        """
         if not self.s.lease_block_unleased:
             return None
-        lease = self.active_for(unit_id)
+        lease = self.active_for(unit_id, self._canon(unit_id, model))
         return lease if lease is not None and not lease.preemptible else None
 
-    def blocks_idle_unload(self, unit_id: str) -> Optional[Lease]:
+    def blocks_idle_unload(self, unit_id: str, model: Optional[str] = None) -> Optional[Lease]:
         """The live lease that should stop the idle reaper, if any.
 
         ANY live lease blocks — not just non-preemptible ones. The reaper is a
@@ -258,7 +308,30 @@ class LeaseManager:
         """
         if not self.s.lease_blocks_idle_unload:
             return None
-        return self.active_for(unit_id)
+        return self.active_for(unit_id, self._canon(unit_id, model))
+
+    def _conflicting(self, unit_id: str, model: str, holder: str) -> Optional[Lease]:
+        """The live lease a claim for (unit, model) must contend with.
+
+        Two claims OVERLAP when either covers the other:
+
+          * a whole-unit claim (`model == ""`) overlaps everything on the node;
+          * two claims for the SAME model overlap;
+          * claims for two different models do NOT — that is what lets two callers
+            each hold their own model on one Spark.
+
+        The same holder re-claiming is returned first so `claim()` extends in place
+        rather than fragmenting into two leases.
+        """
+        live = self.active_all(unit_id)
+        model = self._canon(unit_id, model)
+        mine = next((l for l in live if l.holder == holder and l.model == model), None)
+        if mine is not None:
+            return mine
+        for lease in live:
+            if not model or not lease.model or lease.model == model:
+                return lease
+        return None
 
     def pending_free(self) -> dict[str, PendingFree]:
         return dict(self._pending_free)
@@ -272,7 +345,9 @@ class LeaseManager:
     def claim(self, req: LeaseClaimRequest) -> tuple[Lease, Optional[Lease]]:
         """Acquire a unit. Returns (lease, displaced_or_None); raises on refusal.
 
-        Decision table — `E` is the unit's live lease:
+        Decision table — `E` is the live lease this claim OVERLAPS (see
+        `_conflicting`): a whole-unit lease, or one naming the same model. A claim
+        for a different model on the same unit does not contend at all.
 
         | E                    | condition                       | outcome              |
         | -------------------- | ------------------------------- | -------------------- |
@@ -298,7 +373,7 @@ class LeaseManager:
         ttl_s, clamp_note = self._clamp_ttl(req.ttl_s)
         priority = max(0, min(100, int(req.priority)))
         now, now_mono = time.time(), time.monotonic()
-        existing = self.active_for(req.unit)
+        existing = self._conflicting(req.unit, req.model, holder)
 
         # Same holder re-claiming: extend in place rather than fragmenting into two
         # leases (a retrying client must not end up holding one and being blocked
@@ -310,7 +385,7 @@ class LeaseManager:
             existing.priority = priority
             existing.free_on_preempt = req.free_on_preempt
             if req.model:
-                existing.model = req.model
+                existing.model = self._canon(req.unit, req.model)
             if req.server:
                 existing.server = req.server
             existing.note = clamp_note or req.note or existing.note
@@ -347,7 +422,9 @@ class LeaseManager:
             acquired_at=now,
             expires_at=now + ttl_s,
             server=req.server,
-            model=req.model,
+            # Stored canonical so a lease claimed under an alias governs the node's
+            # served name too — see `_canon`.
+            model=self._canon(req.unit, req.model),
             note=clamp_note or req.note,
             free_on_preempt=req.free_on_preempt,
         )
@@ -365,7 +442,7 @@ class LeaseManager:
         # baseline itself, so freeing first is usually a wasted drain/refill plus a
         # window in which a third party can grab the empty card.
         if req.free_on_preempt:
-            self._pending_free[req.unit] = PendingFree(lease.id, now, "claimed")
+            self._pending_free[req.unit] = PendingFree(lease.id, now, "claimed", lease.model)
 
         self._leases[lease.id] = lease
         self._prune()
@@ -418,7 +495,7 @@ class LeaseManager:
         if free:
             # No requesting lease — an operator asked, so honour it only while the
             # unit stays unclaimed (see LeaseSweeper._free_unit).
-            self._pending_free[lease.unit] = PendingFree("", time.time(), reason)
+            self._pending_free[lease.unit] = PendingFree("", time.time(), reason, lease.model)
         return lease
 
     def note_request(self, lease_id: str) -> None:
@@ -551,7 +628,15 @@ class LeaseSweeper:
                 st = await unit.status()
             except Exception:  # noqa: BLE001 — a probe failure is not evidence of disuse
                 continue
-            if st.owner in MANAGED_OWNERS or st.swap_in_progress:
+            if st.swap_in_progress:
+                continue
+            if lease.model:
+                # A lease naming a model is only a ghost when THAT model is absent.
+                # Unit-wide residency is the wrong test on a multi-model node: a
+                # co-tenant someone else loaded would keep this ghost alive forever.
+                if any(m.model == lease.model for m in st.loaded_models):
+                    continue
+            elif st.owner in MANAGED_OWNERS:
                 continue
             self.leases.expire_unused(lease.id)
             log.info("lease %s (%s) released — never used and %s is free",
@@ -563,14 +648,17 @@ class LeaseSweeper:
         A claimant's request is honoured only while that claimant still holds the
         unit; an operator's (`lease_id == ""`) only while nobody else has claimed it.
         Either way we must never yank a model out from under a *different* holder.
+        Scoped to `pf.model`, so a claim on a neighbouring model neither satisfies
+        nor cancels this one.
         """
-        active = self.leases.active_for(unit_id)
+        active = self.leases.active_for(unit_id, pf.model or None)
         if pf.lease_id:
             return active is not None and active.id == pf.lease_id
         return active is None
 
     async def _free_unit(self, unit: "Unit", pf: PendingFree) -> None:
-        """Evict a preempted unit, mirroring IdleReaper._check_lane's guard ladder."""
+        """Evict a preempted unit — or just the one model — mirroring
+        IdleReaper._check_lane's guard ladder."""
         # A queued load is invisible here (`_active_job_id` is only set once the lock
         # is taken), so a free can land just before a queued load reloads — a wasted
         # drain/refill, not a correctness bug: the load's own eviction gate handles it.
@@ -584,6 +672,10 @@ class LeaseSweeper:
         if st.swap_in_progress or st.owner not in MANAGED_OWNERS:
             self.leases.clear_pending(unit.cfg.id)        # nothing loaded to free
             return
+        if pf.model and not any(self.leases._canon(unit.cfg.id, m.model) == pf.model
+                                for m in st.loaded_models):
+            self.leases.clear_pending(unit.cfg.id)        # that model already gone
+            return
         # Final sync re-check. No await between here and unload(): an uncontended
         # asyncio.Lock acquires without yielding and active_for() is plain dict
         # access, so neither a competing load nor a claim landing during the status
@@ -591,7 +683,8 @@ class LeaseSweeper:
         if unit._lock.locked() or not self._still_wanted(unit.cfg.id, pf):
             return
         self.leases.clear_pending(unit.cfg.id)
-        log.info("lease sweeper: freeing %s after %s (lease %s)",
-                 unit.cfg.id, pf.reason, pf.lease_id)
-        await unit.unload(UnloadRequest(server=None, lane=unit.cfg.id))  # invariant 3
-        unit.touch()  # restart the idle window, as the reaper does after a reap
+        log.info("lease sweeper: freeing %s on %s after %s (lease %s)",
+                 pf.model or "everything", unit.cfg.id, pf.reason, pf.lease_id)
+        # invariant 3 — always through Unit.unload
+        await unit.unload(UnloadRequest(server=None, lane=unit.cfg.id, model=pf.model or None))
+        unit.touch(model=pf.model or None)  # restart the idle window, as the reaper does

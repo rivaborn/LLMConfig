@@ -60,9 +60,14 @@ class Lane:
 
     kind = "gpu"
 
-    def touch(self, ts: float | None = None) -> None:
+    def touch(self, ts: float | None = None, model: str | None = None) -> None:
         """Record lane activity for the idle reaper. Never moves the clock backwards,
-        so a stale Monitor sample can't shorten the idle window."""
+        so a stale Monitor sample can't shorten the idle window.
+
+        `model` is accepted for a uniform Unit contract and ignored: the eviction-wait
+        gate means a lane has at most one occupant, so the unit clock IS that model's
+        clock.
+        """
         self.last_activity = max(self.last_activity, time.time() if ts is None else ts)
 
     async def aclose(self) -> None:

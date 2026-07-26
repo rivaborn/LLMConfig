@@ -18,7 +18,7 @@ from llmconfig.leases import (
     LeaseSweeper,
     UnknownUnit,
 )
-from llmconfig.schemas import LaneStatus, LeaseClaimRequest, UnloadRequest
+from llmconfig.schemas import LaneStatus, LeaseClaimRequest, LoadedModel, UnloadRequest
 
 
 # --------------------------------------------------------------------------- #
@@ -33,6 +33,7 @@ class FakeUnit:
         self._lock = asyncio.Lock()
         self._active_job_id = None
         self.owner = owner
+        self.models: list[str] = []      # resident models, for the multi-model paths
         self.unloads: list[UnloadRequest] = []
         self.touched = 0
         self.status_hook = None          # optional async callback fired inside status()
@@ -40,15 +41,24 @@ class FakeUnit:
     async def status(self, gpu=None) -> LaneStatus:
         if self.status_hook is not None:
             await self.status_hook()
-        return LaneStatus(id=self.cfg.id, name=self.cfg.id, owner=self.owner,
-                          ollama_up=True, vllm_up=False)
+        return LaneStatus(
+            id=self.cfg.id, name=self.cfg.id, owner=self.owner,
+            ollama_up=True, vllm_up=False,
+            loaded_models=[LoadedModel(server="ollama", model=m) for m in self.models],
+        )
 
     async def unload(self, req: UnloadRequest) -> LaneStatus:
         self.unloads.append(req)
-        self.owner = "free"
+        if req.model:
+            self.models = [m for m in self.models if m != req.model]
+        else:
+            self.models = []
+            self.owner = "free"
         return await self.status()
 
-    def touch(self, ts=None) -> None:
+    def touch(self, ts=None, model=None) -> None:
+        # `model` is part of the duck-typed unit contract now that a unit can hold
+        # several models — see SparkUnit.touch.
         self.touched += 1
 
 
@@ -418,3 +428,87 @@ async def test_takeover_during_the_status_probe_cancels_the_free():
     unit.status_hook = steal_midway
     await _sweeper(mgr, orch, s)._tick()
     assert unit.unloads == [], "a takeover during the probe must block the free"
+
+
+# --------------------------------------------------------------------------- #
+# Per-model scoping — a multi-model unit means a claim need not be node-wide
+# --------------------------------------------------------------------------- #
+async def test_per_model_lease_only_blocks_its_own_model():
+    """The point of per-model leases: alice pinning m2 must not 409 bob's m1
+    traffic on the same Spark. A node-wide claim still blocks everything."""
+    mgr, _, _ = _mgr()
+    _claim(mgr, "alice", model="m2", preemptible=False)
+
+    assert mgr.blocks_unleased("primary", "m2") is not None, "the claimed model is gated"
+    assert mgr.blocks_unleased("primary", "m1") is None,         "a co-resident model nobody claimed must stay open"
+    assert mgr.blocks_idle_unload("primary", "m1") is None,         "and the reaper must still be free to evict it"
+
+
+async def test_unit_wide_lease_blocks_every_model():
+    mgr, _, _ = _mgr()
+    _claim(mgr, "alice", preemptible=False)  # no model = the whole node
+
+    for model in ("m1", "m2", None):
+        assert mgr.blocks_unleased("primary", model) is not None, model
+        assert mgr.blocks_idle_unload("primary", model) is not None, model
+
+
+async def test_two_holders_can_claim_different_models_on_one_unit():
+    mgr, _, _ = _mgr()
+    a, _ = _claim(mgr, "alice", model="m1", preemptible=False)
+    b, displaced = _claim(mgr, "bob", model="m2", preemptible=False)  # no LeaseConflict
+
+    assert a.id != b.id and displaced is None, "different models don't contend at all"
+    assert {l.holder for l in mgr.active_all("primary")} == {"alice", "bob"}
+    assert mgr.blocks_unleased("primary", "m1").holder == "alice"
+    assert mgr.blocks_unleased("primary", "m2").holder == "bob"
+
+
+async def test_same_model_still_conflicts():
+    """Per-model scoping must not weaken the guarantee within one model."""
+    mgr, _, _ = _mgr()
+    _claim(mgr, "alice", model="m1", preemptible=False)
+    with pytest.raises(LeaseConflict):
+        _claim(mgr, "bob", model="m1")
+
+
+async def test_free_on_preempt_frees_only_the_leased_model():
+    """A per-model claimant wants room for ITS model, not an empty node — freeing
+    everything would evict a co-tenant it never contended with."""
+    mgr, orch, s = _mgr(lease_unused_release_s=0)
+    unit = orch.units["primary"]
+    unit.models = ["m1", "m2"]
+    _claim(mgr, holder="alice", model="m1")
+    _claim(mgr, holder="bob", model="m1", priority=5, free_on_preempt=True)
+
+    await _sweeper(mgr, orch, s)._tick()
+
+    assert [r.model for r in unit.unloads] == ["m1"], "the stop must name the model"
+    assert unit.models == ["m2"], "the co-tenant survives"
+
+
+async def test_free_on_preempt_of_a_unit_wide_lease_still_frees_everything():
+    mgr, orch, s = _mgr(lease_unused_release_s=0)
+    unit = orch.units["primary"]
+    unit.models = ["m1", "m2"]
+    _claim(mgr, holder="alice")
+    _claim(mgr, holder="bob", priority=5, free_on_preempt=True)
+
+    await _sweeper(mgr, orch, s)._tick()
+
+    assert [r.model for r in unit.unloads] == [None], "no model = free the whole unit"
+    assert unit.models == []
+
+
+async def test_a_queued_free_is_dropped_once_its_model_has_gone():
+    """Someone else unloading it first satisfies the request; the sweeper must not
+    then fall through and free the node."""
+    mgr, orch, s = _mgr(lease_unused_release_s=0)
+    unit = orch.units["primary"]
+    unit.models = ["m2"]                      # m1 already gone
+    _claim(mgr, holder="alice", model="m1")
+    _claim(mgr, holder="bob", model="m1", priority=5, free_on_preempt=True)
+
+    await _sweeper(mgr, orch, s)._tick()
+
+    assert unit.unloads == [] and unit.models == ["m2"]

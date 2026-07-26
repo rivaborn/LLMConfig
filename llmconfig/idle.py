@@ -14,6 +14,13 @@ and talk to Ollama / the vLLM relay directly:
   * a Monitor utilization sample above `idle_unload_util_pct` on the lane's GPU
     (folded in each tick via `Monitor.last_util_activity`, matched by UUID).
 
+A unit that can hold several models at once (a DGX Spark) clocks each model
+separately as well, and the reaper decides PER MODEL — the unit clock is the max
+across them, so reaping off it alone would let one busy model keep every idle
+neighbour resident. One model is reaped per tick, each behind its own lock
+acquisition and re-check. A GPU lane holds a single model and has no per-model
+clocks, so the same code path collapses to the original unit-level decision.
+
 Invariant: reaping goes ONLY through `Lane.unload` — the lane lock + the
 eviction-wait gate — never a private unload path. After reaping the last vLLM
 (no lane serving vLLM, no lane lock held) the shared WSL keepalive is released
@@ -36,7 +43,7 @@ import time
 from typing import TYPE_CHECKING, Optional
 
 from .config import Settings
-from .schemas import MANAGED_OWNERS, LaneStatus, LaneUsage, UnloadRequest
+from .schemas import MANAGED_OWNERS, LaneStatus, LaneUsage, LoadedModel, UnloadRequest
 
 if TYPE_CHECKING:
     from .leases import LeaseManager
@@ -136,14 +143,22 @@ class IdleReaper:
         )
         if ts is not None:
             lane.touch(ts)
+            # The util signal says "this device is busy" without saying which model is
+            # doing the work, so it counts for all of them. Bumping only the unit clock
+            # would let per-model reaping evict a model that a direct-to-backend client
+            # is actively using.
+            for known in list(getattr(lane, "model_activity", {})):
+                lane.touch(ts, model=known)
         # Cheap guards before any HTTP/nvidia-smi probing.
         if not lane.cfg.enabled or not lane.cfg.idle_unload_enabled:
             return False
         # A claimed unit is off-limits — including a *preemptible* claim, because the
         # reaper is a power-saving optimisation, not a competing caller. Checked here
-        # so a leased lane costs no nvidia-smi/HTTP probe at all.
+        # so a leased lane costs no nvidia-smi/HTTP probe at all. Only a WHOLE-UNIT
+        # claim short-circuits: a lease naming one model must not shield that model's
+        # idle neighbours, so it is enforced per model further down instead.
         held = self.leases.blocks_idle_unload(lane.cfg.id)
-        if held is not None:
+        if held is not None and not held.model:
             if self._lease_logged.get(lane.cfg.id) != held.id:
                 self._lease_logged[lane.cfg.id] = held.id
                 log.info("idle reaper: lane %s leased by '%s' (%s) — skipping",
@@ -152,26 +167,49 @@ class IdleReaper:
         self._lease_logged.pop(lane.cfg.id, None)
         if lane._lock.locked() or lane._active_job_id:  # swap in progress
             return False
-        idle = time.time() - lane.last_activity
-        if idle < self.timeout_s:
+        # Cheap pre-probe guard on the OLDEST clock this unit knows — the unit clock plus
+        # every per-model clock. Using the unit clock alone would be wrong on a multi-model
+        # Spark: it is the max across models, so one busy model would keep every idle
+        # neighbour resident forever, which is exactly the memory we want back.
+        clocks = [lane.last_activity, *getattr(lane, "model_activity", {}).values()]
+        if time.time() - min(clocks) < self.timeout_s:
             return False
         # Something we manage must actually hold the unit (free/unknown → nothing to do).
         st = await lane.status()
         if st.swap_in_progress or st.owner not in MANAGED_OWNERS:
             return False
+
+        # Which resident models are individually past the timeout and unleased? A lane
+        # holds one model and has no per-model clocks, so this collapses to the old
+        # unit-level decision for it.
+        idle_of = getattr(lane, "idle_for", None)
+        stale: list[tuple[LoadedModel, float]] = []
+        for m in st.loaded_models:
+            idle = idle_of(m.model) if idle_of else (time.time() - lane.last_activity)
+            if idle >= self.timeout_s and self.leases.blocks_idle_unload(lane.cfg.id, m.model) is None:
+                stale.append((m, idle))
+        if not stale:
+            return False
+        # Reap the single stalest model per tick. One unload per pass keeps each reap
+        # behind its own lock acquisition and re-check, so a load that lands mid-sweep
+        # can't have a later victim chosen from a status snapshot taken before it.
+        victim, idle = max(stale, key=lambda p: p[1])
         # Final sync re-check, then reap through the existing lock + eviction-wait
         # path. No await between these checks and unload(): an uncontended asyncio.Lock
         # acquires without yielding and LeaseManager.blocks_idle_unload is pure dict
         # access, so neither a competing load nor a lease claimed during the status
         # probe above can interleave.
-        if lane._lock.locked() or self.leases.blocks_idle_unload(lane.cfg.id) is not None:
+        if lane._lock.locked() or self.leases.blocks_idle_unload(lane.cfg.id, victim.model) is not None:
             return False
-        model = st.loaded.model if st.loaded else "?"
         log.info("idle reaper: lane %s idle %.1f min — unloading %s (%s)",
-                 lane.cfg.id, idle / 60.0, model, st.owner)
-        await lane.unload(UnloadRequest(server=None, lane=lane.cfg.id))
-        lane.touch()  # restart the window so a slow VRAM drain isn't re-reaped every tick
-        return st.owner == "vllm"
+                 lane.cfg.id, idle / 60.0, victim.model, victim.server)
+        # Name the model even when it is the unit's only occupant: unload(model=…) is a
+        # targeted stop, so a co-resident neighbour loaded between the probe and here
+        # survives instead of being collateral.
+        await lane.unload(UnloadRequest(server=None, lane=lane.cfg.id, model=victim.model))
+        # Restart both windows so a slow VRAM drain isn't re-reaped every tick.
+        lane.touch(model=victim.model)
+        return victim.server == "vllm"
 
     async def _maybe_release_keepalive(self) -> None:
         """After reaping vLLM: if no lane serves vLLM anymore, drop the shared WSL hold
