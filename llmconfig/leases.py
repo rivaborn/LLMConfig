@@ -294,6 +294,12 @@ class LeaseManager:
         """
         if not self.s.lease_block_unleased:
             return None
+        if model is None:
+            # A unit-wide action (free the node, load over it) disturbs EVERY
+            # claim on it, so any live non-preemptible lease refuses — not just
+            # whichever one active_for surfaces first, behind which a preemptible
+            # lease could hide a non-preemptible neighbour.
+            return next((l for l in self.active_all(unit_id) if not l.preemptible), None)
         lease = self.active_for(unit_id, self._canon(unit_id, model))
         return lease if lease is not None and not lease.preemptible else None
 
@@ -634,7 +640,11 @@ class LeaseSweeper:
                 # A lease naming a model is only a ghost when THAT model is absent.
                 # Unit-wide residency is the wrong test on a multi-model node: a
                 # co-tenant someone else loaded would keep this ghost alive forever.
-                if any(m.model == lease.model for m in st.loaded_models):
+                # Residency reports SERVED names while the lease stores the
+                # canonical alias, so fold before comparing — raw equality reaped
+                # a staging lease on `gemma-4-26b` while `gemma-4-26b-fp8` ran.
+                if any(self.leases._canon(lease.unit, m.model) == lease.model
+                       for m in st.loaded_models):
                     continue
             elif st.owner in MANAGED_OWNERS:
                 continue

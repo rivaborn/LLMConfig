@@ -296,9 +296,11 @@ class SparkUnit:
             + (f", mem={entry.mem_fraction}" if entry.mem_fraction else "")
             + ")…",
         )
+        timeout = float(entry.load_timeout_s or self.cfg.load_timeout_s)
         r = await self.spark.run_recipe(recipe, tp=entry.tp, extra=entry.extra_args,
                                         served=target, port=port,
-                                        mem_fraction=entry.mem_fraction)
+                                        mem_fraction=entry.mem_fraction,
+                                        timeout=timeout)
         if not r.ok:
             if r.rc == 127:
                 raise RuntimeError(
@@ -312,7 +314,6 @@ class SparkUnit:
             if line.strip():
                 self.jobs.log(job, line.strip())
 
-        timeout = float(entry.load_timeout_s or self.cfg.load_timeout_s)
         self.jobs.log(
             job,
             f"waiting up to {int(timeout)}s for {target} to answer on "
@@ -359,6 +360,14 @@ class SparkUnit:
                     )
                 recipe = entry.recipe or entry.alias
             await self.spark.stop(recipe=recipe)
+            # Drop the departed model's clock now rather than waiting for a
+            # status() prune — after the LAST model leaves, the slot probe comes
+            # back empty and the prune never fires, leaving a stale oldest-clock
+            # that defeats the reaper's cheap pre-probe guard on every tick.
+            if req.model:
+                self.model_activity.pop(self.canonical_model(req.model), None)
+            else:
+                self.model_activity.clear()
         return await self.status()
 
     # ------------------------------------------------------------------ #

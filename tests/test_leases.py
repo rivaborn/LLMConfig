@@ -512,3 +512,49 @@ async def test_a_queued_free_is_dropped_once_its_model_has_gone():
     await _sweeper(mgr, orch, s)._tick()
 
     assert unit.unloads == [] and unit.models == ["m2"]
+
+
+async def test_reap_unused_spares_a_lease_whose_model_is_resident_under_its_served_name():
+    """Residency reports SERVED names, leases store the canonical alias. Raw
+    comparison reaped a staging lease on `m1` while `served-1` was running."""
+    mgr, orch, s = _mgr(lease_unused_release_s=1)
+    unit = orch.units["primary"]
+    unit.models = ["served-1"]                       # the node's served name
+    unit.canonical_model = lambda m: {"served-1": "m1"}.get(m, m)
+    lease, _ = _claim(mgr, "alice", model="m1")      # the catalog alias
+    lease.acquired_at -= 999                          # well past the unused window
+
+    await _sweeper(mgr, orch, s)._tick()
+
+    assert mgr.get(lease.id).state == "active", \
+        "a lease whose model IS resident must never be reaped as unused"
+
+
+async def test_reap_unused_still_reaps_a_true_ghost():
+    """The counterpart: model absent, no traffic, window passed -> reaped."""
+    mgr, orch, s = _mgr(lease_unused_release_s=1)
+    orch.units["primary"].owner = "free"
+    lease, _ = _claim(mgr, "alice", model="m1")
+    lease.acquired_at -= 999
+
+    await _sweeper(mgr, orch, s)._tick()
+
+    assert mgr.get(lease.id).state == "expired"
+
+
+async def test_whole_unit_gate_sees_a_nonpreemptible_lease_behind_a_preemptible_one():
+    """With several per-model claims, whichever lease active_for surfaced first
+    used to be the only one checked — a preemptible m1 lease masked bob's
+    non-preemptible m2 claim and let a whole-node unload through."""
+    mgr, _, _ = _mgr()
+    _claim(mgr, "alice", model="m1", preemptible=True)
+    _claim(mgr, "bob", model="m2", preemptible=False)
+
+    blocker = mgr.blocks_unleased("primary")          # the whole-unit question
+    assert blocker is not None and blocker.holder == "bob", \
+        "a unit-wide action must be refused by ANY non-preemptible claim"
+
+    # And with only preemptible claims, unit-wide actions stay allowed.
+    mgr2, _, _ = _mgr()
+    _claim(mgr2, "alice", model="m1", preemptible=True)
+    assert mgr2.blocks_unleased("primary") is None

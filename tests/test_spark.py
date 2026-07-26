@@ -846,3 +846,56 @@ async def test_clocks_for_departed_models_are_forgotten(cfg, monkeypatch):
     await unit.status()
 
     assert set(unit.model_activity) == {"m1"}
+
+
+async def test_launch_timeout_honours_the_recipes_budget(cfg, monkeypatch):
+    """`sparkrun run` pulls (or builds) the Docker image before the container
+    starts; capping it at the NODE default (900 s) timed out recipes whose own
+    budget is larger (gemma declares 3600 s)."""
+    reg = SparkRegistry(cfg.registry_path)
+    reg.upsert(SparkModelEntry(alias="slow", recipe="r-slow", served_name="served-slow",
+                               load_timeout_s=77, mem_fraction=0.4))
+    unit = SparkUnit(Settings(_env_file=None), cfg, reg, JobManager())
+
+    timeouts: dict[str, float] = {}
+
+    async def fake_run_wsl(command, *, login=True, timeout=30.0, settings=None):
+        if "sparkrun run" in command:
+            timeouts["run"] = timeout
+            port = int(command.split("--port ")[1].split()[0])
+            state[port] = "served-slow"
+        if "nvidia-smi" in command:
+            return CmdResult(0, SMI_ROW, "")
+        return CmdResult(0, "ok", "")
+
+    state: dict[int, str] = {}
+    monkeypatch.setattr(spark_mod, "run_wsl", fake_run_wsl)
+    with respx.mock:
+        for port in cfg.slot_ports:
+            def make(p):
+                def responder(request):
+                    nm = state.get(p)
+                    data = [{"id": nm, "root": "", "max_model_len": 0}] if nm else []
+                    return httpx.Response(200, json={"data": data})
+                return responder
+            respx.get(f"http://{cfg.host}:{port}/v1/models").mock(side_effect=make(port))
+
+        job = await wait_job(unit.load(LoadRequest(server="spark", model="slow", lane="spark1")))
+
+    assert job.state == "succeeded", job.error
+    assert timeouts["run"] == 77.0, "the launch must get the recipe budget, not the node default"
+
+
+@respx.mock
+async def test_unload_prunes_the_departed_models_clock(cfg, monkeypatch):
+    """After the LAST model leaves, the status() prune never fires (empty probe),
+    so a stale clock would defeat the reaper's cheap guard forever."""
+    unit = two_model_unit(cfg)
+    state, _ = stateful_node(monkeypatch, cfg, {8000: "served-1", 8001: "served-2"})
+    unit.model_activity = {"m1": time.time(), "m2": time.time()}
+
+    await unit.unload(UnloadRequest(server=None, lane="spark1", model="served-2"))
+    assert set(unit.model_activity) == {"m1"}, "a targeted unload drops just that clock"
+
+    await unit.unload(UnloadRequest(server=None, lane="spark1"))
+    assert unit.model_activity == {}, "freeing the node drops every clock"

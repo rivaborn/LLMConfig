@@ -173,7 +173,7 @@ class SparkBackend:
 
     async def run_recipe(self, recipe: str, tp: int = 1, extra: list[str] | None = None,
                          served: str = "", port: Optional[int] = None,
-                         mem_fraction: float = 0.0):
+                         mem_fraction: float = 0.0, timeout: Optional[float] = None):
         """Launch a workload on this node. Returns the raw CmdResult.
 
         `served` pins `--served-model-name`, so the node reports exactly the name
@@ -196,8 +196,13 @@ class SparkBackend:
             extra=" ".join(args),
             **({"port": int(port)} if port else {}),
         )
-        # Generous timeout: sparkrun pulls the image/weights on a cold node.
-        return await run_wsl(cmd, login=True, timeout=float(self.cfg.load_timeout_s), settings=self.s)
+        # Generous timeout: sparkrun pulls — or on some recipes BUILDS — the
+        # Docker image before the container starts, and the per-recipe budget
+        # knows that cost better than the node default (gemma declares 3600 s,
+        # the node 900): capping at the node default timed real launches out.
+        return await run_wsl(cmd, login=True,
+                             timeout=float(timeout or self.cfg.load_timeout_s),
+                             settings=self.s)
 
     async def stop(self, recipe: Optional[str] = None):
         """Stop workloads on this node.

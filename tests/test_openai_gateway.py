@@ -634,3 +634,26 @@ async def test_spark_does_not_shortcircuit_on_a_different_in_flight_load(monkeyp
     job2, sc2 = gw._ensure_load_job(orch.primary, st2, "load:primary:vllm:x", "vllm", "x",
                                     stream=False)
     assert sc2 is True and job2 is None, "a GPU lane still short-circuits"
+
+
+async def test_cold_load_reroutes_to_the_slot_the_model_landed_on(monkeypatch, tmp_path):
+    """The pre-load backend is always slot 0 — usually some OTHER model's port on
+    a multi-model node. Until the re-route, the forward after a cold load went to
+    slot 0 and the co-resident answered 404 for a model that had just loaded."""
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    unit = _add_spark(orch, tmp_path, Settings(_env_file=None))
+    from llmconfig.openai_gateway import OpenAIGateway
+    gw = OpenAIGateway(orch, jobs, Settings(_env_file=None))
+
+    # After the load, residency says model-b took slot 1.
+    async def status_after_load(gpu=None):
+        return _spark_status(("model-a", 8000), ("model-b", 8001))
+    monkeypatch.setattr(unit, "status", status_after_load)
+
+    reroute = gw._reroute(unit, "spark", "model-b", unit.cfg.api_base)
+    assert await reroute() == f"http://{SPARK_HOST}:8001", \
+        "the post-load forward must go to the slot the load actually took"
+
+    # A model that never became resident keeps the default (cold-load fallback).
+    reroute_missing = gw._reroute(unit, "spark", "model-c", unit.cfg.api_base)
+    assert await reroute_missing() == unit.cfg.api_base

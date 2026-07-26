@@ -347,15 +347,28 @@ class OpenAIGateway:
             await asyncio.sleep(1.0)
         return False, f"load did not finish within {int(timeout)}s"
 
+    def _reroute(self, lane: "Unit", server: str, model: str, default: str):
+        """Late-bound backend resolution for a cold Spark load.
+
+        Which slot a cold load lands on (lowest FREE port wins) is unknowable
+        until the job finishes, so the forward target cannot be computed up
+        front — the pre-load answer is always slot 0, which on a multi-model
+        node is usually some OTHER model's port. Callers await this AFTER the
+        load succeeds, when residency finally says where the model went.
+        """
+        async def _resolve() -> str:
+            return self._route(lane, server, model, await lane.status(), default)
+        return _resolve
+
     async def _stream_load_then_forward(self, job_id: Optional[str], backend: str, sub_path: str,
                                         body: dict, model: str, headers, is_chat: bool,
-                                        lane: Optional[Lane] = None):
+                                        lane: Optional[Lane] = None, reroute=None):
         """Wrapper that marks the lane active when the stream finishes (however it
         ends), so a generation longer than the idle timeout isn't reaped mid-answer
         even when the Monitor's util signal is unavailable."""
         try:
             async for chunk in self._stream_load_then_forward_inner(
-                job_id, backend, sub_path, body, model, headers, is_chat
+                job_id, backend, sub_path, body, model, headers, is_chat, reroute
             ):
                 yield chunk
         finally:
@@ -364,7 +377,7 @@ class OpenAIGateway:
 
     async def _stream_load_then_forward_inner(self, job_id: Optional[str], backend: str,
                                               sub_path: str, body: dict, model: str,
-                                              headers, is_chat: bool):
+                                              headers, is_chat: bool, reroute=None):
         created = int(time.time())
         cid = ("chatcmpl-" if is_chat else "cmpl-") + uuid.uuid4().hex[:12]
         emitted = 0
@@ -389,6 +402,10 @@ class OpenAIGateway:
                     yield b"data: [DONE]\n\n"
                     return
                 await asyncio.sleep(1.5)
+            # The load is done — only now does residency say which slot it took
+            # (see `_reroute`); the `backend` computed before the load is slot 0.
+            if reroute is not None:
+                backend = await reroute()
         # Loaded — relay the upstream completion verbatim (it emits its own [DONE]).
         try:
             async for chunk in self._forward_stream(backend, sub_path, body, headers):
@@ -453,9 +470,12 @@ class OpenAIGateway:
         job, short_circuit = self._ensure_load_job(lane, status, target_kind, server, load_arg, stream)
 
         if stream:
+            reroute = (self._reroute(lane, server, model, backend)
+                       if isinstance(lane, SparkUnit) else None)
             return StreamingResponse(
                 self._stream_load_then_forward(job.id if job else None, backend, sub_path, body,
-                                               model, request.headers, is_chat, lane=lane),
+                                               model, request.headers, is_chat, lane=lane,
+                                               reroute=reroute),
                 media_type="text/event-stream",
             )
 
@@ -481,6 +501,11 @@ class OpenAIGateway:
                 content={"error": {"message": f"failed to load '{model}': {err}",
                                     "type": "server_error", "code": "model_load_failed"}},
             )
+        if isinstance(lane, SparkUnit):
+            # The cold load may have landed on any free slot; the `backend`
+            # computed before it is slot 0. Re-route from fresh residency, or the
+            # forward goes to whichever model already lives there.
+            backend = self._route(lane, server, model, await lane.status(), backend)
         resp = await self.forward(backend, sub_path, body, request.headers)
         lane.touch(model=model)  # generation finished — a long answer shouldn't count as idle time
         return resp
@@ -574,6 +599,10 @@ class OpenAIGateway:
                 content={"error": {"message": f"failed to load '{model}': {err}",
                                     "type": "server_error", "code": "model_load_failed"}},
             )
+        if isinstance(lane, SparkUnit):
+            # Same slot re-route as the chat path — an embedding answered by the
+            # wrong slot's model would not even error, just embed wrongly.
+            backend = self._route(lane, server, model, await lane.status(), backend)
         resp = await self.forward(backend, sub_path, body, request.headers)
         lane.touch(model=model)
         return resp
