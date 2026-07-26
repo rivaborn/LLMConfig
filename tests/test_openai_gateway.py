@@ -657,3 +657,126 @@ async def test_cold_load_reroutes_to_the_slot_the_model_landed_on(monkeypatch, t
     # A model that never became resident keeps the default (cold-load fallback).
     reroute_missing = gw._reroute(unit, "spark", "model-c", unit.cfg.api_base)
     assert await reroute_missing() == unit.cfg.api_base
+
+
+# --------------------------------------------------------------------------- #
+# Auto-placement (no X-LLM-Lane header, or X-LLM-Lane: auto)
+# --------------------------------------------------------------------------- #
+from types import SimpleNamespace                            # noqa: E402
+
+from llmconfig.monitor import Monitor                        # noqa: E402
+from llmconfig.placement import Placer                       # noqa: E402
+
+
+def _auto_build(monkeypatch, tmp_path, *, spark_models=(), **settings_overrides):
+    """The standard _build plus a Spark unit and a wired Placer, so no-header
+    requests genuinely have a CHOICE (two candidates disables the sole-pin).
+
+    The Spark's status is ALWAYS stubbed (default: empty node) — the real
+    SparkUnit.status would probe an unroutable host and spawn real wsl.exe
+    telemetry from inside the placer's sweep, hanging the suite.
+    """
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    s = Settings(_env_file=None, **settings_overrides)
+    unit = _add_spark(orch, tmp_path, s)
+    st = _spark_status(*spark_models)
+
+    async def spark_status(gpu=None):
+        return st
+    monkeypatch.setattr(unit, "status", spark_status)
+    monkeypatch.setattr(unit, "_refresh_gpu_soon", lambda: None)
+
+    leases = app.state.leases
+    monitor = SimpleNamespace(util_for=lambda uuid: None)
+    placer = Placer(s, orch, leases, monitor)
+    # rebuild the gateway with the placer, reusing the captured upstream
+    gateway = OpenAIGateway(orch, jobs, s, leases, placer)
+    gateway._http = httpx.AsyncClient(transport=ASGITransport(app=_upstream_app(captured)))
+    app2 = FastAPI()
+    app2.include_router(build_gateway_router(gateway))
+    app2.state.leases = leases
+    return app2, orch, jobs, world, captured, unit, placer
+
+
+async def test_no_header_places_on_the_resident_spark(monkeypatch, tmp_path):
+    """The feature: a client that names only a model reaches the unit serving it,
+    even though 'primary' never had it — and learns where via X-LLM-Unit."""
+    app, orch, jobs, world, captured, unit, placer = _auto_build(
+        monkeypatch, tmp_path, spark_models=(("model-a", 8000),))
+
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions",
+                         json={"model": "model-a",
+                               "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, r.text
+    assert r.headers.get("x-llm-unit") == "spark1"
+    assert captured and ":8000" in captured[-1], "forwarded to the spark's slot"
+
+
+async def test_auto_sentinel_equals_absent_and_explicit_pin_still_pins(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured, unit, placer = _auto_build(
+        monkeypatch, tmp_path, spark_models=(("model-a", 8000),))
+
+    async with _client(app) as c:
+        r_auto = await c.post("/v1/chat/completions", headers={"X-LLM-Lane": "auto"},
+                              json={"model": "model-a",
+                                    "messages": [{"role": "user", "content": "hi"}]})
+        r_pin = await c.post("/v1/chat/completions", headers={"X-LLM-Lane": "primary"},
+                             json={"model": "model-a",
+                                   "messages": [{"role": "user", "content": "hi"}]})
+    assert r_auto.status_code == 200 and r_auto.headers.get("x-llm-unit") == "spark1"
+    assert r_pin.status_code == 404, "an explicit pin must NOT be second-guessed"
+
+
+async def test_auto_with_valid_lease_pins_to_the_lease_unit(monkeypatch, tmp_path):
+    """A lease is a claim on a unit; auto must not scatter its holder elsewhere."""
+    app, orch, jobs, world, captured, unit, placer = _auto_build(
+        monkeypatch, tmp_path, spark_models=(("model-a", 8000),))
+    lease, _ = app.state.leases.claim(
+        LeaseClaimRequest(unit="spark1", holder="alice", model="a"))
+
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", headers={"X-LLM-Lease": lease.id},
+                         json={"model": "model-a",
+                               "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200 and r.headers.get("x-llm-unit") == "spark1"
+
+
+async def test_auto_not_found_stays_404(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured, unit, placer = _auto_build(monkeypatch, tmp_path)
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions",
+                         json={"model": "no-such-model",
+                               "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 404
+    assert r.json()["error"]["code"] == "model_not_found"
+
+
+async def test_kill_switch_restores_primary_default(monkeypatch, tmp_path):
+    """AUTO_PLACE_ENABLED=false → a no-header request behaves exactly as before:
+    resolved against primary only, so a spark-only model 404s."""
+    app, orch, jobs, world, captured, unit, placer = _auto_build(
+        monkeypatch, tmp_path, auto_place_enabled=False,
+        spark_models=(("model-a", 8000),))
+
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions",
+                         json={"model": "model-a",
+                               "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 404
+
+
+async def test_models_union_under_auto_and_per_lane_with_header(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured, unit, placer = _auto_build(monkeypatch, tmp_path)
+    world.ollama_tags = ["qwen3:4b"]
+
+    async with _client(app) as c:
+        union = (await c.get("/v1/models")).json()
+        pinned = (await c.get("/v1/models", headers={"X-LLM-Lane": "spark1"})).json()
+    union_ids = {m["id"] for m in union["data"]}
+    assert "model-a" in union_ids and "model-b" in union_ids, "spark catalog present"
+    pinned_ids = {m["id"] for m in pinned["data"]}
+    # the spark registry seeds the packaged catalog too; the point is that the
+    # pinned list has ONLY spark entries — nothing from primary's ollama/vllm.
+    assert {"model-a", "model-b"} <= pinned_ids
+    assert "qwen3:4b" not in pinned_ids, "explicit header keeps the per-unit list"

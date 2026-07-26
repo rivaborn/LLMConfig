@@ -165,6 +165,16 @@ class Orchestrator:
                 jobs.append(self.unit(cfg.id).load(req))
         return jobs
 
+    def attach_leases(self, leases) -> None:
+        """Hand every Spark unit the LeaseManager for under-lock victim checks.
+
+        Called from create_app AFTER the LeaseManager exists (it is constructed
+        with the orchestrator, so the reference cannot be a constructor arg).
+        """
+        for u in self.units.values():
+            if hasattr(u, "declared_budgets"):     # duck-typed: only Sparks
+                u.leases = leases
+
     async def aclose(self) -> None:
         """Close every unit's pooled HTTP clients (call on app shutdown)."""
         for u in self.units.values():

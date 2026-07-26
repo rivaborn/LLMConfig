@@ -29,22 +29,28 @@ from .config import Settings
 from .jobs import JobManager
 from .lane import Lane
 from .orchestrator import Orchestrator, Unit
+from .placement import wants_auto
 from .schemas import LoadRequest
 from .spark_unit import SparkUnit
 
 if TYPE_CHECKING:
     from .leases import LeaseManager
+    from .placement import Placer
 
 
 class OpenAIGateway:
     """Holds the long-lived forwarding client + the resolve/load/forward logic."""
 
     def __init__(self, orch: Orchestrator, jobs: JobManager, settings: Settings,
-                 leases: "LeaseManager | None" = None):
+                 leases: "LeaseManager | None" = None,
+                 placer: "Placer | None" = None):
         self.orch = orch
         self.jobs = jobs
         self.s = settings
         self.leases = leases
+        # None (or AUTO_PLACE_ENABLED=false) disables auto-placement: a request
+        # without X-LLM-Lane then falls back to "primary" exactly as before.
+        self.placer = placer
         self._http: httpx.AsyncClient | None = None
 
     # ---- forwarding client (no read timeout: chat generations can run long) ----
@@ -226,8 +232,78 @@ class OpenAIGateway:
             return StreamingResponse(_gen(), media_type="text/event-stream")
         return JSONResponse(status_code=409, content=payload)
 
+    async def _choose(self, request: Request, model: str, *, is_chat: bool,
+                      stream: bool):
+        """Pick the unit for this request. Returns (lane, victims, lease_id) or an
+        error Response. The ONE place auto-placement is wired, shared by the chat
+        and pooling handlers so the two cannot drift.
+
+        Explicit `X-LLM-Lane: <unit>` pins, exactly as before. Absent/empty/`auto`
+        auto-places — unless a valid `X-LLM-Lease` names a unit, in which case the
+        lease IS the placement (a lease is a claim on that unit; scattering its
+        holder elsewhere would defeat it). An invalid lease id does NOT disable
+        auto: place normally, then the lease gate still reports
+        `server_restarted`/`lease_revoked` with the id the client sent.
+
+        Placement is advisory, so a lease landing on the chosen unit between the
+        sweep and the gate yields a refusal — retried ONCE with that unit
+        excluded before giving up (more would oscillate).
+        """
+        header = request.headers.get("x-llm-lane")
+        lease_id = (request.headers.get("x-llm-lease") or "").strip()
+        auto = (self.placer is not None and self.s.auto_place_enabled
+                and wants_auto(header))
+        if not auto:
+            lane = self.lane(header or "primary")
+            reject = self._lease_gate(lane.cfg.id, lease_id, model)
+            if reject is not None:
+                return self._lease_reject(*reject, is_chat=is_chat, stream=stream)
+            return lane, [], lease_id
+
+        if lease_id and self.leases is not None:
+            lease = self.leases.get(lease_id)
+            if lease is not None and lease.state == "active":
+                lane = self.lane(lease.unit)
+                reject = self._lease_gate(lane.cfg.id, lease_id, model)
+                if reject is not None:
+                    return self._lease_reject(*reject, is_chat=is_chat, stream=stream)
+                return lane, [], lease_id
+
+        exclude: frozenset[str] = frozenset()
+        for attempt in range(2):
+            decision = await self.placer.place(model, exclude=exclude)
+            if decision.outcome == "not_found":
+                return JSONResponse(
+                    status_code=404,
+                    content={"error": {"message": f"model '{model}' not found on any unit",
+                                        "type": "invalid_request_error",
+                                        "code": "model_not_found"}},
+                )
+            if decision.outcome == "no_capacity":
+                why = "; ".join(f"{u}: {r}" for u, r in sorted(decision.reasons.items()))
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": {"message": f"no unit can take '{model}' right now — {why}",
+                                        "type": "server_error", "code": "no_capacity",
+                                        "reasons": decision.reasons}},
+                )
+            lane = self.lane(decision.unit_id)
+            reject = self._lease_gate(lane.cfg.id, lease_id, model)
+            if reject is None:
+                return lane, list(decision.victims), lease_id
+            if attempt == 0:
+                exclude = frozenset({decision.unit_id})
+                continue
+            return self._lease_reject(*reject, is_chat=is_chat, stream=stream)
+
+    @staticmethod
+    def _unit_headers(lane: "Unit") -> dict:
+        """`X-LLM-Unit` on every success response — with auto-placement the client
+        no longer knows where its request ran unless we say so."""
+        return {"x-llm-unit": lane.cfg.id}
+
     def _ensure_load_job(self, lane: Lane, status, target_kind: str, server: str,
-                         load_arg: str, stream: bool):
+                         load_arg: str, stream: bool, evict: list[str] | None = None):
         """Return (job_or_None, short_circuit). Coalesces onto an identical in-flight
         load; for a *different* in-flight load, queues ours (stream) or signals a
         short-circuit (non-stream, so title-gen doesn't block for minutes).
@@ -246,7 +322,8 @@ class OpenAIGateway:
                 return None, True     # different model loading + non-stream → bail fast
             # stream, or a Spark (co-residency makes the other load irrelevant):
             # queue ours behind the unit lock (shows "waiting…")
-        job = self.orch.load(LoadRequest(server=server, model=load_arg, lane=lane.cfg.id))
+        job = self.orch.load(LoadRequest(server=server, model=load_arg, lane=lane.cfg.id,
+                                         evict=list(evict or [])))
         return job, False
 
     def _fwd_headers(self, headers) -> dict:
@@ -263,7 +340,8 @@ class OpenAIGateway:
         return backend.rstrip("/") + "/v1" + sub_path
 
     # ---- non-streaming forward ----
-    async def forward(self, backend: str, sub_path: str, body: dict, headers) -> Response:
+    async def forward(self, backend: str, sub_path: str, body: dict, headers,
+                      extra_headers: dict | None = None) -> Response:
         url = self._backend_url(backend, sub_path)
         try:
             resp = await self.client().post(url, json=body, headers=self._fwd_headers(headers))
@@ -273,6 +351,7 @@ class OpenAIGateway:
             content=resp.content,
             status_code=resp.status_code,
             media_type=resp.headers.get("content-type", "application/json"),
+            headers=extra_headers or None,
         )
 
     # ---- streaming forward (raw passthrough, incl. upstream's `data: [DONE]`) ----
@@ -419,7 +498,6 @@ class OpenAIGateway:
     # Request handler (shared by chat/completions and completions)
     # ------------------------------------------------------------------ #
     async def handle_completion(self, request: Request, sub_path: str, is_chat: bool):
-        lane = self.lane(request.headers.get("x-llm-lane") or "primary")
         try:
             body = await request.json()
         except Exception:
@@ -429,14 +507,13 @@ class OpenAIGateway:
         model = body.get("model") or ""
         stream = bool(body.get("stream"))
 
-        # Admission BEFORE resolve() and before the first lane.touch(): the decision
-        # shouldn't depend on model resolution, and a refused request must not extend
-        # the lane's idle window (it never reached a backend).
-        reject = self._lease_gate(lane.cfg.id,
-                                  (request.headers.get("x-llm-lease") or "").strip(),
-                                  model)
-        if reject is not None:
-            return self._lease_reject(*reject, is_chat=is_chat, stream=stream)
+        # Admission + placement BEFORE resolve() and before the first lane.touch():
+        # the decision shouldn't depend on model resolution, and a refused request
+        # must not extend anyone's idle window (it never reached a backend).
+        chosen = await self._choose(request, model, is_chat=is_chat, stream=stream)
+        if isinstance(chosen, Response):
+            return chosen
+        lane, victims, _lease_id = chosen
 
         resolved = await self.resolve(lane, model)
         if resolved is None:
@@ -460,14 +537,17 @@ class OpenAIGateway:
                     self._stream_load_then_forward(None, backend, sub_path, body, model,
                                                    request.headers, is_chat, lane=lane),
                     media_type="text/event-stream",
+                    headers=self._unit_headers(lane),
                 )
-            resp = await self.forward(backend, sub_path, body, request.headers)
+            resp = await self.forward(backend, sub_path, body, request.headers,
+                                      extra_headers=self._unit_headers(lane))
             lane.touch(model=model)  # generation finished — a long answer shouldn't count as idle time
             return resp
 
         # Need to load (cold / wrong model). Coalesce onto an identical in-flight load.
         target_kind = f"load:{lane.cfg.id}:{server}:{load_arg}"
-        job, short_circuit = self._ensure_load_job(lane, status, target_kind, server, load_arg, stream)
+        job, short_circuit = self._ensure_load_job(lane, status, target_kind, server, load_arg,
+                                                   stream, evict=victims)
 
         if stream:
             reroute = (self._reroute(lane, server, model, backend)
@@ -477,6 +557,7 @@ class OpenAIGateway:
                                                model, request.headers, is_chat, lane=lane,
                                                reroute=reroute),
                 media_type="text/event-stream",
+                headers=self._unit_headers(lane),
             )
 
         # Non-stream: a different model is mid-load → return an empty 200 (don't hang).
@@ -496,6 +577,10 @@ class OpenAIGateway:
             timeout = 600.0
         ok, err = await self._wait_job(job.id, timeout)
         if not ok:
+            retry = await self._retry_elsewhere(request, model, err, lane,
+                                                sub_path, body, is_chat=is_chat)
+            if retry is not None:
+                return retry
             return JSONResponse(
                 status_code=503,
                 content={"error": {"message": f"failed to load '{model}': {err}",
@@ -506,8 +591,57 @@ class OpenAIGateway:
             # computed before it is slot 0. Re-route from fresh residency, or the
             # forward goes to whichever model already lives there.
             backend = self._route(lane, server, model, await lane.status(), backend)
-        resp = await self.forward(backend, sub_path, body, request.headers)
+        resp = await self.forward(backend, sub_path, body, request.headers,
+                                  extra_headers=self._unit_headers(lane))
         lane.touch(model=model)  # generation finished — a long answer shouldn't count as idle time
+        return resp
+
+    # Error substrings that mean "the WORLD moved, not the model is broken":
+    # a placement victim failed re-validation, or admission lost a budget race.
+    _CONFLICT_MARKERS = ("placement_conflict:", "already committed to", "actually free")
+
+    async def _retry_elsewhere(self, request: Request, model: str, err: str,
+                               failed_lane: "Unit", sub_path: str, body: dict,
+                               *, is_chat: bool):
+        """One re-place on another unit after a conflict-class load failure.
+
+        Only for AUTO requests (an explicit pin means the client chose), only for
+        non-stream (a stream has already sent bytes), and only ONCE — the
+        excluded-unit re-place either lands or the caller 503s with the original
+        error. Returns a Response or None (= fall through to the 503)."""
+        if self.placer is None or not self.s.auto_place_enabled:
+            return None
+        if not wants_auto(request.headers.get("x-llm-lane")):
+            return None
+        if not any(m in (err or "") for m in self._CONFLICT_MARKERS):
+            return None
+        decision = await self.placer.place(model, exclude=frozenset({failed_lane.cfg.id}))
+        if decision.outcome not in ("place", "pin"):
+            return None
+        lane = self.lane(decision.unit_id)
+        status = await lane.status()
+        server, load_arg = decision.server, decision.load_arg
+        backend = self._route(lane, server, model, status,
+                              lane.cfg.api_base if isinstance(lane, SparkUnit)
+                              else (lane.cfg.vllm_relay_url if server == "vllm"
+                                    else lane.cfg.ollama_url))
+        lane.touch(model=model)
+        if not any(m.server == server and m.model == model for m in status.loaded_models):
+            target_kind = f"load:{lane.cfg.id}:{server}:{load_arg}"
+            job, short = self._ensure_load_job(lane, status, target_kind, server, load_arg,
+                                               stream=False, evict=decision.victims)
+            if short or job is None:
+                return None
+            entry = lane.registry.get(load_arg)
+            timeout = float(getattr(entry, "load_timeout_s", 0) or lane.cfg.load_timeout_s
+                            if isinstance(lane, SparkUnit) else 600.0) + 60.0
+            ok, _err2 = await self._wait_job(job.id, timeout)
+            if not ok:
+                return None
+            backend = self._route(lane, server, model, await lane.status(), backend)
+        resp = await self.forward(backend, sub_path, body, request.headers,
+                                  extra_headers=self._unit_headers(lane))
+        lane.touch(model=model)
         return resp
 
     async def handle_pooling(self, request: Request, sub_path: str):
@@ -525,7 +659,6 @@ class OpenAIGateway:
           store is silent data corruption, and an empty rerank silently reorders
           nothing. Every not-ready case here is an explicit 503 instead.
         """
-        lane = self.lane(request.headers.get("x-llm-lane") or "primary")
         try:
             body = await request.json()
         except Exception:
@@ -534,14 +667,12 @@ class OpenAIGateway:
             raise HTTPException(status_code=400, detail="request body must be a JSON object")
         model = body.get("model") or ""
 
-        # Same ordering as the chat path: admission before resolve() and before the
-        # first touch(), so a refusal neither depends on resolution nor extends the
-        # lane's idle window. `stream` is always False — see the docstring.
-        reject = self._lease_gate(lane.cfg.id,
-                                  (request.headers.get("x-llm-lease") or "").strip(),
-                                  model)
-        if reject is not None:
-            return self._lease_reject(*reject, is_chat=False, stream=False)
+        # Same ordering as the chat path: admission + placement before resolve()
+        # and before the first touch(). `stream` is always False — see docstring.
+        chosen = await self._choose(request, model, is_chat=False, stream=False)
+        if isinstance(chosen, Response):
+            return chosen
+        lane, victims, _lease_id = chosen
 
         resolved = await self.resolve(lane, model)
         if resolved is None:
@@ -567,13 +698,14 @@ class OpenAIGateway:
         status = await lane.status()
         backend = self._route(lane, server, model, status, backend)
         if any(m.server == server and m.model == model for m in status.loaded_models):
-            resp = await self.forward(backend, sub_path, body, request.headers)
+            resp = await self.forward(backend, sub_path, body, request.headers,
+                                      extra_headers=self._unit_headers(lane))
             lane.touch(model=model)
             return resp
 
         target_kind = f"load:{lane.cfg.id}:{server}:{load_arg}"
         job, short_circuit = self._ensure_load_job(lane, status, target_kind, server, load_arg,
-                                                   stream=False)
+                                                   stream=False, evict=victims)
         if short_circuit or job is None:
             # A *different* model is mid-load. Never answer with an empty vector.
             return JSONResponse(
@@ -594,6 +726,10 @@ class OpenAIGateway:
             timeout = 600.0
         ok, err = await self._wait_job(job.id, timeout)
         if not ok:
+            retry = await self._retry_elsewhere(request, model, err, lane,
+                                                sub_path, body, is_chat=False)
+            if retry is not None:
+                return retry
             return JSONResponse(
                 status_code=503,
                 content={"error": {"message": f"failed to load '{model}': {err}",
@@ -603,27 +739,37 @@ class OpenAIGateway:
             # Same slot re-route as the chat path — an embedding answered by the
             # wrong slot's model would not even error, just embed wrongly.
             backend = self._route(lane, server, model, await lane.status(), backend)
-        resp = await self.forward(backend, sub_path, body, request.headers)
+        resp = await self.forward(backend, sub_path, body, request.headers,
+                                  extra_headers=self._unit_headers(lane))
         lane.touch(model=model)
         return resp
 
     async def models(self, request: Request) -> dict:
-        lane = self.lane(request.headers.get("x-llm-lane") or "primary")
+        header = request.headers.get("x-llm-lane")
+        # With auto-placement, the natural catalog for a client that names no unit
+        # is the UNION across the fleet — one entry per id, first unit's label
+        # (auto-routing makes any one entry correct). An explicit header keeps the
+        # per-unit list (opencode's providers depend on it).
+        if self.placer is not None and self.s.auto_place_enabled and wants_auto(header):
+            lanes = [u for u in self.orch.units.values() if u.cfg.enabled]
+        else:
+            lanes = [self.lane(header or "primary")]
         # Track the backend each id came from (the gateway's own source of truth), so
         # the display `name` is tagged from that — not guessed from the id convention.
         tagged: list[tuple[str, str]] = []  # (id, backend label)
-        if isinstance(lane, SparkUnit):
-            for se in lane.registry.entries():
-                tagged.append((se.served_name or se.alias, f"Spark {lane.cfg.name}"))
-        else:
-            for e in lane.registry.entries():
-                tagged.append((e.served_name or e.alias, "vLLM"))
-            try:
-                for m in await lane.ollama.list_models():
-                    if m.name:
-                        tagged.append((m.name, "Ollama"))
-            except Exception:
-                pass
+        for lane in lanes:
+            if isinstance(lane, SparkUnit):
+                for se in lane.registry.entries():
+                    tagged.append((se.served_name or se.alias, f"Spark {lane.cfg.name}"))
+            else:
+                for e in lane.registry.entries():
+                    tagged.append((e.served_name or e.alias, "vLLM"))
+                try:
+                    for m in await lane.ollama.list_models():
+                        if m.name:
+                            tagged.append((m.name, "Ollama"))
+                except Exception:
+                    pass
         seen: set[str] = set()
         data = []
         for mid, label in tagged:

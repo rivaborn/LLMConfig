@@ -132,7 +132,9 @@ def gpu(lane: str = typer.Option("primary", "--lane", help="primary (3090) | com
 def load(
     server: str = typer.Argument(..., help="ollama | vllm"),
     model: str = typer.Argument(..., help="Ollama tag or vLLM serve.sh alias"),
-    lane: str = typer.Option("primary", "--lane", help="primary (3090) | companion (3070 Ti)"),
+    lane: str = typer.Option("primary", "--lane",
+                             help="primary (3090) | companion (3070 Ti) | spark1..4 | "
+                                  "auto (LLMConfig picks the unit)"),
     force: bool = typer.Option(False, "--force", help="reload even if already active"),
     max_pack: bool = typer.Option(False, "--max-pack", help="fill VRAM (num_gpu) before spilling (Ollama)"),
 ) -> None:
@@ -154,7 +156,7 @@ def load(
 @app.command()
 def unload(
     server: Optional[str] = typer.Option(None, "--server", help="ollama | vllm (default: whatever holds the GPU)"),
-    lane: str = typer.Option("primary", "--lane", help="primary (3090) | companion (3070 Ti)"),
+    lane: str = typer.Option("primary", "--lane", help="primary (3090) | companion (3070 Ti) | spark1..4"),
     model: Optional[str] = typer.Option(None, "--model",
                                         help="free just this model, leaving co-residents "
                                              "running (Spark nodes hold several)"),

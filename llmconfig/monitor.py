@@ -331,6 +331,17 @@ class Monitor:
                 return p[0]
         return None
 
+    def util_for(self, uuid: str) -> float | None:
+        """Latest compute-utilization sample for one GPU, or None when unmonitored.
+
+        The placement engine's load signal (and main.py's usage stamping). Reads
+        the newest point directly instead of building a full snapshot() dict.
+        """
+        t = self._gpus.get(uuid)
+        if t is None or not t.points:
+            return None
+        return t.points[-1][5]
+
     def snapshot(self) -> dict:
         """Latest reading per GPU + rolling aggregates + Ollama split."""
         now = time.time()

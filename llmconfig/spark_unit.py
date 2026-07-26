@@ -42,6 +42,10 @@ class SparkUnit:
         self.cfg = cfg
         self.registry = registry
         self.jobs = jobs
+        # Set by Orchestrator.attach_leases() once the LeaseManager exists (it is
+        # built after the units). Used ONLY for the sync under-lock re-validation
+        # of placement-chosen eviction victims; None skips that check.
+        self.leases = None
         self.spark = SparkBackend(settings, cfg, registry)
         self._lock = asyncio.Lock()
         self._active_job_id: Optional[str] = None
@@ -253,6 +257,14 @@ class SparkUnit:
         slots = await self.spark.served_slots()          # {port: ServedModel}
         resident = {sm.name: port for port, sm in slots.items() if sm.name}
 
+        # Placement-chosen victims: displace them BEFORE admission, each re-validated
+        # here under the unit lock — the placer's facts were a snapshot, and a victim
+        # may have been used, leased, or unloaded since. A failed re-validation
+        # raises `placement_conflict:` so the gateway can re-place instead of
+        # reporting the model itself as broken.
+        for victim in dict.fromkeys(req.evict or []):
+            await self._evict_victim(job, victim, slots, resident)
+
         # Fast path: already serving what was asked for, on whichever slot.
         if not req.force and target in resident:
             self.jobs.log(
@@ -384,6 +396,49 @@ class SparkUnit:
             port=port,
         ).model_dump()
 
+    async def _evict_victim(self, job: Job, victim: str, slots: dict,
+                            resident: dict) -> None:
+        """Stop one placement-chosen co-tenant, re-validated under the lock.
+
+        Sync checks between validation and the stop (invariant 11 style): still
+        resident, no live lease (any lease shields, matching the idle reaper's
+        convention), and per-model idle beyond the active window. `slots` and
+        `resident` are mutated so the admission sum that follows sees the node
+        as it will be, not as it was.
+        """
+        entry = self.registry.get(victim) or self.registry.find_by_served_name(victim)
+        if entry is None:
+            raise RuntimeError(f"placement_conflict: unknown eviction victim '{victim}'")
+        served = entry.served_name or entry.alias
+        if served not in resident:
+            return  # already gone — someone else freed it; nothing to do
+        if self.leases is not None and self.leases.active_for(self.cfg.id, entry.alias) is not None:
+            raise RuntimeError(
+                f"placement_conflict: '{victim}' gained a lease since placement"
+            )
+        if self.idle_for(entry.alias) <= self.s.usage_active_window_s:
+            raise RuntimeError(
+                f"placement_conflict: '{victim}' became active since placement"
+            )
+        port = resident[served]
+        self.jobs.log(job, f"stopping idle {served} on port {port} to make room…")
+        await self.spark.stop(recipe=entry.recipe or entry.alias)
+        resident.pop(served, None)
+        slots.pop(port, None)
+        self.model_activity.pop(entry.alias, None)
+
+    def declared_budgets(self, names) -> dict[str, float]:
+        """Served-name → declared `mem_fraction` for each named model (0.0 = unset,
+        i.e. a whole-node claim). Pure sync registry access — shared by `_admit`
+        and the auto-placer, so the two can never disagree on the arithmetic."""
+        out: dict[str, float] = {}
+        for name in names:
+            if not name:
+                continue
+            e = self.registry.find_by_served_name(name)
+            out[name] = e.mem_fraction if e else 0.0
+        return out
+
     def _free_slot(self, slots: dict) -> Optional[int]:
         """Lowest unoccupied slot port, or None when the node is full."""
         return next((p for p in self.cfg.slot_ports if p not in slots), None)
@@ -408,13 +463,10 @@ class SparkUnit:
            An unreachable probe degrades to the declared-only check.
         """
         want = entry.mem_fraction
-        by_name = {sm.name: sm for sm in slots.values() if sm.name}
-        if not by_name:
+        names = [sm.name for sm in slots.values() if sm.name]
+        if not names:
             return
-        budgets = {}
-        for name in by_name:
-            e = self.registry.find_by_served_name(name)
-            budgets[name] = e.mem_fraction if e else 0.0
+        budgets = self.declared_budgets(names)
 
         unbudgeted = [n for n, f in budgets.items() if not f]
         if unbudgeted or not want:

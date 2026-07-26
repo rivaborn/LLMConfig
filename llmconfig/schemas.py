@@ -311,6 +311,12 @@ class LoadRequest(BaseModel):
     force: bool = False        # reload even if already the active model
     max_pack: bool = False     # push num_gpu to fill VRAM before spilling (Ollama)
     keep_alive: int = -1       # Ollama keep_alive; -1 = pin until swapped
+    # Spark co-tenants the auto-placer chose to displace so this load fits
+    # (canonical aliases). The unit RE-VALIDATES each under its own lock — still
+    # resident, unleased, idle — and refuses with `placement_conflict:` if the
+    # world moved; placement is advisory, the unit is the gate. Lanes ignore it
+    # (their load path evicts inherently).
+    evict: list[str] = Field(default_factory=list)
 
 
 class UnloadRequest(BaseModel):

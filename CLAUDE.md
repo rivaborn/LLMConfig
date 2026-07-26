@@ -161,9 +161,11 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    (that would cross-kill the other lane's vLLM when both GPUs serve). Keep it scoped.
 3. **The eviction-wait gate is the contract.** Any new load path must evict + confirm
    VRAM freed (`_wait_vram_free`) before loading. Don't add a load that skips it.
-   Likewise the idle reaper (`idle.py`) unloads **only** through `Lane.unload` (lane
-   lock + eviction-wait) — never give it (or any future policy) a private unload path,
-   and only release the WSL keepalive when no lane serves vLLM and no lane lock is held.
+   Likewise any policy that unloads (the idle reaper, the lease sweeper, placement
+   eviction) goes **only** through `Unit.unload` or the unit's OWN load path under its
+   own lock (`SparkUnit._load` stops a reload target, a tp>1 sweep, and placement
+   victims there — each re-validated under the lock) — never a private unload path.
+   Only release the WSL keepalive when no lane serves vLLM and no lane lock is held.
 4. **Hold WSL open around vLLM.** WSL2 idle-shuts-down the whole distro ~seconds after
    the last `wsl.exe` exits, killing a just-loaded vLLM model *and* the relay — even
    with lingering. A vLLM load calls `keepalive.ensure()`; the app releases it on
@@ -227,6 +229,18 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    `_load_vllm` always launches via `vllm@<alias>` → `serve.sh <alias>`, whose hardcoded
    `case` sets the args. A user-added model = add a `case` to `deploy/serve.sh` **and**
    add the alias row. If you wire up `managed_by: registry`, update `lane.py` + doctor.
+15. **Auto-placement is advisory; the gates are elsewhere.** A `/v1` request without
+   `X-LLM-Lane` (or with `X-LLM-Lane: auto`) lets `placement.py` pick the unit:
+   resident first, then free capacity, then eviction of idle+unleased models — but
+   the ranking runs on a snapshot, so nothing may TRUST it. Admission (`_admit`),
+   the unit lock, the lease gate, and the under-lock re-validation of eviction
+   victims (`_evict_victim`, refusing with `placement_conflict:`) are the real
+   gates; the gateway answers a conflict with ONE re-place, never a loop. A model
+   resolving on exactly one unit bypasses ranking entirely (sole-candidate pin), so
+   a single-unit deployment behaves exactly as an explicit header would.
+   `AUTO_PLACE_ENABLED=false` restores the implicit-primary default byte-for-byte.
+   The id `auto` is reserved and can never name a unit.
+
 14. **A Spark load is admitted by summed `mem_fraction`, and there is nothing
    else.** A lane can watch `nvidia-smi` drain before it loads; a Spark has no
    equivalent — memory comes back only when a container stops, and vLLM

@@ -950,3 +950,71 @@ async def test_serve_status_and_real_log_come_from_inside_the_container(cfg, cal
     assert await b.serve_status(8001) == "alive"
     calls.plan["base64 -d"] = CmdResult(0, "", "")
     assert await b.serve_status(8001) == "unknown", "no matching container = unknown, never dead"
+
+
+# --------------------------------------------------------------------------- #
+# Placement-driven eviction (LoadRequest.evict) — re-validated under the lock
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_evict_stops_the_victim_then_loads(cfg, monkeypatch):
+    unit = two_model_unit(cfg, f1=0.5, f2=0.5)
+    state, calls = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+    unit.model_activity = {"m1": time.time() - 999}      # victim is idle
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2",
+                                               lane="spark1", evict=["m1"])))
+
+    assert job.state == "succeeded", job.error
+    assert "served-1" not in state.values(), "the victim was stopped"
+    assert "served-2" in state.values(), "the target loaded"
+    assert any("to make room" in l for l in job.log)
+
+
+@respx.mock
+async def test_evict_refuses_a_victim_that_became_active(cfg, monkeypatch):
+    """Placement ran on a snapshot; the victim got traffic since. The unit is
+    the gate: refuse with placement_conflict so the gateway re-places."""
+    unit = two_model_unit(cfg, f1=0.5, f2=0.5)
+    state, _ = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+    unit.touch(model="m1")                               # active NOW
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2",
+                                               lane="spark1", evict=["m1"])))
+
+    assert job.state == "failed"
+    assert "placement_conflict" in (job.error or "")
+    assert state == {8000: "served-1"}, "the active victim survives untouched"
+
+
+@respx.mock
+async def test_evict_refuses_a_victim_that_gained_a_lease(cfg, monkeypatch):
+    unit = two_model_unit(cfg, f1=0.5, f2=0.5)
+    state, _ = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+    unit.model_activity = {"m1": time.time() - 999}
+    orch = SimpleNamespace(units={"spark1": unit})
+    unit.leases = LeaseManager(Settings(_env_file=None), orch)
+    unit.leases.claim(LeaseClaimRequest(unit="spark1", holder="alice", model="m1"))
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2",
+                                               lane="spark1", evict=["m1"])))
+
+    assert job.state == "failed" and "gained a lease" in (job.error or "")
+    assert state == {8000: "served-1"}
+
+
+@respx.mock
+async def test_evict_of_an_already_gone_victim_is_a_noop(cfg, monkeypatch):
+    unit = two_model_unit(cfg, f1=0.5, f2=0.5)
+    state, calls = stateful_node(monkeypatch, cfg, {})    # victim already gone
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2",
+                                               lane="spark1", evict=["m1"])))
+
+    assert job.state == "succeeded", job.error
+    assert not any("sparkrun stop" in c for c in calls), "nothing to stop"
+
+
+def test_declared_budgets_matches_admit_arithmetic(cfg):
+    unit = two_model_unit(cfg, f1=0.4, f2=0.18)
+    b = unit.declared_budgets(["served-1", "served-2", "stranger"])
+    assert b == {"served-1": 0.4, "served-2": 0.18, "stranger": 0.0},         "unknown residents read as whole-node claims, exactly as _admit treats them"

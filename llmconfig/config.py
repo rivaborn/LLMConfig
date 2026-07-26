@@ -115,6 +115,8 @@ def _parse_spark_nodes(spec: str) -> list[tuple[str, str, str]]:
         parts = [p.strip() for p in chunk.split("=")]
         if len(parts) < 2 or not parts[0] or not parts[1]:
             continue
+        if parts[0].lower() == "auto":
+            continue  # reserved: the gateway's auto-placement sentinel, never a unit id
         node_id, host = parts[0], parts[1]
         name = parts[2] if len(parts) > 2 and parts[2] else node_id
         nodes.append((node_id, host, name))
@@ -186,6 +188,14 @@ class Settings(BaseSettings):
     # if each declares a `mem_fraction`. Each slot costs one HTTP probe per status
     # poll (they run concurrently), so this is the knob that trades poll cost for
     # capacity.
+    # --- auto-placement (the /v1 gateway picks the unit when none is named) ---
+    # Kill switch: off restores the pre-placement behavior byte-for-byte (a request
+    # without X-LLM-Lane lands on "primary").
+    auto_place_enabled: bool = True
+    # TTL on the placer's unit-status sweep; staleness only mis-ranks (admission,
+    # the lane lock, and the lease gate are the real gates).
+    placement_cache_ttl_s: float = 2.0
+
     spark_max_models: int = 4
     # Total share of a node's pool that may be committed at once. Loads are refused
     # when the sum of resident `mem_fraction` plus the incoming model exceeds this.

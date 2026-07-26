@@ -151,3 +151,16 @@ async def test_monitor_persists_across_restart(tmp_path, monkeypatch):
     assert snap["ollama"]["spilled"] is True and snap["ollama"]["cpu_pct"] == 12.0
     assert len(m2._gpus[G3090].points) == 1
     await m2.stop()
+
+
+def test_util_for_latest_sample_and_unknown_uuid():
+    """util_for: the placement engine's load signal — newest util or None."""
+    from llmconfig.monitor import GpuTrack, Monitor
+    m = Monitor.__new__(Monitor)          # no sampler loop needed
+    m._gpus = {}
+    assert m.util_for("GPU-x") is None
+    t = GpuTrack(index=0, uuid="GPU-x", name="x", mem_total_mb=1)
+    t.points.append((1.0, None, None, None, None, 42.0, 0, 0))
+    m._gpus = {"GPU-x": t}
+    assert m.util_for("GPU-x") == 42.0
+    assert m.util_for("GPU-y") is None

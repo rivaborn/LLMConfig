@@ -23,6 +23,7 @@ from .leases import LeaseConflict, LeaseError, LeaseManager, LeaseNotActive, Lea
 from .monitor import Monitor
 from .openai_gateway import OpenAIGateway, build_gateway_router
 from .orchestrator import Orchestrator
+from .placement import Placer
 from .registry import make_registry
 from .schemas import (
     GpuOut,
@@ -55,8 +56,10 @@ def create_app() -> FastAPI:
     jobs = JobManager()
     orch = Orchestrator(settings, registry, jobs)
     leases = LeaseManager(settings, orch)
-    gateway = OpenAIGateway(orch, jobs, settings, leases)
+    orch.attach_leases(leases)   # Spark units re-validate eviction victims under their lock
     monitor = Monitor(settings, orch)
+    placer = Placer(settings, orch, leases, monitor)
+    gateway = OpenAIGateway(orch, jobs, settings, leases, placer)
     reaper = IdleReaper(settings, orch, monitor, leases)
     sweeper = LeaseSweeper(settings, orch, leases)
 
@@ -88,6 +91,7 @@ def create_app() -> FastAPI:
     app.state.reaper = reaper
     app.state.leases = leases
     app.state.sweeper = sweeper
+    app.state.placer = placer
 
     async def require_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         if settings.auth_enabled and x_api_key != settings.llmconfig_api_key:
@@ -101,17 +105,10 @@ def create_app() -> FastAPI:
         except KeyError as e:
             raise HTTPException(status_code=400, detail=str(e))
 
-    def _current_util(uuid: str) -> Optional[float]:
-        """The Monitor's latest utilization sample for one GPU (None when unmonitored)."""
-        for g in monitor.snapshot().get("gpus", []):
-            if g.get("uuid") == uuid:
-                return g.get("util_pct")
-        return None
-
     async def _status_with_usage() -> StatusResponse:
         resp = await orch.status()
         for ls in resp.lanes:
-            ls.usage = classify_usage(ls, _current_util(orch.lane(ls.id).cfg.gpu_uuid), settings)
+            ls.usage = classify_usage(ls, monitor.util_for(orch.lane(ls.id).cfg.gpu_uuid), settings)
             # Additive — `usage` keeps its three values because off-box consumers
             # switch on it; the lease is reported alongside, never as a 4th state.
             ls.lease = leases.brief(ls.id)  # sync, no await
@@ -288,6 +285,21 @@ def create_app() -> FastAPI:
     @app.post("/api/load", response_model=Job, dependencies=write)
     async def api_load(req: LoadRequest,
                        x_llm_lease: Optional[str] = Header(default=None)) -> Job:
+        if req.lane.strip().lower() == "auto":
+            # The REST caller already names a server kind, so it constrains the
+            # candidate set; placement then rewrites `lane` to the chosen unit and
+            # the normal checks below run against it.
+            decision = await placer.place(req.model, server=req.server)
+            if decision.outcome == "not_found":
+                raise HTTPException(status_code=404,
+                                    detail=f"model '{req.model}' not found on any unit")
+            if decision.outcome == "no_capacity":
+                why = "; ".join(f"{u}: {r}" for u, r in sorted(decision.reasons.items()))
+                raise HTTPException(status_code=503,
+                                    detail=f"no unit can take '{req.model}' — {why}")
+            req.lane = decision.unit_id
+            req.model = decision.load_arg
+            req.evict = decision.victims
         unit = _lane(req.lane)
         # Catch the kind mismatch here — otherwise server="spark" on a GPU lane
         # falls into the vLLM path and fails with a misleading "unknown alias".
@@ -301,6 +313,9 @@ def create_app() -> FastAPI:
     @app.post("/api/unload", response_model=StatusResponse, dependencies=write)
     async def api_unload(req: UnloadRequest,
                          x_llm_lease: Optional[str] = Header(default=None)) -> StatusResponse:
+        if req.lane.strip().lower() == "auto":
+            raise HTTPException(status_code=400,
+                                detail="unload needs a concrete unit — 'auto' only places loads")
         _lane(req.lane)
         # `req.model` frees one model and leaves co-residents running; without it the
         # whole unit is freed, which is what the UI's unit-level Unload still means.
@@ -467,7 +482,7 @@ def create_app() -> FastAPI:
             # Only the claimed unit — a full _status_with_usage() would probe every
             # unit (local nvidia-smi + each Spark) just to inspect this one.
             st = await orch.unit(lease.unit).status()
-            usage = classify_usage(st, _current_util(orch.unit(lease.unit).cfg.gpu_uuid), settings)
+            usage = classify_usage(st, monitor.util_for(orch.unit(lease.unit).cfg.gpu_uuid), settings)
             if st.swap_in_progress or usage == "active":
                 busy = {
                     "active_job_id": st.active_job_id,
