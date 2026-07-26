@@ -340,7 +340,12 @@ async def test_launch_command_matches_verified_sparkrun_flags(cfg, calls):
     assert "--served-model-name served-1" in run, "pin the served name to the catalog"
 
     stop = next(c for c in calls if "sparkrun stop" in c)
-    assert "--all" in stop, "sparkrun stop errors without a TARGET or --all"
+    # sparkrun stop still errors without a TARGET or --all -- that invariant is
+    # unchanged. What changed is HOW it is satisfied: reloading a resident model
+    # now names the recipe as the TARGET so co-residents survive, where it used to
+    # sweep the node with --all.
+    assert ("--all" in stop) or ("sparkrun stop recipe-1" in stop),         "sparkrun stop errors without a TARGET or --all"
+    assert "sparkrun stop recipe-1" in stop, "reload must target its own recipe, not --all"
 
 
 def test_seeded_recipes_are_namespaced():
@@ -542,3 +547,180 @@ def test_slot_ports_follow_max_models(tmp_path):
     assert c.slot_ports == (8000, 8001, 8002)
     assert c.api_base_for(8002) == f"http://{HOST}:8002"
     assert c.api_base == f"http://{HOST}:8000"  # slot 0, unchanged for old callers
+
+
+# --------------------------------------------------------------------------- #
+# Multi-model lifecycle: co-residency, slot allocation, admission control
+# --------------------------------------------------------------------------- #
+class NodeState(dict):
+    """{port: served_name} for a fake node, mutated by the fake sparkrun.
+
+    Static routes are not enough for load tests: the slot must be EMPTY until the
+    launch happens, otherwise the unit short-circuits on "already serving" and
+    never runs the command under test.
+    """
+
+
+def stateful_node(monkeypatch, cfg, initial: dict[int, str] | None = None):
+    """Wire respx + a fake `sparkrun` that actually mutates node state.
+
+    Returns (state, calls). `sparkrun run --port P --served-model-name N` fills
+    slot P; `sparkrun stop <recipe>` empties whichever slot that recipe fills;
+    `sparkrun stop --all` empties everything.
+    """
+    state = NodeState(initial or {})
+    calls: list[str] = []
+    recipe_to_served = {
+        (e.recipe or e.alias): (e.served_name or e.alias)
+        for e in SparkRegistry(cfg.registry_path).entries()
+    }
+
+    async def fake_run_wsl(command, *, login=True, timeout=30.0, settings=None):
+        calls.append(command)
+        if "nvidia-smi" in command:
+            return CmdResult(0, SMI_ROW, "")
+        if "sparkrun run" in command:
+            port = int(command.split("--port ")[1].split()[0])
+            served = command.split("--served-model-name ")[1].split()[0]
+            state[port] = served
+        elif "sparkrun stop" in command:
+            if "--all" in command:
+                state.clear()
+            else:
+                target = command.split("sparkrun stop ")[1].split()[0]
+                served = recipe_to_served.get(target, target)
+                for prt, nm in list(state.items()):
+                    if nm == served:
+                        del state[prt]
+        return CmdResult(0, "ok", "")
+
+    monkeypatch.setattr(spark_mod, "run_wsl", fake_run_wsl)
+
+    for port in cfg.slot_ports:
+        def make(p):
+            def responder(request):
+                nm = state.get(p)
+                data = [{"id": nm, "root": "", "max_model_len": 0}] if nm else []
+                return httpx.Response(200, json={"data": data})
+            return responder
+        respx.get(f"http://{cfg.host}:{port}/v1/models").mock(side_effect=make(port))
+
+    return state, calls
+
+
+def two_model_unit(cfg, f1=0.4, f2=0.4) -> SparkUnit:
+    reg = SparkRegistry(cfg.registry_path)
+    reg.upsert(SparkModelEntry(alias="m1", recipe="recipe-1", served_name="served-1",
+                               load_timeout_s=5, mem_fraction=f1))
+    reg.upsert(SparkModelEntry(alias="m2", recipe="recipe-2", served_name="served-2",
+                               load_timeout_s=5, mem_fraction=f2))
+    return SparkUnit(Settings(_env_file=None), cfg, reg, JobManager())
+
+
+@respx.mock
+async def test_loading_a_second_model_does_not_stop_the_first(cfg, monkeypatch):
+    """The core of the change. Previously every load began `sparkrun stop --all`,
+    so loading B tore down A."""
+    unit = two_model_unit(cfg)
+    state, calls = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2", lane="spark1")))
+
+    assert job.state == "succeeded", job.error
+    assert not any("--all" in c for c in calls),         "loading a co-resident model must never sweep the node"
+    assert state == {8000: "served-1", 8001: "served-2"}, "A must survive B's load"
+    run = next(c for c in calls if "sparkrun run" in c)
+    assert "--port 8001" in run, "must land on the first FREE slot, not slot 0"
+    assert "--gpu-mem 0.4" in run, "declared budget must reach sparkrun"
+
+
+@respx.mock
+async def test_second_model_is_refused_when_the_budget_will_not_fit(cfg, monkeypatch):
+    """Admission control is the only thing between co-residency and an OOM at
+    load: a Spark has no eviction-wait gate to observe memory beforehand."""
+    unit = two_model_unit(cfg, f1=0.7, f2=0.5)   # 0.7 + 0.5 > 0.95 headroom
+    state, calls = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2", lane="spark1")))
+
+    assert job.state == "failed"
+    assert "already committed" in (job.error or "")
+    assert not any("sparkrun run" in c for c in calls), "must refuse before launching"
+    assert state == {8000: "served-1"}, "the resident model must be untouched"
+
+
+@respx.mock
+async def test_unbudgeted_model_still_claims_the_whole_node(cfg, monkeypatch):
+    """mem_fraction 0.0 means "unset" -- the pre-multi-model behaviour. Sharing a
+    node with one is refused rather than silently overcommitting it."""
+    unit = two_model_unit(cfg, f1=0.0, f2=0.4)   # A has no declared budget
+    state, calls = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2", lane="spark1")))
+
+    assert job.state == "failed"
+    assert "no mem_fraction" in (job.error or "")
+
+
+@respx.mock
+async def test_node_full_is_a_clear_error(tmp_path, monkeypatch):
+    c = SparkConfig(id="spark1", name="spark-test", host=HOST, ssh_user="u",
+                    api_port=PORT, registry_path=tmp_path / "r.yaml",
+                    load_timeout_s=5, max_models=2)
+    unit = two_model_unit(c, f1=0.2, f2=0.2)
+    unit.registry.upsert(SparkModelEntry(alias="m3", recipe="recipe-3",
+                                         served_name="served-3", load_timeout_s=5,
+                                         mem_fraction=0.2))
+    state, calls = stateful_node(monkeypatch, c, {8000: "served-1", 8001: "served-2"})
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m3", lane="spark1")))
+
+    assert job.state == "failed"
+    assert "no free slot" in (job.error or "")
+
+
+@respx.mock
+async def test_unload_one_model_leaves_the_others(cfg, calls):
+    unit = two_model_unit(cfg)
+    slot_route(8000, "served-1")
+    slot_route(8001, "served-2")
+    slot_route(8002, None)
+    slot_route(8003, None)
+
+    await unit.unload(UnloadRequest(lane="spark1", model="m2"))
+
+    stop = next(c for c in calls if "sparkrun stop" in c)
+    assert "sparkrun stop recipe-2" in stop
+    assert "--all" not in stop, "a targeted unload must not free the node"
+
+
+@respx.mock
+async def test_unload_without_a_model_still_frees_the_whole_node(cfg, calls):
+    """What the idle reaper and a lease's free_on_preempt mean by "free the unit"."""
+    unit = two_model_unit(cfg)
+    for p, m in ((8000, "served-1"), (8001, "served-2"), (8002, None), (8003, None)):
+        slot_route(p, m)
+
+    await unit.unload(UnloadRequest(lane="spark1"))
+
+    stop = next(c for c in calls if "sparkrun stop" in c)
+    assert "--all" in stop
+
+
+@respx.mock
+async def test_reloading_a_resident_model_reuses_its_slot(cfg, calls):
+    unit = two_model_unit(cfg)
+    slot_route(8000, "served-1")
+    slot_route(8001, "served-2")
+    slot_route(8002, None)
+    slot_route(8003, None)
+
+    job = await wait_job(
+        unit.load(LoadRequest(server="spark", model="m2", lane="spark1", force=True))
+    )
+
+    assert job.state == "succeeded", job.error
+    stop = next(c for c in calls if "sparkrun stop" in c)
+    assert "sparkrun stop recipe-2" in stop, "free only its own slot"
+    run = next(c for c in calls if "sparkrun run" in c)
+    assert "--port 8001" in run, "the freed slot is the lowest free one, so it is reused"

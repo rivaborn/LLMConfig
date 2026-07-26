@@ -199,24 +199,57 @@ class SparkUnit:
             )
 
         target = entry.served_name or entry.alias
-
-        # Fast path: already serving what was asked for.
-        if not req.force and (await self.spark.served()) == target:
-            self.jobs.log(job, f"{self.cfg.name} already serving {target}")
-            return self._result(target, await self.spark.gpu())
-
-        # A Spark runs one workload at a time, so a swap is stop-then-run. There is
-        # no VRAM gate to wait on — stopping the container releases the whole node.
-        self.jobs.log(job, f"stopping any running workload on {self.cfg.name}…")
-        stop = await self.spark.stop()
-        if not stop.ok and stop.rc not in (0, 1):
-            # rc 1 is the common "nothing running" case; anything else is worth showing.
-            self.jobs.log(job, f"stop reported rc={stop.rc}: {stop.text()[:200]}")
-
         recipe = entry.recipe or entry.alias
-        self.jobs.log(job, f"launching {recipe} on {self.cfg.name} as '{target}' (tp={entry.tp})…")
+
+        slots = await self.spark.served_slots()          # {port: ServedModel}
+        resident = {sm.name: port for port, sm in slots.items() if sm.name}
+
+        # Fast path: already serving what was asked for, on whichever slot.
+        if not req.force and target in resident:
+            self.jobs.log(
+                job, f"{self.cfg.name} already serving {target} on port {resident[target]}"
+            )
+            return self._result(target, await self.spark.gpu(), port=resident[target])
+
+        # Reloading a model that is already up: free ITS slot only, so co-tenants
+        # survive. This replaces the old unconditional `stop --all`.
+        if target in resident:
+            port = resident[target]
+            self.jobs.log(job, f"stopping {target} on port {port} to reload it…")
+            stop = await self.spark.stop(recipe=recipe)
+            if not stop.ok and stop.rc not in (0, 1):
+                self.jobs.log(job, f"stop reported rc={stop.rc}: {stop.text()[:200]}")
+            resident.pop(target, None)
+            slots.pop(port, None)
+        else:
+            # A tp>1 recipe spans nodes and cannot share one; it claims everything.
+            if entry.tp > 1 and slots:
+                self.jobs.log(
+                    job,
+                    f"{recipe} is a {entry.tp}-node recipe — freeing the whole node first…",
+                )
+                await self.spark.stop()
+                slots, resident = {}, {}
+
+        self._admit(entry, slots)
+        port = self._free_slot(slots)
+        if port is None:
+            raise RuntimeError(
+                f"{self.cfg.name} has no free slot: all {self.cfg.max_models} are in use "
+                f"({', '.join(sorted(resident)) or 'none'}). Unload one first, or raise "
+                f"SPARK_MAX_MODELS."
+            )
+
+        self.jobs.log(
+            job,
+            f"launching {recipe} on {self.cfg.name} as '{target}' "
+            f"(tp={entry.tp}, port={port}"
+            + (f", mem={entry.mem_fraction}" if entry.mem_fraction else "")
+            + ")…",
+        )
         r = await self.spark.run_recipe(recipe, tp=entry.tp, extra=entry.extra_args,
-                                        served=target)
+                                        served=target, port=port,
+                                        mem_fraction=entry.mem_fraction)
         if not r.ok:
             if r.rc == 127:
                 raise RuntimeError(
@@ -231,8 +264,13 @@ class SparkUnit:
                 self.jobs.log(job, line.strip())
 
         timeout = float(entry.load_timeout_s or self.cfg.load_timeout_s)
-        self.jobs.log(job, f"waiting up to {int(timeout)}s for {target} to answer on {self.cfg.api_base}…")
-        ok = await self.spark.wait_ready(target, timeout, on_log=lambda l: self.jobs.log(job, l))
+        self.jobs.log(
+            job,
+            f"waiting up to {int(timeout)}s for {target} to answer on "
+            f"{self.cfg.api_base_for(port)}…",
+        )
+        ok = await self.spark.wait_ready(target, timeout,
+                                         on_log=lambda l: self.jobs.log(job, l), port=port)
         if not ok:
             tail = await self.spark.logs(n=25)
             raise RuntimeError(
@@ -244,28 +282,88 @@ class SparkUnit:
         # status() stops backing off immediately.
         self._gpu_cached, self._gpu_ts = gpu, time.time()
         self._served_fails = 0
-        self.jobs.log(job, f"{self.cfg.name} serving {target} (VRAM {gpu.vram_pct}% used)")
-        return self._result(target, gpu)
+        self.jobs.log(
+            job, f"{self.cfg.name} serving {target} on port {port} (VRAM {gpu.vram_pct}% used)"
+        )
+        return self._result(target, gpu, port=port)
 
     # ------------------------------------------------------------------ #
     # Unload
     # ------------------------------------------------------------------ #
     async def unload(self, req: UnloadRequest) -> LaneStatus:
+        """Free one model, or the whole node.
+
+        `req.model` names a single model to stop, leaving co-residents running —
+        that is what per-model reaping and a targeted UI Unload need. Without it
+        the whole node is freed, which is what the idle reaper's "free the unit"
+        and a lease's `free_on_preempt` still mean.
+        """
         async with self._lock:
             self._active_job_id = None
-            await self.spark.stop()
+            recipe = None
+            if req.model:
+                entry = self.registry.get(req.model) or self.registry.find_by_served_name(req.model)
+                if entry is None:
+                    raise RuntimeError(
+                        f"unknown Spark model '{req.model}' on {self.cfg.id} — cannot "
+                        f"target it for unload"
+                    )
+                recipe = entry.recipe or entry.alias
+            await self.spark.stop(recipe=recipe)
         return await self.status()
 
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
-    def _result(self, served_name: str, gpu: GpuInfo) -> dict:
+    def _result(self, served_name: str, gpu: GpuInfo, port: int = 0) -> dict:
         return LoadedModel(
             server="spark",
             model=served_name,
             gpu_vram_pct=gpu.vram_pct,
             fully_on_gpu=True,
+            port=port,
         ).model_dump()
+
+    def _free_slot(self, slots: dict) -> Optional[int]:
+        """Lowest unoccupied slot port, or None when the node is full."""
+        return next((p for p in self.cfg.slot_ports if p not in slots), None)
+
+    def _admit(self, entry, slots: dict) -> None:
+        """Refuse a load whose declared budget will not fit beside the residents.
+
+        A Spark has no eviction-wait gate — nothing observes memory before a
+        launch — so this declared-budget sum is the only thing standing between
+        co-residency and an OOM at load. `mem_fraction: 0.0` means "unset", which
+        is read as a whole-node claim: it neither fits beside anything nor lets
+        anything fit beside it, which keeps pre-multi-model catalogs behaving as
+        they always did.
+        """
+        want = entry.mem_fraction
+        by_name = {sm.name: sm for sm in slots.values() if sm.name}
+        if not by_name:
+            return
+        budgets = {}
+        for name in by_name:
+            e = self.registry.find_by_served_name(name)
+            budgets[name] = e.mem_fraction if e else 0.0
+
+        unbudgeted = [n for n, f in budgets.items() if not f]
+        if unbudgeted or not want:
+            who = ", ".join(sorted(unbudgeted)) or entry.alias
+            raise RuntimeError(
+                f"cannot co-locate '{entry.alias}' on {self.cfg.name}: "
+                f"{who} has no mem_fraction, so it is treated as claiming the whole "
+                f"node. Set mem_fraction on every model that should share a node, "
+                f"or unload the other model first."
+            )
+        used = sum(budgets.values())
+        headroom = self.s.spark_mem_headroom
+        if used + want > headroom + 1e-9:
+            raise RuntimeError(
+                f"'{entry.alias}' needs {want:.2f} of {self.cfg.name} but "
+                f"{used:.2f}/{headroom:.2f} is already committed to "
+                f"{', '.join(sorted(budgets))}. Unload something or lower mem_fraction."
+            )
 
     async def aclose(self) -> None:
         if self._gpu_task is not None and not self._gpu_task.done():

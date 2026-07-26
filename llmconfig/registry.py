@@ -116,6 +116,17 @@ class SparkRegistry:
         e = self.get(alias)
         return (e.served_name or e.alias) if e else None
 
+    def find_by_served_name(self, served: str) -> SparkModelEntry | None:
+        """Reverse lookup: the catalog entry a node's /v1/models name came from.
+
+        Needed because residency is discovered from the node, which reports served
+        names, while budgets and recipes are keyed by alias.
+        """
+        for e in self._entries.values():
+            if (e.served_name or e.alias) == served:
+                return e
+        return None
+
     # ---- mutations ----
     def upsert(self, entry: SparkModelEntry) -> None:
         self._entries[entry.alias] = entry

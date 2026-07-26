@@ -172,25 +172,44 @@ class SparkBackend:
             ) from e
 
     async def run_recipe(self, recipe: str, tp: int = 1, extra: list[str] | None = None,
-                         served: str = ""):
+                         served: str = "", port: Optional[int] = None,
+                         mem_fraction: float = 0.0):
         """Launch a workload on this node. Returns the raw CmdResult.
 
         `served` pins `--served-model-name`, so the node reports exactly the name
         this app waits for and the /v1 resolver matches — rather than whatever the
         recipe happens to default to.
+
+        `port` selects the slot; without it the workload lands on slot 0 and can
+        only ever be the node's single occupant. `mem_fraction`, when set, becomes
+        `--gpu-mem` — the declared budget that lets models coexist, since vLLM
+        preallocates and a recipe's own default is typically 0.7-0.85 of the pool.
         """
+        args = list(extra or [])
+        if mem_fraction:
+            args += ["--gpu-mem", str(mem_fraction)]
         cmd = self._fmt(
             self.s.spark_run_cmd,
             recipe=shlex.quote(recipe),
             tp=int(tp or 1),
             served=shlex.quote(served or recipe),
-            extra=" ".join(extra or []),
+            extra=" ".join(args),
+            **({"port": int(port)} if port else {}),
         )
         # Generous timeout: sparkrun pulls the image/weights on a cold node.
         return await run_wsl(cmd, login=True, timeout=float(self.cfg.load_timeout_s), settings=self.s)
 
-    async def stop(self):
-        cmd = self._fmt(self.s.spark_stop_cmd)
+    async def stop(self, recipe: Optional[str] = None):
+        """Stop workloads on this node.
+
+        With `recipe`, stops just that one and leaves co-residents running — the
+        whole point of multi-model. Without it, `--all` frees the entire node,
+        which is still what the idle reaper and a lease's `free_on_preempt` want.
+        """
+        if recipe:
+            cmd = self._fmt(self.s.spark_stop_one_cmd, recipe=shlex.quote(recipe))
+        else:
+            cmd = self._fmt(self.s.spark_stop_cmd)
         return await run_wsl(cmd, login=True, timeout=120.0, settings=self.s)
 
     async def cluster_status(self):
