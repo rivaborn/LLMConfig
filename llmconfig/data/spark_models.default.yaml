@@ -52,9 +52,12 @@ models:
       google/gemma-4-26B-A4B-it, MoE 26B/4B-active, served fp8 with fp8 KV.
       65536 ctx clears opencode's ~24.5k baseline with room. VERIFIED on all four
       nodes 2026-07-24 — real completions through the LLMConfig /v1 gateway in
-      0.6-1.1 s, ~85-89% of the 122 GB unified pool resident. Weights download as
-      ~48 GB bf16 and are quantized at load, so a node's FIRST load is a long pull
-      (~50 min cold); later loads hit the local HF cache (~7 min).
+      0.6-1.1 s. Weights download as ~48 GB bf16 and are QUANTIZED AT LOAD, so
+      (a) a node's first-ever load is a long pull (~50 min cold; ~10 min cached), and
+      (b) the load-time transient is ~74 GB — nearly double the 0.40 runtime budget —
+      so gemma MUST BE THE FIRST MODEL ON ITS NODE (loading it beside a resident
+      trips Ray's 95% node-memory kill; proven 3x on 2026-07-26). Pre-quantized
+      co-tenants join safely afterwards.
     load_timeout_s: 3600
 
   - alias: gpt-oss-120b
