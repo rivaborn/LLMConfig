@@ -922,3 +922,23 @@ async def test_admission_refuses_when_measured_free_memory_contradicts_the_budge
     assert job.state == "failed"
     assert "actually free" in (job.error or ""), job.error
     assert state == {8000: "served-1"}, "the resident must be untouched by the refusal"
+
+
+async def test_serve_status_and_real_log_come_from_inside_the_container(cfg, calls):
+    """sparkrun's container is a `sleep infinity` placeholder; the server is
+    exec'd inside and logs to /tmp/sparkrun_serve.log IN the container, so
+    `docker logs` shows only the CUDA banner. The probes must exec in."""
+    b = make_unit(cfg).spark
+
+    calls.plan["docker ps -q"] = CmdResult(
+        0, "SERVE_DEAD\nAvailable KV cache memory: -10.07 GiB\n", "")
+    assert await b.serve_status(8001) == "dead"
+    tail = await b.logs(n=5, port=8001)
+    assert "Available KV cache memory" in tail, "the REAL serve log must surface"
+    probe = next(c for c in calls if "sparkrun_serve.pid" in c)
+    assert "docker exec" in probe and "port 8001" in probe
+
+    calls.plan["docker ps -q"] = CmdResult(0, "SERVE_ALIVE\n", "")
+    assert await b.serve_status(8001) == "alive"
+    calls.plan["docker ps -q"] = CmdResult(0, "", "")
+    assert await b.serve_status(8001) == "unknown", "no matching container = unknown, never dead"

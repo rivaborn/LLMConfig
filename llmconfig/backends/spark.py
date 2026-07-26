@@ -237,6 +237,8 @@ class SparkBackend:
         """
         deadline = time.monotonic() + timeout
         announced = False
+        dead_checks = 0
+        next_alive_probe = time.monotonic() + 30.0
         while time.monotonic() < deadline:
             current = (await self.served_info(port)).name
             if current == served_name:
@@ -249,6 +251,23 @@ class SparkBackend:
                     f"(waiting for '{served_name}')"
                 )
                 announced = True
+            # A server that failed at startup (bad budget, OOM) dies in under a
+            # minute but leaves the port silent — polling HTTP alone burned the
+            # entire budget (900 s for a 43 s failure, live on spark4
+            # 2026-07-26). Every ~30 s, ask the node whether the exec'd process
+            # still exists; two consecutive 'dead' answers end the wait. Two,
+            # because a single probe can race the exec that starts the server.
+            if time.monotonic() >= next_alive_probe:
+                next_alive_probe = time.monotonic() + 30.0
+                state = await self.serve_status(port or self.cfg.api_port)
+                if state == "dead":
+                    dead_checks += 1
+                    if dead_checks >= 2:
+                        if on_log:
+                            on_log("server process died at startup — stopping the wait")
+                        return False
+                else:
+                    dead_checks = 0
             await asyncio.sleep(self.s.poll_interval_s)
         return False
 
@@ -354,8 +373,43 @@ class SparkBackend:
             )
         return None
 
-    async def logs(self, n: int = 40) -> str:
-        """Best-effort tail of the node's running container, for job diagnostics."""
+    # sparkrun's container is a `sleep infinity` placeholder; the actual server is
+    # exec'd inside it via a script that logs to /tmp/sparkrun_serve.log IN the
+    # container. `docker logs` therefore shows only the CUDA banner — reading it
+    # made every startup failure look blank. These two helpers find the container
+    # whose serve script mentions this slot's port and inspect the real state.
+    def _serve_probe(self, port: int, tail: int = 0) -> str:
+        tail_cmd = (f"tail -{int(tail)} /tmp/sparkrun_serve.log 2>/dev/null; "
+                    if tail else "")
+        return (
+            "for c in $(docker ps -q); do "
+            f"docker exec $c sh -c 'grep -q \"port {int(port)}\" /tmp/sparkrun_serve.sh 2>/dev/null "
+            "&& { kill -0 $(cat /tmp/sparkrun_serve.pid) 2>/dev/null && echo SERVE_ALIVE "
+            f"|| echo SERVE_DEAD; {tail_cmd}" + "}' 2>/dev/null; done"
+        )
+
+    async def serve_status(self, port: int) -> str:
+        """'alive' | 'dead' | 'unknown' for the slot's exec'd server process.
+
+        SSH, so never on the status path — only the load path polls it, where a
+        server that died at startup otherwise burns the whole wait_ready budget
+        looking at a port that will never answer.
+        """
+        r = await self._ssh(self._serve_probe(port), timeout=20.0)
+        out = r.out or ""
+        if "SERVE_ALIVE" in out:
+            return "alive"
+        if "SERVE_DEAD" in out:
+            return "dead"
+        return "unknown"
+
+    async def logs(self, n: int = 40, port: Optional[int] = None) -> str:
+        """Best-effort diagnostics tail. With `port`, the slot's real serve log."""
+        if port:
+            r = await self._ssh(self._serve_probe(port, tail=n), timeout=30.0)
+            out = (r.out or "").replace("SERVE_ALIVE", "").replace("SERVE_DEAD", "").strip()
+            if out:
+                return out
         r = await self._ssh(
             "docker ps --filter label=sparkrun --format '{{.Names}}' | head -1 | "
             "xargs -r docker logs --tail " + str(int(n)) + " 2>&1",

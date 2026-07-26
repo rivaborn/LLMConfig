@@ -322,9 +322,11 @@ class SparkUnit:
         ok = await self.spark.wait_ready(target, timeout,
                                          on_log=lambda l: self.jobs.log(job, l), port=port)
         if not ok:
-            tail = await self.spark.logs(n=25)
+            tail = await self.spark.logs(n=25, port=port)
             raise RuntimeError(
-                f"{self.cfg.name} did not serve '{target}' within {int(timeout)}s.\n{tail}"
+                f"{self.cfg.name} did not serve '{target}' (see log tail below — "
+                f"'Available KV cache memory' negative means the mem_fraction is "
+                f"too small for weights + ~15 GiB GB10 overhead + KV).\n{tail}"
             )
 
         gpu = await self.spark.gpu()

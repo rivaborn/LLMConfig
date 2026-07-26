@@ -19,6 +19,14 @@
 # only after the fabric is up (see the wiki runbook), and only for a recipe whose
 # `Nodes` column in `sparkrun list` supports it.
 #
+# mem_fraction sizing on GB10 (learned live 2026-07-26): vLLM charges ~15 GiB of
+# NON-TORCH overhead against --gpu-mem on this unified-memory platform (CUDA
+# context + host allocations sharing the pool), on top of weights and KV. Budget
+# = (weights + ~15 GiB + KV + margin) / 121. A budget sized on weights+KV alone
+# boots to "Available KV cache memory: -X GiB" and dies in ~45 s — the embedder's
+# original 0.18 (weights 15.2 + KV 4.5 = fine on paper) failed exactly that way,
+# while gemma's 0.40 (26 + 15 + 8 = 49 vs 48.4) barely cleared it.
+#
 # status: "unverified" until it has been launched and recall-tested on THIS
 # cluster. The decode figures in the notes are community numbers from the Spark
 # Arena leaderboard, not measurements from this lab.
@@ -38,7 +46,7 @@ models:
     served_name: gemma-4-26b-fp8
     tp: 1
     status: ok
-    mem_fraction: 0.40   # 26 GB fp8 weights; 0.40 of the pool leaves ~22 GB for KV at 65536.
+    mem_fraction: 0.4    # PROVEN live: 26 fp8 weights + ~15 overhead + 8 KV = 49 GB vs 48.4 budget — barely fits.
     extra_args: ["--max-model-len", "65536"]
     notes: >-
       google/gemma-4-26B-A4B-it, MoE 26B/4B-active, served fp8 with fp8 KV.
@@ -66,7 +74,7 @@ models:
     served_name: qwen3-coder-next
     tp: 1
     status: unverified
-    mem_fraction: 0.45   # 52.53 GB measured (40.53 weights + 12.00 KV at 262144) of 121 GB.
+    mem_fraction: 0.6    # 40.53 weights + ~15 overhead + 12 KV at 262144 = 67.5 GB; 0.60 = 72.6.
     # 262144 rather than the 65536 the other recipes carry, because this one has
     # room for it and is the coding model: `sparkrun show` puts weights at 40.53 GB
     # (INT4) and the KV at only 12.00 GB for the full 262144 window — the arch is a
@@ -87,7 +95,7 @@ models:
     served_name: qwen35-35b-a3b
     tp: 1
     status: unverified
-    mem_fraction: 0.40   # ~35 GB FP8 weights + KV at 65536.
+    mem_fraction: 0.5    # ~35 GB FP8 weights + ~15 overhead + KV at 65536 (SGLang overhead unmeasured).
     extra_args: ["--max-model-len", "65536"]
     notes: "FP8 MoE on SGLang. ~50.8 t/s single-stream, ~196 t/s aggregate at c10."
     load_timeout_s: 900
@@ -105,7 +113,7 @@ models:
     served_name: qwen36-35b-a3b
     tp: 1
     status: unverified
-    mem_fraction: 0.40   # 44.89 GB (34.89 weights + 10 KV at 262144) of 121 GB.
+    mem_fraction: 0.52   # 34.89 weights + ~15 overhead + 10 KV at 262144 = 59.9 GB; 0.52 = 62.9.
     extra_args: ["--max-model-len", "262144"]
     notes: >-
       Qwen/Qwen3.6-35B-A3B-FP8 with MTP speculative decoding. 34.89 GB weights,
@@ -117,7 +125,7 @@ models:
     served_name: qwen36-27b
     tp: 1
     status: unverified
-    mem_fraction: 0.52   # 60.75 GB (28.75 weights + 32 KV at 262144) of 121 GB.
+    mem_fraction: 0.68   # 28.75 weights + ~15 overhead + 32 KV at 262144 = 75.8 GB; 0.68 = 82.3.
     extra_args: ["--max-model-len", "262144"]
     notes: >-
       Qwen/Qwen3.6-27B-FP8 with MTP speculative decoding. Dense 27B: 28.75 GB
@@ -138,7 +146,7 @@ models:
     served_name: qwen3-vl-embedding-8b
     tp: 1
     status: unverified
-    mem_fraction: 0.18   # 19.67 GB of 121 GB — small enough to sit beside a chat model.
+    mem_fraction: 0.3    # 15.17 weights + 14.93 MEASURED overhead + 4.5 KV = 34.6 GB; 0.18 died at -10 GiB KV.
     extra_args: ["--max-model-len", "32768"]
     notes: >-
       Qwen/Qwen3-VL-Embedding-8B, pooling runner. 15.17 GB weights + 4.50 GB KV at
@@ -150,7 +158,7 @@ models:
     served_name: qwen3-vl-reranker-8b
     tp: 1
     status: unverified
-    mem_fraction: 0.18   # 20.83 GB of 121 GB — pairs with the embedder on one node.
+    mem_fraction: 0.32   # 16.33 weights + ~15 overhead + 4.5 KV = 35.8 GB; pairs with the embedder (0.62 total).
     extra_args: ["--max-model-len", "32768"]
     notes: >-
       Qwen/Qwen3-VL-Reranker-8B, pooling runner. 16.33 GB weights + 4.50 GB KV at
@@ -195,7 +203,7 @@ models:
     served_name: qwen35-122b-int4
     tp: 1
     status: unverified
-    mem_fraction: 0.72   # 83.5 GB (71.46 weights + ~12 KV at 131072); room for one pooling model beside it.
+    mem_fraction: 0.85   # 71.46 weights + ~15 overhead + ~12 KV at 131072 = 98.5 GB; effectively sole occupant.
     extra_args: ["--max-model-len", "131072"]
     notes: >-
       Intel/Qwen3.5-122B-A10B-int4-AutoRound on ONE node. 71.46 GB weights, ~12 GB KV
