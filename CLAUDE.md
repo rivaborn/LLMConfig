@@ -136,7 +136,11 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 - `winsvc.py` — Windows service control (status/start/restart, elevation check).
 - `proc.py` — `run_argv()` subprocess wrapper (`CmdResult`).
 - `doctor.py` — read-only recon (`run_doctor`) that verifies every on-box assumption.
-- `openai_gateway.py` — the OpenAI-compatible `/v1` gateway (auto-load on first request).
+- `openai_gateway.py` — the OpenAI-compatible `/v1` gateway (auto-load on first request;
+  chat + completions + embeddings/rerank/score; auto-placement wiring in `_choose`).
+- `placement.py` — auto-placement: pure `rank()` over per-unit `CandidateFacts` +
+  `Placer` (single-flight status sweep, sync lease/registry reads). Advisory by design
+  — see invariant 15.
 - `cli.py` — the `llmconfig` typer CLI (thin client over the REST API + `serve`).
 - `web/` — static UI (`app.js`, `monitor.js`, `style.css`) + `templates/index.html`.
 - `data/*.default.yaml` (in the package) — shipped registry seeds; `../data/*.yaml`

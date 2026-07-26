@@ -40,7 +40,10 @@ so it packs 100 % of VRAM before any CPU spill.
 - **Leases** — a real claim on a unit: who holds it, whether their work may be
   interrupted, how long they need it, and an in-band answer when they get displaced.
 - **OpenAI `/v1` gateway** with **auto-load on first request**, so a client's `/model`
-  picker switches models with no manual swap. `X-LLM-Lane` selects the unit.
+  picker switches models with no manual swap. `X-LLM-Lane` pins a unit; a request
+  **without** the header is **auto-placed** — LLMConfig picks the unit (resident first,
+  then free capacity, then evicting an idle unleased model) and answers with
+  `X-LLM-Unit` saying where it ran.
 - **Served context window** surfaced per unit — the window a prompt budget must
   actually respect, not the model's architectural maximum.
 - **Independent units.** The 3090 can serve a big vLLM model while the 3070 Ti serves a
@@ -59,7 +62,7 @@ so it packs 100 % of VRAM before any CPU spill.
 | ---------- | ------------------- | -------------------------------------- | ---------------------------------- |
 | Runs in    | Windows 11 native   | WSL2 Ubuntu 24.04                      | the remote GB10 node (Docker)      |
 | Reach      | `127.0.0.1:11434`   | `127.0.0.1:11437` (socat relay)        | `http://192.168.1.5x:8000`         |
-| Model swap | REST `keep_alive`   | one model/process — `serve.sh <alias>` | `sparkrun stop` → `sparkrun run`   |
+| Model swap | REST `keep_alive`   | one model/process — `serve.sh <alias>` | per-model `sparkrun stop/run`, slot ports 8000-8003 |
 | State via  | `/api/ps`           | relay `/v1/models`                     | the node's own `/v1/models`        |
 | Catalog    | `ollama list` tags  | `data/vllm_models.yaml`                | `data/spark_models_<unit>.yaml`    |
 
@@ -72,7 +75,7 @@ with no auth unless you set `LLMCONFIG_API_KEY`.
 | ----------------------- | ---------------------------- | ------------------------------------------- | -------------------------------- |
 | `primary`               | RTX 3090, 24 GB              | eviction-wait gate, Ollama **XOR** vLLM     | local `nvidia-smi` by UUID       |
 | `companion`             | RTX 3070 Ti, 8 GB (opt-in)   | same, fully independent of `primary`        | local `nvidia-smi` by UUID       |
-| `spark1`…`spark4`       | DGX Spark GB10, 128 GB       | none needed — one workload per node         | remote `nvidia-smi` over SSH     |
+| `spark1`…`spark4`       | DGX Spark GB10, 128 GB       | up to 4 co-resident models, one per port; admission by summed `mem_fraction` | remote `nvidia-smi` over SSH     |
 
 `settings.units()` = `lanes()` + `sparks()`. Sparks are **off by default**
 (`SPARK_ENABLED=true` to enable). Both kinds satisfy the same duck-typed contract, so
@@ -252,17 +255,31 @@ client can switch models **without a manual swap**: the first request for a mode
 loads it. Built for opencode's `/model` picker (which has no selection-time hook), so
 the switch happens on the inference path.
 
-`GET /v1/models` · `POST /v1/chat/completions` · `POST /v1/completions`.
+`GET /v1/models` · `POST /v1/chat/completions` · `POST /v1/completions` ·
+`POST /v1/embeddings` · `POST /v1/rerank` · `POST /v1/score`.
 
-- **Lane** = the `X-LLM-Lane` header (`primary` default; `companion` → the 3070 Ti).
-- **Resolution:** a vLLM `served_name` (e.g. `qwen3-coder-30b`) → that lane's vLLM
-  relay; else an Ollama tag (e.g. `qwen3-coder:30b`) → that lane's Ollama; else `404`.
+- **Unit selection:** `X-LLM-Lane: <unit>` pins. **No header (or `auto`) auto-places**:
+  the unit already serving the model wins (idle preferred, deterministic tie-break for
+  prefix-cache affinity); else a unit with free capacity (declared Spark budgets, or a
+  free lane); else one whose idle + unleased occupant can be evicted; else `503
+  no_capacity` naming why each unit refused. The chosen unit is echoed back as
+  **`X-LLM-Unit`**. A valid `X-LLM-Lease` pins to its lease's unit. Placement is
+  advisory — admission, the unit locks and the lease gate stay the real gates — and a
+  conflict is retried once on the runner-up. `AUTO_PLACE_ENABLED=false` restores the
+  old implicit-`primary` default. `/v1/models` without a header lists the whole
+  fleet's catalog union.
+- **Resolution (per unit):** a Spark catalog `served_name` → that node's own slot
+  port (multi-model nodes route per model); a vLLM `served_name` → the lane's relay;
+  else an Ollama tag (has a `:`) → the lane's Ollama; else `404`.
 - **No new arbitration** — it reuses `/api/load` (the per-lane lock, eviction-wait
-  gate, WSL keepalive). On a **streaming** request it relays the cold-load progress as
-  chat chunks (`⏳ …`), then forwards the real completion verbatim.
-- **Edge cases:** identical concurrent loads coalesce onto one job; a non-stream
-  request that arrives mid-load of a *different* model returns an empty `200` (so
-  title-gen never blocks); cold-load timeout → `503`. LAN-only, like the rest.
+  gate, WSL keepalive, Spark admission). On a **streaming** request it relays the
+  cold-load progress as chat chunks (`⏳ …`), then forwards the real completion
+  verbatim.
+- **Edge cases:** identical concurrent loads coalesce onto one job; a non-stream chat
+  request mid-load of a *different* model returns an empty `200` on a GPU lane (so
+  title-gen never blocks) — a Spark queues instead, since the other load is another
+  slot's business; pooling routes never fabricate (`503`, because an empty embedding
+  written to a vector store is silent corruption); cold-load timeout → `503`.
 
 Point a provider's `baseURL` at `http://192.168.1.40:11430/v1`. The always-on app must
 be **restarted** to pick up a new gateway build.
