@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import re
 import shlex
 import time
 from typing import Callable, Optional
@@ -33,6 +34,7 @@ import httpx
 
 from ..config import Settings, SparkConfig
 from ..gpu import GPU_QUERY, METRICS_QUERY, GpuInfo, GpuMetric, _parse_float, _parse_int
+from ..proc import CmdResult
 from ..registry import SparkRegistry
 from ..schemas import ServedModel, SparkModel
 from ..wsl import run_wsl
@@ -246,15 +248,45 @@ class SparkBackend:
                              timeout=float(timeout or self.cfg.load_timeout_s),
                              settings=self.s)
 
+    _JOB_RE = re.compile(r"^Job:\s+(\S+)\s+\(tp=\d+\)\s+\[([0-9a-f]+)\]")
+
+    async def _job_id_for(self, recipe: str) -> Optional[str]:
+        """The sparkrun job id running `recipe` on THIS host, from `sparkrun status`.
+
+        Needed because `sparkrun stop <recipe> --hosts` claims success and stops
+        NOTHING (live, 2026-07-26 — three "successful" stops left the embedder
+        serving); only the job id works. Status output shape:
+
+            Job: @official/… (tp=1) [03d5c9f36a39] (1 container(s))
+              solo       192.168.1.53   Up 9 hours   sparkrun-eugr-vllm-tf5
+        """
+        r = await run_wsl(self._fmt(self.s.spark_status_cmd), login=True,
+                          timeout=60.0, settings=self.s)
+        current: Optional[tuple[str, str]] = None       # (recipe, job_id)
+        for line in (r.out or "").splitlines():
+            m = self._JOB_RE.match(line.strip())
+            if m:
+                current = (m.group(1), m.group(2))
+                continue
+            if current and self.cfg.host in line and current[0] == recipe:
+                return current[1]
+        return None
+
     async def stop(self, recipe: Optional[str] = None):
         """Stop workloads on this node.
 
-        With `recipe`, stops just that one and leaves co-residents running — the
-        whole point of multi-model. Without it, `--all` frees the entire node,
-        which is still what the idle reaper and a lease's `free_on_preempt` want.
+        With `recipe`, resolves it to the sparkrun JOB ID first and stops that —
+        leaving co-residents running. Without it, `--all` frees the entire node.
+        `sparkrun stop` swallows SSH failures into rc=0, so callers verify via
+        the slot probe (the unload path re-probes status), never the exit code.
         """
         if recipe:
-            cmd = self._fmt(self.s.spark_stop_one_cmd, recipe=shlex.quote(recipe))
+            job = await self._job_id_for(recipe)
+            if job is None:
+                # Nothing tracked for this recipe here — already gone, or an
+                # orphan sparkrun can't see either. The caller's re-probe decides.
+                return CmdResult(0, f"no tracked sparkrun job for {recipe} on {self.cfg.host}", "")
+            cmd = self._fmt(self.s.spark_stop_job_cmd, job=job)
         else:
             cmd = self._fmt(self.s.spark_stop_cmd)
         return await run_wsl(cmd, login=True, timeout=120.0, settings=self.s)

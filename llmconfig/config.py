@@ -229,7 +229,14 @@ class Settings(BaseSettings):
     # is a recipe name or a cluster id; the recipe is what this app already knows.
     # Without this every load would keep using `--all` and evict the neighbours it
     # is supposed to coexist with.
-    spark_stop_one_cmd: str = "sparkrun stop {recipe} --cluster {cluster} --hosts {host}"
+    # DO NOT stop by recipe name: `sparkrun stop <recipe> --cluster --hosts` prints
+    # "Workload stopped" with rc=0 while stopping NOTHING (verified live 2026-07-26 —
+    # the embedder kept serving through three "successful" stops). Only the job id
+    # printed by `sparkrun status` actually stops a workload; stop also swallows
+    # SSH failures into rc=0, so callers must verify via the slot probe, never
+    # trust the exit code.
+    spark_stop_one_cmd: str = "sparkrun stop {recipe} --cluster {cluster} --hosts {host}"  # broken; kept for reference
+    spark_stop_job_cmd: str = "sparkrun stop {job} --cluster {cluster}"
     spark_status_cmd: str = "sparkrun status --cluster {cluster}"
     # Remote telemetry: plain SSH to the node (the control node's WSL already has
     # passwordless key auth to every Spark).

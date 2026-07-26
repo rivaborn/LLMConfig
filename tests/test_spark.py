@@ -310,6 +310,7 @@ async def test_probe_backoff_after_repeated_failures(cfg, calls):
 async def test_load_stops_then_runs_then_waits(cfg, calls):
     models_route("served-1")
     u = make_unit(cfg)
+    calls.plan["sparkrun status"] = CmdResult(0, "Job: recipe-1  (tp=1)  [aaaa0000bbbb]  (1 container(s))\n  solo       10.9.9.9   Up 1 hour   img", "")
     job = u.load(LoadRequest(server="spark", model="m1", lane="spark1", force=True))
     await wait_job(job)
 
@@ -335,6 +336,7 @@ async def test_launch_command_matches_verified_sparkrun_flags(cfg, calls):
     """
     models_route("served-1")
     u = make_unit(cfg)
+    calls.plan["sparkrun status"] = CmdResult(0, "Job: recipe-1  (tp=1)  [aaaa0000bbbb]  (1 container(s))\n  solo       10.9.9.9   Up 1 hour   img", "")
     await wait_job(u.load(LoadRequest(server="spark", model="m1", lane="spark1", force=True)))
 
     run = next(c for c in calls if "sparkrun run" in c)
@@ -344,12 +346,12 @@ async def test_launch_command_matches_verified_sparkrun_flags(cfg, calls):
     assert "--served-model-name served-1" in run, "pin the served name to the catalog"
 
     stop = next(c for c in calls if "sparkrun stop" in c)
-    # sparkrun stop still errors without a TARGET or --all -- that invariant is
-    # unchanged. What changed is HOW it is satisfied: reloading a resident model
-    # now names the recipe as the TARGET so co-residents survive, where it used to
-    # sweep the node with --all.
-    assert ("--all" in stop) or ("sparkrun stop recipe-1" in stop),         "sparkrun stop errors without a TARGET or --all"
-    assert "sparkrun stop recipe-1" in stop, "reload must target its own recipe, not --all"
+    # sparkrun stop still errors without a TARGET or --all -- unchanged. What
+    # changed TWICE is how it is satisfied: first the recipe name as TARGET, and
+    # now the JOB ID resolved from `sparkrun status`, because stopping by recipe
+    # name prints success while stopping nothing (live, 2026-07-26).
+    assert "sparkrun stop aaaa0000bbbb" in stop,         "reload must target its own sparkrun JOB ID, not the recipe name or --all"
+    assert "--cluster" in stop, "without the cluster the SSH user is wrong"
 
 
 def test_seeded_recipes_are_namespaced():
@@ -578,11 +580,27 @@ def stateful_node(monkeypatch, cfg, initial: dict[int, str] | None = None):
         (e.recipe or e.alias): (e.served_name or e.alias)
         for e in SparkRegistry(cfg.registry_path).entries()
     }
+    served_to_recipe = {v: k for k, v in recipe_to_served.items()}
+
+    def job_id_for(served: str) -> str:
+        # Deterministic 12-hex per served name, like sparkrun's job ids.
+        # Reversed first: 'served-1'/'served-2' share their leading bytes, and a
+        # forward-hex prefix would collide two jobs onto one id.
+        return (served[::-1].encode().hex() + "0" * 12)[:12]
 
     async def fake_run_wsl(command, *, login=True, timeout=30.0, settings=None):
         calls.append(command)
         if "nvidia-smi" in command:
             return CmdResult(0, SMI_ROW, "")
+        if "sparkrun status" in command:
+            # Mirror the real output shape: a Job line (recipe + [id]) then a
+            # host line — the targeted-stop path resolves job ids from this.
+            lines = []
+            for prt, nm in sorted(state.items()):
+                recipe = served_to_recipe.get(nm, nm)
+                lines.append(f"Job: {recipe}  (tp=1)  [{job_id_for(nm)}]  (1 container(s))")
+                lines.append(f"  solo       {cfg.host}    Up 1 hour   img")
+            return CmdResult(0, "\n".join(lines), "")
         if "sparkrun run" in command:
             port = int(command.split("--port ")[1].split()[0])
             served = command.split("--served-model-name ")[1].split()[0]
@@ -592,9 +610,8 @@ def stateful_node(monkeypatch, cfg, initial: dict[int, str] | None = None):
                 state.clear()
             else:
                 target = command.split("sparkrun stop ")[1].split()[0]
-                served = recipe_to_served.get(target, target)
                 for prt, nm in list(state.items()):
-                    if nm == served:
+                    if job_id_for(nm) == target:
                         del state[prt]
         return CmdResult(0, "ok", "")
 
@@ -691,10 +708,11 @@ async def test_unload_one_model_leaves_the_others(cfg, calls):
     slot_route(8002, None)
     slot_route(8003, None)
 
+    calls.plan["sparkrun status"] = CmdResult(0, "Job: recipe-2  (tp=1)  [cccc0000dddd]  (1 container(s))\n  solo       10.9.9.9   Up 1 hour   img", "")
     await unit.unload(UnloadRequest(lane="spark1", model="m2"))
 
     stop = next(c for c in calls if "sparkrun stop" in c)
-    assert "sparkrun stop recipe-2" in stop
+    assert "sparkrun stop cccc0000dddd" in stop, "targeted = the recipe's JOB ID"
     assert "--all" not in stop, "a targeted unload must not free the node"
 
 
@@ -719,13 +737,14 @@ async def test_reloading_a_resident_model_reuses_its_slot(cfg, calls):
     slot_route(8002, None)
     slot_route(8003, None)
 
+    calls.plan["sparkrun status"] = CmdResult(0, "Job: recipe-2  (tp=1)  [cccc0000dddd]  (1 container(s))\n  solo       10.9.9.9   Up 1 hour   img", "")
     job = await wait_job(
         unit.load(LoadRequest(server="spark", model="m2", lane="spark1", force=True))
     )
 
     assert job.state == "succeeded", job.error
     stop = next(c for c in calls if "sparkrun stop" in c)
-    assert "sparkrun stop recipe-2" in stop, "free only its own slot"
+    assert "sparkrun stop cccc0000dddd" in stop, "free only its own slot (by job id)"
     run = next(c for c in calls if "sparkrun run" in c)
     assert "--port 8001" in run, "the freed slot is the lowest free one, so it is reused"
 
@@ -760,7 +779,7 @@ async def test_reaping_an_idle_model_leaves_a_busy_neighbour_resident(cfg, monke
 
     assert state == {8000: "served-1"}, "only the idle model may be evicted"
     assert not any("--all" in c for c in calls), "reaping one model must not sweep the node"
-    assert any("sparkrun stop recipe-2" in c for c in calls), "the stop must be targeted"
+    assert any("sparkrun stop " in c and "--all" not in c for c in calls),         "the stop must be targeted (by job id)"
 
 
 @respx.mock
@@ -1078,3 +1097,46 @@ async def test_list_models_unbudgeted_resident_blocks_everything(cfg, monkeypatc
     models = {m.alias: m for m in await unit.spark.list_models()}
     assert not models["small"].addable
     assert "served-old" in models["small"].add_note
+
+
+# --------------------------------------------------------------------------- #
+# Targeted stop resolves the sparkrun JOB ID — stopping by recipe name lies
+# --------------------------------------------------------------------------- #
+STATUS_OUT = (
+    "Job: @official/emb-vllm  (tp=1)  [aaaa11112222]  (1 container(s))\n"
+    "  solo       10.9.9.9        Up 9 hours   tf5\n"
+    "Job: @official/emb-vllm  (tp=1)  [bbbb33334444]  (1 container(s))\n"
+    "  solo       10.9.9.10       Up 2 hours   tf5\n"
+    "Job: @eugr/other  (tp=1)  [cccc55556666]  (1 container(s))\n"
+    "  solo       10.9.9.9        Up 1 hour    vllm-node\n"
+)
+
+
+async def test_targeted_stop_resolves_the_job_id_on_this_host(cfg, calls):
+    """`sparkrun stop <recipe> --hosts` prints success and stops NOTHING (live,
+    2026-07-26). The stop must go by the job id from `sparkrun status`, matched
+    to THIS host — the same recipe runs on other nodes under other ids."""
+    b = make_unit(cfg).spark
+    calls.plan["sparkrun status"] = CmdResult(0, STATUS_OUT, "")
+
+    r = await b.stop(recipe="@official/emb-vllm")
+    assert r.ok
+    stop_cmd = calls[-1]
+    assert "sparkrun stop aaaa11112222" in stop_cmd,         f"must stop THIS host's job id, got: {stop_cmd}"
+    assert "bbbb33334444" not in stop_cmd, "the other node's job must be untouched"
+    assert "--cluster" in stop_cmd, "without --cluster the SSH user is wrong"
+
+
+async def test_targeted_stop_with_no_tracked_job_is_a_clean_noop(cfg, calls):
+    b = make_unit(cfg).spark
+    calls.plan["sparkrun status"] = CmdResult(0, "", "")
+
+    r = await b.stop(recipe="@official/emb-vllm")
+    assert r.ok and "no tracked sparkrun job" in r.out
+    assert not any("sparkrun stop" in c for c in calls), "nothing was stopped"
+
+
+async def test_stop_all_still_uses_dash_all(cfg, calls):
+    b = make_unit(cfg).spark
+    await b.stop()
+    assert any("sparkrun stop" in c and "--all" in c for c in calls)
