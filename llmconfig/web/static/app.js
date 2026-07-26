@@ -43,7 +43,14 @@ const cards = {};                // unit id -> {el, refs, unit}   (Home dashboar
 const busyUnits = new Set();
 let currentView = "home";
 
-const busyKey = (id, model) => (model ? `${id}::${model}` : id);
+// alias <-> served-name folding, mirroring SparkUnit.canonical_model: the
+// catalog cards key work by ALIAS while resident rows key it by the node's
+// SERVED name. Without folding them onto one key, unloading `gemma-4-26b-fp8`
+// wouldn't grey the `gemma-4-26b` card doing the same model's load.
+// {unitId: {anyName: canonicalName}} - filled from the Spark catalog on refresh.
+const CANON = {};
+const canonName = (id, model) => (CANON[id] && CANON[id][model]) || model;
+const busyKey = (id, model) => (model ? `${id}::${canonName(id, model)}` : id);
 const isBusy = (id, model) => busyUnits.has(id) || (!!model && busyUnits.has(busyKey(id, model)));
 const anyBusy = () => busyUnits.size > 0;
 // A GPU lane evicts to load, so any load there occupies the whole unit; only a
@@ -403,6 +410,14 @@ async function refreshModels() {
       opts.push({ value: `vllm::${a.alias}`, label: `${a.alias}  ·  vllm` });
       if (a.loaded) loadedValue = `vllm::${a.alias}`;
     });
+    if (d.spark && d.spark.length) {
+      const map = {};
+      d.spark.forEach((m) => {
+        map[m.alias] = m.alias;
+        if (m.served_name) map[m.served_name] = m.alias;
+      });
+      CANON[unit.id] = map;
+    }
     (d.spark || []).forEach((m) => {
       opts.push({ value: `spark::${m.alias}`, label: `${m.alias}  ·  spark` });
       if (m.loaded) loadedValue = `spark::${m.alias}`;
