@@ -19,7 +19,7 @@ from llmconfig.openai_gateway import OpenAIGateway, build_gateway_router
 from llmconfig.orchestrator import Orchestrator
 from llmconfig.proc import CmdResult
 from llmconfig.registry import Registry
-from llmconfig.schemas import LeaseClaimRequest, OllamaModel, ServedModel
+from llmconfig.schemas import LaneStatus, LeaseClaimRequest, OllamaModel, ServedModel
 
 GiB = 1024 ** 3
 
@@ -533,3 +533,104 @@ async def test_embeddings_respect_a_non_preemptible_lease(monkeypatch, tmp_path)
     assert r.status_code == 409
     assert r.json()["error"]["code"] == "lease_required"
     assert captured == [], "a refused request must never reach the backend"
+
+
+# --------------------------------------------------------------------------- #
+# Multi-model Sparks: route each model to ITS port, and never evict a neighbour
+# --------------------------------------------------------------------------- #
+from llmconfig.config import SparkConfig                    # noqa: E402
+from llmconfig.registry import SparkRegistry                # noqa: E402
+from llmconfig.schemas import LoadedModel, SparkModelEntry  # noqa: E402
+from llmconfig.spark_unit import SparkUnit                  # noqa: E402
+
+SPARK_HOST = "10.9.9.9"
+
+
+def _add_spark(orch, tmp_path, settings):
+    """Register a real SparkUnit on the orchestrator the gateway already holds."""
+    cfg = SparkConfig(
+        id="spark1", name="Spark 1", host=SPARK_HOST, ssh_user="u", api_port=8000,
+        registry_path=tmp_path / "spark_models_spark1.yaml", load_timeout_s=5,
+        max_models=4,
+    )
+    reg = SparkRegistry(cfg.registry_path)
+    reg.upsert(SparkModelEntry(alias="a", recipe="ra", served_name="model-a",
+                               mem_fraction=0.4, load_timeout_s=5))
+    reg.upsert(SparkModelEntry(alias="b", recipe="rb", served_name="model-b",
+                               mem_fraction=0.4, load_timeout_s=5))
+    unit = SparkUnit(settings, cfg, reg, orch.jobs)
+    orch.units["spark1"] = unit
+    return unit
+
+
+def _spark_status(*pairs):
+    """A LaneStatus for a Spark holding (model, port) pairs."""
+    models = [LoadedModel(server="spark", model=m, port=p) for m, p in pairs]
+    return LaneStatus(
+        id="spark1", name="Spark 1", kind="spark", owner="spark" if models else "free",
+        ollama_up=False, vllm_up=False,
+        loaded=models[0] if models else None, loaded_models=models,
+    )
+
+
+async def test_route_sends_each_model_to_its_own_port(monkeypatch, tmp_path):
+    """Every Spark model used to resolve to the unit's single api_base, so a
+    request for a model on slot 1 was delivered to slot 0's process — which
+    answers 404 'model does not exist' with no hint that routing was wrong."""
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    gw = app.state.gateway if hasattr(app.state, "gateway") else None
+    unit = _add_spark(orch, tmp_path, Settings(_env_file=None))
+    from llmconfig.openai_gateway import OpenAIGateway
+    gw = gw or OpenAIGateway(orch, jobs, Settings(_env_file=None))
+
+    st = _spark_status(("model-a", 8000), ("model-b", 8001))
+    default = unit.cfg.api_base
+
+    assert gw._route(unit, "spark", "model-a", st, default) == f"http://{SPARK_HOST}:8000"
+    assert gw._route(unit, "spark", "model-b", st, default) == f"http://{SPARK_HOST}:8001"
+    # not resident yet -> slot 0, so a cold load still reaches a backend
+    assert gw._route(unit, "spark", "model-c", st, default) == default
+    # a GPU lane has one occupant; its URL must never be rewritten
+    assert gw._route(orch.primary, "vllm", "anything", st, "http://relay") == "http://relay"
+
+
+async def test_resident_reads_the_list_not_the_primary_occupant(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    from llmconfig.openai_gateway import OpenAIGateway
+    gw = OpenAIGateway(orch, jobs, Settings(_env_file=None))
+
+    st = _spark_status(("model-a", 8000), ("model-b", 8001))
+
+    # `loaded` names only model-a; model-b is resident all the same.
+    assert st.loaded.model == "model-a"
+    assert gw._resident(st, "model-b") is not None
+    assert gw._resident(st, "model-b").port == 8001
+    assert gw._resident(st, "model-c") is None
+
+
+async def test_spark_does_not_shortcircuit_on_a_different_in_flight_load(monkeypatch, tmp_path):
+    """On a GPU lane a different load means this model is about to be evicted, so
+    bailing is right. On a Spark the other load is for another slot entirely and
+    says nothing about this request."""
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    unit = _add_spark(orch, tmp_path, Settings(_env_file=None))
+    from llmconfig.openai_gateway import OpenAIGateway
+    gw = OpenAIGateway(orch, jobs, Settings(_env_file=None))
+
+    other = jobs.create(kind="load:spark1:spark:a")
+    other.state = "running"
+    st = _spark_status()
+    st.swap_in_progress, st.active_job_id = True, other.id
+
+    monkeypatch.setattr(orch, "load", lambda req: jobs.create(kind="load:spark1:spark:b"))
+    job, short_circuit = gw._ensure_load_job(unit, st, "load:spark1:spark:b", "spark", "b",
+                                             stream=False)
+    assert short_circuit is False, "a Spark must queue, not bail"
+    assert job is not None
+
+    # the GPU lane keeps the old behaviour
+    st2 = _spark_status()
+    st2.swap_in_progress, st2.active_job_id = True, other.id
+    job2, sc2 = gw._ensure_load_job(orch.primary, st2, "load:primary:vllm:x", "vllm", "x",
+                                    stream=False)
+    assert sc2 is True and job2 is None, "a GPU lane still short-circuits"

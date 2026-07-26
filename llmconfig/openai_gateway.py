@@ -72,14 +72,17 @@ class OpenAIGateway:
     async def resolve(self, lane: "Unit", model: str) -> Optional[tuple[str, str, str]]:
         """Map an OpenAI `model` id → (server, load_arg, backend_base_url).
 
-        - on a Spark unit: a curated `served_name` → ("spark", alias, node api base)
+        - on a Spark unit: a curated `served_name` → ("spark", alias, node slot-0 base)
+          The URL here is only a DEFAULT: a Spark can serve several models at once,
+          each on its own port, and which port a model occupies is not known until
+          status() has probed. `_route()` corrects it once residency is known.
         - a vLLM `served_name` (uses `-`) → ("vllm", alias, lane relay url)
         - else an Ollama tag (has `:`)     → ("ollama", tag, lane ollama url)
         - else None (→ 404). The id formats don't collide.
         """
         if not model:
             return None
-        # A Spark node serves one workload; its catalog is the only thing to match.
+        # A Spark's catalog is the only thing to match; the port comes later.
         if isinstance(lane, SparkUnit):
             fallback: Optional[str] = None
             for e in lane.registry.entries():
@@ -108,6 +111,34 @@ class OpenAIGateway:
             if model in names:
                 return ("ollama", model, lane.cfg.ollama_url)
         return None
+
+    @staticmethod
+    def _resident(status, model: str):
+        """The resident `LoadedModel` for `model` on this unit, or None.
+
+        Reads the additive `loaded_models` list rather than the scalar `loaded`,
+        which only ever names the unit's primary occupant — the reason a request
+        for a co-resident model used to miss the fast path and tear down its
+        neighbour to "load" something that was already up.
+        """
+        for m in (status.loaded_models or []):
+            if m.model == model:
+                return m
+        return None
+
+    def _route(self, lane: "Unit", server: str, model: str, status, default: str) -> str:
+        """Backend URL for THIS model.
+
+        Only Sparks can disagree with the unit-wide default: several models, one
+        port each. Falling back to `default` (slot 0) when the model is not
+        resident is what lets a cold load still reach a backend.
+        """
+        if server != "spark":
+            return default
+        m = self._resident(status, model)
+        if m is not None and m.port:
+            return lane.cfg.api_base_for(m.port)
+        return default
 
     # ---- lease admission (see leases.py) ----
     def _lease_gate(self, unit_id: str, lease_id: str):
@@ -198,14 +229,22 @@ class OpenAIGateway:
                          load_arg: str, stream: bool):
         """Return (job_or_None, short_circuit). Coalesces onto an identical in-flight
         load; for a *different* in-flight load, queues ours (stream) or signals a
-        short-circuit (non-stream, so title-gen doesn't block for minutes)."""
+        short-circuit (non-stream, so title-gen doesn't block for minutes).
+
+        The short-circuit exists because a GPU lane holds ONE model: a different
+        load in flight means the model being asked for is about to be evicted, so
+        waiting is pointless. That is not true of a Spark, where the in-flight load
+        is for another slot entirely and has no bearing on this request — hence the
+        `isinstance` guard below.
+        """
         if status.swap_in_progress and status.active_job_id:
             active = self.jobs.get(status.active_job_id)
             if active and active.kind == target_kind and active.state in ("pending", "running"):
                 return active, False  # identical target already loading → attach
-            if not stream:
+            if not stream and not isinstance(lane, SparkUnit):
                 return None, True     # different model loading + non-stream → bail fast
-            # stream + different load: queue ours behind the lane lock (shows "waiting…")
+            # stream, or a Spark (co-residency makes the other load irrelevant):
+            # queue ours behind the unit lock (shows "waiting…")
         job = self.orch.load(LoadRequest(server=server, model=load_arg, lane=lane.cfg.id))
         return job, False
 
@@ -389,9 +428,13 @@ class OpenAIGateway:
         server, load_arg, backend = resolved
         lane.touch()  # inference traffic on this lane — reset the idle-unload window
 
-        # Fast path: the lane already serves exactly this model → forward, no load.
+        # Fast path: this model is ALREADY resident → forward, no load. Membership
+        # over loaded_models, not equality against the unit's primary occupant: on a
+        # multi-model Spark the latter made a request for co-resident model B miss
+        # the fast path and tear down model A to reload B.
         status = await lane.status()
-        if status.loaded and status.loaded.server == server and status.loaded.model == model:
+        backend = self._route(lane, server, model, status, backend)
+        if any(m.server == server and m.model == model for m in status.loaded_models):
             if stream:
                 return StreamingResponse(
                     self._stream_load_then_forward(None, backend, sub_path, body, model,
@@ -492,7 +535,8 @@ class OpenAIGateway:
         lane.touch()
 
         status = await lane.status()
-        if status.loaded and status.loaded.server == server and status.loaded.model == model:
+        backend = self._route(lane, server, model, status, backend)
+        if any(m.server == server and m.model == model for m in status.loaded_models):
             resp = await self.forward(backend, sub_path, body, request.headers)
             lane.touch()
             return resp
