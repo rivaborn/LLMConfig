@@ -98,6 +98,8 @@ class SparkModel(BaseModel):
     notes: str = ""
     loaded: bool = False
     load_timeout_s: int = 900
+    mem_fraction: float = 0.0  # declared share of the node pool; 0 = whole node
+    port: int = 0              # the port it is CURRENTLY served on; 0 when not loaded
 
 
 class SparkModelEntry(BaseModel):
@@ -116,6 +118,14 @@ class SparkModelEntry(BaseModel):
     notes: str = ""
     extra_args: list[str] = Field(default_factory=list)
     load_timeout_s: int = 900
+    # Share of the node's unified pool this model may claim, passed to sparkrun as
+    # `--gpu-mem`. A Spark has no eviction-wait gate (nothing to wait for — memory is
+    # released when the container stops), so this declared budget is the ONLY thing
+    # that keeps co-resident models from colliding: the unit sums it over everything
+    # already loaded and refuses a load that would exceed `spark_mem_headroom`.
+    # 0.0 means "unset" — treated as a whole-node claim, which is the pre-multi-model
+    # behaviour and keeps old catalogs working.
+    mem_fraction: float = 0.0
 
     def to_public(self) -> "SparkModel":
         return SparkModel(
@@ -126,6 +136,7 @@ class SparkModelEntry(BaseModel):
             status=self.status,
             notes=self.notes,
             load_timeout_s=self.load_timeout_s,
+            mem_fraction=self.mem_fraction,
         )
 
 
@@ -202,6 +213,11 @@ class LoadedModel(BaseModel):
     spilled: bool = False
     fully_on_gpu: bool = True
     gpu_vram_pct: float = 0.0  # share of the card's VRAM in use once loaded
+    # Port this model is served on. Only meaningful for a Spark, where several
+    # models can be resident at once and each sparkrun workload gets its own port;
+    # it is DISCOVERED by probing, never persisted, so it survives a restart. 0 on
+    # a GPU lane, whose single occupant is always reached via the lane's own URL.
+    port: int = 0
 
 
 class LaneStatus(BaseModel):
@@ -222,7 +238,15 @@ class LaneStatus(BaseModel):
     owner: Owner
     ollama_up: bool
     vllm_up: bool
+    # The unit's primary resident model — `loaded_models[0]` when anything is loaded.
+    # Kept scalar for backward compatibility: off-box consumers already switch on it
+    # (see invariant 8), so multi-model support arrives as the ADDITIVE list below
+    # rather than by changing this field's type.
     loaded: Optional[LoadedModel] = None
+    # Every model resident on the unit. A GPU lane holds at most one (the
+    # eviction-wait gate guarantees it); a Spark can hold several, each on its own
+    # port. Always consistent with `loaded`: empty iff `loaded is None`.
+    loaded_models: list[LoadedModel] = Field(default_factory=list)
     # Remote units have no local card, so this defaults to a not-found GpuOut rather
     # than being required; Spark telemetry (when available) is filled in from the
     # node's own nvidia-smi over SSH.
@@ -288,6 +312,11 @@ class LoadRequest(BaseModel):
 class UnloadRequest(BaseModel):
     server: Optional[ServerName] = None  # None = free whatever holds the GPU
     lane: str = "primary"                # which GPU lane to free
+    # Free ONE model, leaving any co-resident models on the unit running. Only a
+    # Spark can have co-tenants; on a GPU lane this is either the single occupant or
+    # a no-op. None (the default) keeps the original meaning — free the whole unit —
+    # which is what the idle reaper and a lease's `free_on_preempt` still want.
+    model: Optional[str] = None
 
 
 # --------------------------------------------------------------------------- #

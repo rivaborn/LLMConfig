@@ -434,3 +434,111 @@ async def test_missing_context_is_zero_not_a_crash(cfg, calls):
     u = make_unit(cfg)
     st = await u.status()
     assert st.loaded.context_len == 0 and st.loaded.root == ""
+
+
+# --------------------------------------------------------------------------- #
+# Multi-model residency (several workloads on one node, one per slot port)
+# --------------------------------------------------------------------------- #
+def slot_route(port: int, served: str | None, root: str = "", ctx: int = 0):
+    """Mock ONE slot's /v1/models. Each slot runs its own vLLM process, so the
+    multi-model dimension is across ports, not inside a single response."""
+    data = ([{"id": served, "root": root, "max_model_len": ctx}] if served else [])
+    return respx.get(f"http://{HOST}:{port}/v1/models").mock(
+        return_value=httpx.Response(200, json={"data": data})
+    )
+
+
+@respx.mock
+async def test_status_reports_every_resident_model(cfg, calls):
+    """The whole point of the change: a node holding several models reports all
+    of them, not just whatever answered on the base port."""
+    unit = make_unit(cfg)
+    slot_route(8000, "served-1", root="org/one", ctx=65536)
+    slot_route(8001, "served-2", root="org/two", ctx=32768)
+    slot_route(8002, None)
+    slot_route(8003, None)
+
+    st = await unit.status()
+
+    assert [m.model for m in st.loaded_models] == ["served-1", "served-2"]
+    assert [m.port for m in st.loaded_models] == [8000, 8001]
+    assert [m.context_len for m in st.loaded_models] == [65536, 32768]
+    assert [m.root for m in st.loaded_models] == ["org/one", "org/two"]
+    assert st.owner == "spark"
+
+
+@respx.mock
+async def test_loaded_stays_the_first_model_for_backwards_compatibility(cfg, calls):
+    """`loaded` is the documented back-compat surface (invariant 8) — off-box
+    consumers switch on it, so it must remain the primary occupant, not vanish."""
+    unit = make_unit(cfg)
+    slot_route(8000, "served-1")
+    slot_route(8001, "served-2")
+    slot_route(8002, None)
+    slot_route(8003, None)
+
+    st = await unit.status()
+
+    assert st.loaded is not None
+    assert st.loaded == st.loaded_models[0]
+    assert st.loaded.model == "served-1"
+
+
+@respx.mock
+async def test_a_gap_in_the_slots_does_not_hide_later_models(cfg, calls):
+    """Slot 0 empty must not stop slot 2 being seen — the old code read the base
+    port only, so an occupied higher slot was invisible."""
+    unit = make_unit(cfg)
+    slot_route(8000, None)
+    slot_route(8001, None)
+    slot_route(8002, "served-2")
+    slot_route(8003, None)
+
+    st = await unit.status()
+
+    assert [(m.model, m.port) for m in st.loaded_models] == [("served-2", 8002)]
+    assert st.loaded.model == "served-2"
+    assert st.owner == "spark"
+
+
+@respx.mock
+async def test_empty_node_reports_no_models(cfg, calls):
+    unit = make_unit(cfg)
+    for p in (8000, 8001, 8002, 8003):
+        slot_route(p, None)
+
+    st = await unit.status()
+
+    assert st.loaded_models == []
+    assert st.loaded is None
+    assert st.owner in ("free", "unknown")
+
+
+@respx.mock
+async def test_list_models_flags_every_resident_entry_with_its_port(cfg, calls):
+    """Previously exactly one catalog row could be `loaded`; the UI dropdown and
+    the CLI marker both keyed off that."""
+    reg = SparkRegistry(cfg.registry_path)
+    reg.upsert(SparkModelEntry(alias="m1", recipe="r1", served_name="served-1"))
+    reg.upsert(SparkModelEntry(alias="m2", recipe="r2", served_name="served-2"))
+    reg.upsert(SparkModelEntry(alias="m3", recipe="r3", served_name="served-3"))
+    unit = SparkUnit(Settings(_env_file=None), cfg, reg, JobManager())
+
+    slot_route(8000, "served-1")
+    slot_route(8001, "served-3")
+    slot_route(8002, None)
+    slot_route(8003, None)
+
+    models = {m.alias: m for m in await unit.spark.list_models()}
+
+    assert (models["m1"].loaded, models["m1"].port) == (True, 8000)
+    assert (models["m3"].loaded, models["m3"].port) == (True, 8001)
+    assert (models["m2"].loaded, models["m2"].port) == (False, 0)
+
+
+def test_slot_ports_follow_max_models(tmp_path):
+    c = SparkConfig(id="s", name="s", host=HOST, ssh_user="u", api_port=8000,
+                    registry_path=tmp_path / "r.yaml", max_models=3)
+    assert c.slot_ports == (8000, 8001, 8002)
+    assert c.api_base_for(8002) == f"http://{HOST}:8002"
+    assert c.api_base == f"http://{HOST}:8000"  # slot 0, unchanged for old callers

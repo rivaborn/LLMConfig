@@ -132,6 +132,11 @@ class Lane:
             ollama_up=ollama_up,
             vllm_up=served is not None,
             loaded=loaded,
+            # A GPU lane holds at most one model — the eviction-wait gate guarantees
+            # it — so the additive list is just the scalar, wrapped. Populating it
+            # here keeps "loaded_models is empty iff loaded is None" true for every
+            # unit kind, so consumers can read the list unconditionally.
+            loaded_models=[loaded] if loaded else [],
             gpu=GpuOut.from_info(gpu),
             swap_in_progress=self._lock.locked(),
             active_job_id=self._active_job_id,

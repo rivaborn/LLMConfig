@@ -14,10 +14,12 @@ Three transports, each chosen because it is the most reliable source for its job
   parsers in `gpu.py`. The control node's WSL already has passwordless key auth
   to every Spark.
 
-Unlike a GPU `Lane` there is no eviction-wait gate: the node *is* the unit and
-runs one workload at a time, so "swapping models" is stop-then-run. Every failure
-path degrades quietly (unreachable node → `found=False` / `None`) so a Spark that
-is powered off never breaks `/api/status`.
+Unlike a GPU `Lane` there is no eviction-wait gate — stopping a container releases
+its memory outright, so there is nothing to poll for. The node can host SEVERAL
+workloads at once, one per slot port (`api_port + N`); residency is discovered by
+probing those ports, never persisted, so it survives a restart. Every failure path
+degrades quietly (unreachable node → `found=False` / `None`) so a Spark that is
+powered off never breaks `/api/status`.
 """
 from __future__ import annotations
 
@@ -54,35 +56,47 @@ class SparkBackend:
         self.s = settings
         self.cfg = cfg
         self.registry = registry
-        self._http: httpx.AsyncClient | None = None
+        # One pooled client per slot port — a node can serve several models at
+        # once and each lives on its own port.
+        self._clients: dict[int, httpx.AsyncClient] = {}
 
     # ---- HTTP plumbing ----
-    def _client(self) -> httpx.AsyncClient:
-        if self._http is None or self._http.is_closed:
-            self._http = httpx.AsyncClient(
-                base_url=self.cfg.api_base,
+    def _client(self, port: Optional[int] = None) -> httpx.AsyncClient:
+        """Pooled client for one slot. Keyed by port because a node can serve
+        several models at once, each its own workload on its own port."""
+        port = port or self.cfg.api_port
+        c = self._clients.get(port)
+        if c is None or c.is_closed:
+            c = httpx.AsyncClient(
+                base_url=self.cfg.api_base_for(port),
                 timeout=httpx.Timeout(self.s.http_timeout_s),
             )
-        return self._http
+            self._clients[port] = c
+        return c
 
     async def aclose(self) -> None:
-        if self._http is not None and not self._http.is_closed:
-            await self._http.aclose()
-        self._http = None
+        for c in list(self._clients.values()):
+            if not c.is_closed:
+                await c.aclose()
+        self._clients.clear()
 
     # ---- liveness / state ----
     async def served(self) -> Optional[str]:
         """The model this node is currently serving, or None when nothing is up."""
         return (await self.served_info()).name
 
-    async def served_info(self) -> ServedModel:
-        """What this backend is serving: name, real HF repo, and context window.
+    async def served_info(self, port: Optional[int] = None) -> ServedModel:
+        """What ONE slot is serving: name, real HF repo, and context window.
 
         Served names are chosen per unit and can collide across units, so the
         root is what tells two same-named models apart (see `LoadedModel.root`).
+        A slot runs a single vLLM/SGLang process, so its /v1/models carries one
+        entry — the multi-model dimension is across PORTS, not within a response.
         """
         try:
-            r = await self._client().get("/v1/models", timeout=self.s.vllm_probe_timeout_s)
+            r = await self._client(port).get(
+                "/v1/models", timeout=self.s.vllm_probe_timeout_s
+            )
             r.raise_for_status()
             data = r.json().get("data", []) or []
             if not data:
@@ -95,6 +109,24 @@ class SparkBackend:
             )
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
             return ServedModel()
+
+    async def served_slots(self) -> dict[int, ServedModel]:
+        """Every occupied slot as {port: ServedModel}, probed CONCURRENTLY.
+
+        This is how the port->model map is discovered instead of persisted: after
+        an LLMConfig restart the resident models are found by asking the node.
+        All probes run together so N slots cost one probe timeout, not N — status
+        is on the UI's 2.5 s poll path (invariant 9).
+        """
+        ports = self.cfg.slot_ports
+        results = await asyncio.gather(
+            *(self.served_info(p) for p in ports), return_exceptions=True
+        )
+        out: dict[int, ServedModel] = {}
+        for port, res in zip(ports, results):
+            if isinstance(res, ServedModel) and res.name:
+                out[port] = res
+        return out
 
     async def up(self) -> bool:
         return (await self.served()) is not None
@@ -109,11 +141,16 @@ class SparkBackend:
         return r.rc == 0
 
     async def list_models(self) -> list[SparkModel]:
-        served = await self.served()
+        """Catalog with residency. Several entries can be `loaded` at once, each
+        carrying the port it is actually reachable on."""
+        slots = await self.served_slots()
+        by_name = {sm.name: port for port, sm in slots.items() if sm.name}
         out: list[SparkModel] = []
         for entry in self.registry.entries():
             pub = entry.to_public()
-            pub.loaded = bool(served and pub.served_name == served)
+            port = by_name.get(pub.served_name)
+            pub.loaded = port is not None
+            pub.port = port or 0
             out.append(pub)
         return out
 
@@ -125,8 +162,9 @@ class SparkBackend:
                 cluster=self.s.spark_cluster,
                 host=self.cfg.host,
                 user=self.cfg.ssh_user,
-                port=self.cfg.api_port,
-                **kw,
+                # Slot 0 unless the caller names a port — `kw` wins, so a load can
+                # target the slot it allocated.
+                **{"port": self.cfg.api_port, **kw},
             ).strip()
         except (KeyError, IndexError) as e:
             raise RuntimeError(
@@ -164,17 +202,28 @@ class SparkBackend:
         served_name: str,
         timeout: float,
         on_log: LogCb | None = None,
+        port: Optional[int] = None,
     ) -> bool:
-        """Poll the node's /v1/models until `served_name` appears, or timeout."""
+        """Poll ONE slot's /v1/models until `served_name` appears, or timeout.
+
+        Scoped to `port` because co-resident models are the normal case now: a
+        neighbour on another slot is not evidence of the wrong state, so polling
+        the node as a whole would let one model's readiness be satisfied — or
+        contradicted — by another's.
+        """
         deadline = time.monotonic() + timeout
         announced = False
         while time.monotonic() < deadline:
-            current = await self.served()
+            current = (await self.served_info(port)).name
             if current == served_name:
                 return True
             if current and not announced and on_log:
-                # Something else came up — surface it rather than silently timing out.
-                on_log(f"node is serving '{current}' (waiting for '{served_name}')")
+                # This slot is serving something else — a genuine anomaly, unlike
+                # a different model on a different port.
+                on_log(
+                    f"slot {port or self.cfg.api_port} is serving '{current}' "
+                    f"(waiting for '{served_name}')"
+                )
                 announced = True
             await asyncio.sleep(self.s.poll_interval_s)
         return False

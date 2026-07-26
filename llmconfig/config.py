@@ -47,18 +47,22 @@ class LaneConfig:
 class SparkConfig:
     """One remote NVIDIA DGX Spark (GB10) node, driven by `sparkrun` over WSL.
 
-    Unlike a `LaneConfig` there is no intra-unit arbitration: the node *is* the
-    unit and serves exactly one model at a time (one sparkrun workload), so there
-    is no eviction-wait gate and no local nvidia-smi UUID. Status is read over
-    HTTP from the node's OpenAI endpoint; lifecycle goes through sparkrun.
+    Unlike a `LaneConfig` there is no intra-unit arbitration and no eviction-wait
+    gate: memory is released when a container stops, so there is nothing to poll
+    for. The node can host SEVERAL models at once (128 GB unified), each as its
+    own sparkrun workload on its own port `api_port + slot`; co-residency is
+    bounded by each recipe's declared `mem_fraction`, not by a hardware gate.
+    Status is read over HTTP from each slot's OpenAI endpoint; lifecycle goes
+    through sparkrun.
     """
 
     id: str                       # "spark1".."spark4" — the API/lane key
     name: str                     # display label, e.g. "spark-cc9b"
     host: str                     # LAN address, e.g. "192.168.1.50"
     ssh_user: str                 # SSH user on the node (for remote nvidia-smi)
-    api_port: int                 # OpenAI-compatible port the workload serves on
+    api_port: int                 # base port; slot N serves on api_port + N
     registry_path: Path           # curated per-node model catalog
+    max_models: int = 4           # concurrent workloads => ports api_port..+max_models-1
     enabled: bool = True
     # GB10 is 128 GB unified memory; nvidia-smi reports memory.total as [N/A] on
     # these parts, so this is the fallback denominator for the VRAM percentage.
@@ -72,7 +76,21 @@ class SparkConfig:
 
     @property
     def api_base(self) -> str:
+        """Slot 0. Kept as a property because plenty of call sites want *an*
+        endpoint for the node; anything routing a specific model must use
+        `api_base_for(port)` instead."""
         return f"http://{self.host}:{self.api_port}"
+
+    def api_base_for(self, port: int) -> str:
+        """The endpoint a model served on `port` is reachable at."""
+        return f"http://{self.host}:{port}"
+
+    @property
+    def slot_ports(self) -> tuple[int, ...]:
+        """Every port a workload on this node may occupy. `status()` probes all of
+        them, which is how the port->model map is discovered rather than stored —
+        so it survives an LLMConfig restart with models already resident."""
+        return tuple(self.api_port + i for i in range(max(1, self.max_models)))
 
     @property
     def gpu_uuid(self) -> str:
@@ -163,7 +181,16 @@ class Settings(BaseSettings):
         "spark4=192.168.1.53=spark-f04a"
     )
     spark_ssh_user: str = "fksogbetun"
-    spark_api_port: int = 8000          # OpenAI port the sparkrun workload serves on
+    spark_api_port: int = 8000          # base OpenAI port; slot N uses base + N
+    # Concurrent models per node. A GB10 holds 128 GB unified, so several models fit
+    # if each declares a `mem_fraction`. Each slot costs one HTTP probe per status
+    # poll (they run concurrently), so this is the knob that trades poll cost for
+    # capacity.
+    spark_max_models: int = 4
+    # Total share of a node's pool that may be committed at once. Loads are refused
+    # when the sum of resident `mem_fraction` plus the incoming model exceeds this.
+    # Below 1.0 because vLLM's own allocation is not the only consumer on the node.
+    spark_mem_headroom: float = 0.95
     spark_cluster: str = "sparks"       # saved sparkrun cluster name
     spark_vram_total_mb: int = 122880   # ~120 GiB usable of the 128 GB unified pool
     spark_load_timeout_s: int = 900     # weights are large; cold starts take minutes
@@ -188,6 +215,11 @@ class Settings(BaseSettings):
     # `stop` requires a TARGET or --all; without either it exits "Must specify
     # TARGET or --all." and nothing is stopped.
     spark_stop_cmd: str = "sparkrun stop --all --cluster {cluster} --hosts {host}"
+    # Stop ONE workload, leaving co-residents running. `stop` accepts a TARGET that
+    # is a recipe name or a cluster id; the recipe is what this app already knows.
+    # Without this every load would keep using `--all` and evict the neighbours it
+    # is supposed to coexist with.
+    spark_stop_one_cmd: str = "sparkrun stop {recipe} --cluster {cluster} --hosts {host}"
     spark_status_cmd: str = "sparkrun status --cluster {cluster}"
     # Remote telemetry: plain SSH to the node (the control node's WSL already has
     # passwordless key auth to every Spark).
@@ -335,6 +367,7 @@ class Settings(BaseSettings):
                     host=host,
                     ssh_user=self.spark_ssh_user,
                     api_port=self.spark_api_port,
+                    max_models=self.spark_max_models,
                     registry_path=REPO_ROOT / "data" / f"spark_models_{node_id}.yaml",
                     vram_total_mb=self.spark_vram_total_mb,
                     idle_unload_enabled=self.spark_idle_unload_enabled,

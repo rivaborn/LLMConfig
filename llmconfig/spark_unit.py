@@ -72,16 +72,21 @@ class SparkUnit:
     # ------------------------------------------------------------------ #
     # Status
     # ------------------------------------------------------------------ #
-    async def _served(self) -> ServedModel:
-        """`spark.served_info()` behind the backoff breaker (see `_served_fails`)."""
+    async def _served_slots(self) -> dict[int, ServedModel]:
+        """`spark.served_slots()` behind the backoff breaker (see `_served_fails`).
+
+        The breaker is per NODE, not per slot: when a Spark is powered off every
+        port times out together, so backing off once spares /api/status all of
+        them (invariant 9).
+        """
         now = time.time()
         if (self._served_fails >= self._fails_before_backoff
                 and now - self._served_ts < self._probe_backoff_s):
-            return ServedModel()  # presumed still down; re-probe once the backoff expires
+            return {}  # presumed still down; re-probe once the backoff expires
         self._served_ts = now
-        info = await self.spark.served_info()
-        self._served_fails = 0 if info.name else self._served_fails + 1
-        return info
+        slots = await self.spark.served_slots()
+        self._served_fails = 0 if slots else self._served_fails + 1
+        return slots
 
     def _refresh_gpu_soon(self) -> None:
         """Kick a background nvidia-smi refresh if the cached sample is stale."""
@@ -111,8 +116,7 @@ class SparkUnit:
 
         Only the fast HTTP probe is awaited here — see `_refresh_gpu_soon`.
         """
-        info = await self._served()
-        served = info.name
+        slots = await self._served_slots()
         self._refresh_gpu_soon()
         remote_gpu = self._gpu_cached or GpuInfo(
             found=False, uuid=self.cfg.gpu_uuid, error="awaiting first telemetry sample"
@@ -121,21 +125,28 @@ class SparkUnit:
         # Serving over HTTP proves the node is up. Otherwise fall back to whether
         # the last nvidia-smi sample succeeded — an idle-but-alive node still
         # answers SSH, a powered-off one doesn't.
-        reachable = bool(served) or remote_gpu.found
+        reachable = bool(slots) or remote_gpu.found
 
-        loaded: Optional[LoadedModel] = None
-        if served:
-            owner = "spark"
-            loaded = LoadedModel(
+        # One LoadedModel per occupied slot, ordered by port so the list — and
+        # therefore the back-compat scalar below — is stable across polls.
+        loaded_models: list[LoadedModel] = [
+            LoadedModel(
                 server="spark",
-                model=served,
+                model=info.name or "",
                 root=info.root,
                 context_len=info.context_len,
+                # Node-wide occupancy: the unified pool is shared, so this is the
+                # whole node's figure on every entry, not a per-model share.
                 gpu_vram_pct=remote_gpu.vram_pct,
                 fully_on_gpu=True,
+                port=port,
             )
-        else:
-            owner = "free" if reachable else "unknown"
+            for port, info in sorted(slots.items())
+        ]
+        # `loaded` stays the primary occupant for every existing consumer; the list
+        # is the additive surface (invariant 8/12).
+        loaded: Optional[LoadedModel] = loaded_models[0] if loaded_models else None
+        owner = "spark" if loaded_models else ("free" if reachable else "unknown")
 
         return LaneStatus(
             id=self.cfg.id,
@@ -150,6 +161,7 @@ class SparkUnit:
             ollama_up=False,
             vllm_up=False,
             loaded=loaded,
+            loaded_models=loaded_models,
             gpu=GpuOut.from_info(remote_gpu),
             swap_in_progress=self._lock.locked(),
             active_job_id=self._active_job_id,
