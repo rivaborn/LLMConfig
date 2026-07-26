@@ -53,6 +53,13 @@ so it packs 100 % of VRAM before any CPU spill.
 - **Idle auto-unload** so an unused card drops to P8 (~115 W → ~30 W measured).
 - **Model management:** pull/delete Ollama models, edit the vLLM and Spark catalogs,
   trigger HuggingFace downloads — all as streamed jobs.
+- **Cookbook:** save the current fleet arrangement (which models run where) under a
+  name; applying a state loads exactly those models — and only those — across every
+  unit as one streamed meta-job, with lease-aware unloads and the load-order rules
+  (`needs_empty_node`) honoured. One state can be the startup default.
+- **Load-time estimates:** every real launch is timed (median of the last 5); the UI
+  shows sizes + "≈2 min load" on hover, and grays models that won't fit a node —
+  computed server-side beside the admission arithmetic so the two can't drift.
 - **`doctor`:** read-only recon that verifies every on-box assumption before you trust
   a swap.
 

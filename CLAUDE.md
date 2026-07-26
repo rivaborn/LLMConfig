@@ -211,13 +211,19 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    `--hosts` alone sparkrun uses the local WSL user and every node returns
    *Permission denied*), **`--no-follow`** (otherwise `run` tails container logs
    and never returns, so the load hangs to its timeout), and **a TARGET or `--all`
-   on `stop`** (with neither it exits *"Must specify TARGET or --all."*). There are
-   two stop templates and the difference matters: `SPARK_STOP_ONE_CMD` names a
-   recipe and leaves co-residents running — it is what per-model unload and the
-   idle reaper use — while `SPARK_STOP_CMD`'s `--all` sweeps the node and is only
-   for "free the whole unit". Recipe names are **namespaced** (`@eugr/…`,
-   `@official/…`) — find them with `sparkrun search`.
-   `tests/test_spark.py::test_launch_command_matches_verified_sparkrun_flags` pins this.
+   on `stop`** (with neither it exits *"Must specify TARGET or --all."*).
+   **A targeted stop must use the sparkrun JOB ID, never the recipe name** —
+   `sparkrun stop <recipe> --hosts` prints *"Workload stopped"* with rc=0 and stops
+   NOTHING (live, 2026-07-26: the embedder survived three "successful" stops), and
+   `stop` also swallows SSH failures into rc=0, so the exit code can never be
+   trusted; the slot re-probe after unload is the real check.
+   `SparkBackend.stop(recipe=…)` therefore resolves the recipe to this host's job
+   id via `sparkrun status` and stops by id (`SPARK_STOP_JOB_CMD`); `SPARK_STOP_CMD`'s
+   `--all` sweeps the node for "free the whole unit". `SPARK_STOP_ONE_CMD` is a
+   documented tombstone. Recipe names are **namespaced** (`@eugr/…`, `@official/…`)
+   — find them with `sparkrun search`.
+   `tests/test_spark.py::test_launch_command_matches_verified_sparkrun_flags` and
+   `::test_targeted_stop_resolves_the_job_id_on_this_host` pin this.
 11. **`LeaseManager`'s query/mutation methods must stay synchronous.** `idle.py`'s
    final guard and `LeaseSweeper._free_unit` both rely on there being **no await**
    between the last check and `Unit.unload()` — an uncontended `asyncio.Lock`
