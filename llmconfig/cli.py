@@ -155,11 +155,15 @@ def load(
 def unload(
     server: Optional[str] = typer.Option(None, "--server", help="ollama | vllm (default: whatever holds the GPU)"),
     lane: str = typer.Option("primary", "--lane", help="primary (3090) | companion (3070 Ti)"),
+    model: Optional[str] = typer.Option(None, "--model",
+                                        help="free just this model, leaving co-residents "
+                                             "running (Spark nodes hold several)"),
 ) -> None:
-    """Free a lane's GPU."""
+    """Free a unit — or one model on it."""
     try:
         with _client() as c:
-            d = c.post("/api/unload", json={"server": server, "lane": lane}).json()
+            d = c.post("/api/unload",
+                       json={"server": server, "lane": lane, "model": model}).json()
     except httpx.HTTPError as e:
         _bail(e)
     _print_status(d)
@@ -445,15 +449,22 @@ def _print_lane(l: dict) -> None:
         typer.echo(f"  gpu:   {g['used_mb']}/{g['total_mb']} MiB ({g['vram_pct']}%)")
     else:
         typer.echo(f"  gpu:   n/a ({g.get('error', '')})")
-    lm = l.get("loaded")
-    if lm:
+    # A Spark holds several models at once, so list every resident one. `loaded` is
+    # just the first entry (see LaneStatus.loaded_models); fall back to it for a
+    # server that predates the list.
+    resident = l.get("loaded_models") or ([l["loaded"]] if l.get("loaded") else [])
+    if not resident:
+        typer.echo("  model: none")
+    for i, lm in enumerate(resident):
+        label_ = "model:" if i == 0 else "      "
         if lm["server"] == "ollama":
             spill = f", {_gib(lm['on_cpu_bytes'])} on CPU" if lm["spilled"] else " (fully on GPU)"
-            typer.echo(f"  model: {lm['model']} [ollama] {_gib(lm['on_gpu_bytes'])} on GPU{spill}")
+            typer.echo(f"  {label_} {lm['model']} [ollama] {_gib(lm['on_gpu_bytes'])} on GPU{spill}")
         else:
-            typer.echo(f"  model: {lm['model']} [vllm]")
-    else:
-        typer.echo("  model: none")
+            # Tag by the model's OWN server — printing every non-Ollama model as
+            # [vllm] mislabelled every Spark model.
+            port = f" :{lm['port']}" if lm.get("port") else ""
+            typer.echo(f"  {label_} {lm['model']} [{lm['server']}]{port}")
     if l.get("swap_in_progress"):
         typer.secho(f"  swap in progress (job {l.get('active_job_id')})", fg="yellow")
     held = l.get("lease")

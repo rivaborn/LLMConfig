@@ -33,7 +33,30 @@ one box per unit; one control tab per unit; Monitor covers all of them):
 `settings.units()` = `lanes()` + `sparks()`; the orchestrator keys everything off
 `self.units`, while `self.lanes` stays GPU-only (the WSL keepalive and the vLLM
 release logic are meaningless for a remote node). Sparks are **off by default**
-(`SPARK_ENABLED`). The rest of this section describes the GPU-lane half.
+(`SPARK_ENABLED`).
+
+**The two kinds differ in how many models they hold, and that is not a style
+choice.** A lane holds exactly ONE, enforced by the eviction-wait gate below,
+because a 24 GB card that overcommits spills into system RAM. A Spark has ~121 GB
+of unified memory and holds up to `SPARK_MAX_MODELS` (default 4) — one per slot
+port, `api_port … api_port+N-1` — because there is nothing to spill into and an
+embedder occupying a whole node at 17 % utilisation is pure waste. So on a Spark:
+
+- **Ports are discovered, never persisted.** `status()` probes all N slots
+  concurrently over HTTP and builds the port→model map from what answers, which is
+  restart-safe and keeps invariant 9 (status never awaits SSH).
+- **`loaded` is the primary occupant; `loaded_models` is the truth.** The scalar
+  stays for back-compat and always equals `loaded_models[0]`; a lane populates the
+  list with its single model so "empty iff `loaded is None`" holds for both kinds.
+- **Admission is by summed `mem_fraction`** — see invariant 14.
+- **Policy is per model**: per-model activity clocks (`touch(model=…)`), one victim
+  per reaper tick, leases that may name a model, and `unload(model=…)` for a
+  targeted stop. Any model name entering that machinery is folded onto the catalog
+  alias by `SparkUnit.canonical_model` — the gateway, a load and residency name the
+  same model three different ways.
+- **`tp > 1` claims the whole node** and must not be co-scheduled.
+
+The rest of this section describes the GPU-lane half.
 
 A **Lane** binds one inference-server *pair* (Ollama + vLLM) to **one GPU, matched by
 UUID**. The core guarantee is the **eviction-wait gate** in `lane.py`: before loading
@@ -64,14 +87,17 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
   `_load_ollama`/`_load_vllm`, `unload`, `_max_pack_reload`). **The heart of the app.**
 - `spark_unit.py` — `SparkUnit`: one **remote DGX Spark node** as a unit. Same
   duck-typed surface as `Lane` (`status`/`load`/`unload`/`touch`/`aclose`, own
-  `asyncio.Lock`, Job pattern) but no eviction gate and no local card — the node
-  *is* the unit and runs one sparkrun workload, so a swap is stop → run → wait-ready.
+  `asyncio.Lock`, Job pattern) but no eviction gate and no local card. It holds
+  several models at once, one per slot port, so a load is admit → run → wait-ready
+  (only a *reload of the same alias* stops anything first, and then only its own
+  slot). `unload(model=…)` stops one; without a model it frees the node.
 - `backends/spark.py` — `SparkBackend`: three transports, each the most reliable
   source for its job — **status over HTTP** (the node's `/v1/models`), **lifecycle
   via the `sparkrun` CLI** through `run_wsl`, **telemetry over SSH** (`nvidia-smi`,
   parsed by `gpu.py`).
-- `lane_state.py` — `LaneDefaults`: persist each lane's startup-default model to
-  `data/lane_defaults.yaml`.
+- `lane_state.py` — `LaneDefaults`: persist each unit's startup-default model**s** to
+  `data/lane_defaults.yaml` (a list per unit — a Spark starts several; the older
+  scalar shape is read and migrated on the next write).
 - `backends/ollama.py` — `OllamaBackend`: REST client to the Ollama server + Windows
   service control. Pooled `httpx` client; `pull` uses a dedicated no-timeout client.
 - `backends/vllm.py` — `VllmBackend`: relay `/v1/models` for status; `serve.sh` /
@@ -173,9 +199,13 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    **`--cluster` alongside `--hosts`** (the cluster carries the SSH user — with
    `--hosts` alone sparkrun uses the local WSL user and every node returns
    *Permission denied*), **`--no-follow`** (otherwise `run` tails container logs
-   and never returns, so the load hangs to its timeout), and **`--all` on `stop`**
-   (without a TARGET it exits *"Must specify TARGET or --all."*). Recipe names are
-   **namespaced** (`@eugr/…`, `@official/…`) — find them with `sparkrun search`.
+   and never returns, so the load hangs to its timeout), and **a TARGET or `--all`
+   on `stop`** (with neither it exits *"Must specify TARGET or --all."*). There are
+   two stop templates and the difference matters: `SPARK_STOP_ONE_CMD` names a
+   recipe and leaves co-residents running — it is what per-model unload and the
+   idle reaper use — while `SPARK_STOP_CMD`'s `--all` sweeps the node and is only
+   for "free the whole unit". Recipe names are **namespaced** (`@eugr/…`,
+   `@official/…`) — find them with `sparkrun search`.
    `tests/test_spark.py::test_launch_command_matches_verified_sparkrun_flags` pins this.
 11. **`LeaseManager`'s query/mutation methods must stay synchronous.** `idle.py`'s
    final guard and `LeaseSweeper._free_unit` both rely on there being **no await**
@@ -197,6 +227,16 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    `_load_vllm` always launches via `vllm@<alias>` → `serve.sh <alias>`, whose hardcoded
    `case` sets the args. A user-added model = add a `case` to `deploy/serve.sh` **and**
    add the alias row. If you wire up `managed_by: registry`, update `lane.py` + doctor.
+14. **A Spark load is admitted by summed `mem_fraction`, and there is nothing
+   else.** A lane can watch `nvidia-smi` drain before it loads; a Spark has no
+   equivalent — memory comes back only when a container stops, and vLLM
+   preallocates, so a resident model cannot be shrunk to make room. The declared
+   budgets in the catalog ARE the contract: `SparkUnit._admit` refuses a load when
+   the resident budgets plus the new one exceed `SPARK_MEM_HEADROOM` (0.95), and
+   refuses co-residency with any model whose `mem_fraction` is unset (0.0 = a
+   whole-node claim). Don't add a Spark load path that skips `_admit`, and keep new
+   catalog entries budgeted or they silently monopolise a node.
+
 
 ## Build / run / test
 

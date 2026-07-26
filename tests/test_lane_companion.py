@@ -257,3 +257,75 @@ async def test_autoload_fires_configured_default(monkeypatch, tmp_path):
     assert len(started) == 1
     assert "auto-me" in wc.ollama
     assert wp.ollama == {}
+
+
+# --------------------------------------------------------------------------- #
+# Multi-model defaults (a Spark holds several; a GPU lane exactly one)
+# --------------------------------------------------------------------------- #
+LEGACY_YAML = """
+lanes:
+  primary:
+    server: ollama
+    model: qwen3:32b
+"""
+
+GARBLED_YAML = """
+lanes:
+  primary: 'just a string'
+  companion:
+    models: [{}, 3]
+"""
+
+
+def test_defaults_read_the_legacy_scalar_shape(tmp_path):
+    """An existing lane_defaults.yaml written before the list shape must keep working."""
+    path = tmp_path / "ld.yaml"
+    path.write_text(LEGACY_YAML, encoding="utf-8")
+    d = LaneDefaults(Settings(_env_file=None), path=path)
+
+    assert d.get("primary") == {"server": "ollama", "model": "qwen3:32b"}
+    assert d.list("primary") == [{"server": "ollama", "model": "qwen3:32b"}]
+
+
+def test_defaults_rewrite_the_legacy_shape_as_a_list(tmp_path):
+    path = tmp_path / "ld.yaml"
+    path.write_text(LEGACY_YAML, encoding="utf-8")
+    LaneDefaults(Settings(_env_file=None), path=path).add("primary", "ollama", "gemma")
+
+    reloaded = LaneDefaults(Settings(_env_file=None), path=path)
+    assert [e["model"] for e in reloaded.list("primary")] == ["qwen3:32b", "gemma"]
+
+
+def test_add_is_idempotent_and_set_replaces(tmp_path):
+    d = LaneDefaults(Settings(_env_file=None), path=tmp_path / "ld.yaml")
+    d.add("spark1", "spark", "a")
+    d.add("spark1", "spark", "b")
+    d.add("spark1", "spark", "a")            # re-adding must not duplicate
+
+    assert [e["model"] for e in d.list("spark1")] == ["b", "a"]
+
+    d.set("spark1", "spark", "c")            # "the default" still means exactly one
+    assert d.list("spark1") == [{"server": "spark", "model": "c"}]
+
+
+def test_remove_drops_the_unit_once_empty(tmp_path):
+    d = LaneDefaults(Settings(_env_file=None), path=tmp_path / "ld.yaml")
+    d.add("spark1", "spark", "a")
+    d.add("spark1", "spark", "b")
+
+    assert d.remove("spark1", "a") is True
+    assert d.remove("spark1", "nope") is False
+    assert d.list("spark1") == [{"server": "spark", "model": "b"}]
+
+    d.remove("spark1", "b")
+    assert d.all() == {}
+
+
+def test_a_garbled_defaults_file_does_not_raise(tmp_path):
+    """It is user-editable, so a bad hand-edit must degrade to "no defaults"."""
+    path = tmp_path / "ld.yaml"
+    path.write_text(GARBLED_YAML, encoding="utf-8")
+
+    d = LaneDefaults(Settings(_env_file=None), path=path)
+
+    assert d.all() == {} and d.get("primary") is None

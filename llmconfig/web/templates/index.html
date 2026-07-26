@@ -18,9 +18,10 @@
     </details>
   </header>
 
-  <!-- Home: one box per LLM unit with its loaded model + a quick-switch dropdown. -->
+  <!-- Home: one box per LLM unit with its resident models + a quick-switch dropdown. -->
   <section id="view-home" class="view active" role="tabpanel">
-    <p class="hint">Every LLM unit at a glance. Pick a model to switch that unit; each runs one model at a time.</p>
+    <p class="hint">Every LLM unit at a glance. Pick a model to load it on that unit — a GPU lane
+      swaps to it (one model per card), a Spark adds it alongside whatever is already resident.</p>
     <div id="unit-grid" class="unit-grid"></div>
   </section>
 

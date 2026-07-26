@@ -282,7 +282,10 @@ class LaneUsageOut(BaseModel):
 
     lane: str
     state: LaneUsage
-    model: Optional[str] = None   # None when free
+    model: Optional[str] = None   # the primary occupant; None when free
+    # Every resident model. Additive alongside the scalar above (see
+    # LaneStatus.loaded_models) — a Spark can hold several at once.
+    models: list[str] = Field(default_factory=list)
     idle_s: Optional[float] = None
     lease: Optional["LeaseBrief"] = None   # additive; see LaneStatus.lease
 
@@ -292,6 +295,7 @@ class UsageResponse(BaseModel):
     lane: str
     state: LaneUsage
     model: Optional[str] = None
+    models: list[str] = Field(default_factory=list)   # additive; see LaneUsageOut.models
     idle_s: Optional[float] = None
     lease: Optional["LeaseBrief"] = None   # additive; mirrors the requested lane
     lanes: list[LaneUsageOut] = Field(default_factory=list)

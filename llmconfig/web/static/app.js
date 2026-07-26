@@ -34,14 +34,24 @@ async function api(path, opts) {
 }
 
 // ---- state ----
-let UNITS = [];                  // [{id, name, kind, host, enabled, default}]
+let UNITS = [];                  // [{id, name, kind, host, enabled, default, defaults, max_models}]
 const panels = {};               // unit id -> {el, refs, unit}
 const cards = {};                // unit id -> {el, refs, unit}   (Home dashboard)
-const busyUnits = new Set();     // units with a job in flight (per-unit, not global)
+// Keys with a job in flight. A whole-unit operation is keyed by unit id; an
+// operation on ONE model of a multi-model unit by `unit::model`, so loading a
+// second model on a Spark doesn't grey out the one already serving there.
+const busyUnits = new Set();
 let currentView = "home";
 
-const isBusy = (id) => busyUnits.has(id);
+const busyKey = (id, model) => (model ? `${id}::${model}` : id);
+const isBusy = (id, model) => busyUnits.has(id) || (!!model && busyUnits.has(busyKey(id, model)));
 const anyBusy = () => busyUnits.size > 0;
+// A GPU lane evicts to load, so any load there occupies the whole unit; only a
+// unit that can hold several models gets per-model keys.
+const multiModel = (id) => {
+  const u = UNITS.find((x) => x.id === id);
+  return !!u && (u.max_models || 1) > 1;
+};
 
 function log(text, append) {
   const el = $("log");
@@ -101,17 +111,16 @@ function buildCard(unit) {
       <span class="badge owner">…</span>
     </div>
     <div class="uc-sub">${unit.kind === "spark" ? esc(unit.host) : "local"}</div>
-    <div class="uc-loaded">…</div>
-    <div class="uc-ctx"></div>
+    <div class="uc-models">…</div>
     <div class="vram"><div class="vram-bar"><div class="vram-fill"></div></div><span class="vram-text"></span></div>
     <div class="uc-switch">
       <select class="uc-select" aria-label="Model for ${esc(unit.name || unit.id)}"></select>
-      <button class="btn uc-load" title="Load the selected model">Switch</button>
-      <button class="btn btn-warn uc-unload" title="Free this unit">Unload</button>
+      <button class="btn uc-load" title="Load the selected model">${unit.max_models > 1 ? "Add" : "Switch"}</button>
+      <button class="btn btn-warn uc-unload" title="Free the whole unit">Free all</button>
     </div>`;
   const q = (s) => el.querySelector(s);
   const refs = {
-    owner: q(".owner"), loaded: q(".uc-loaded"), ctx: q(".uc-ctx"),
+    owner: q(".owner"), models: q(".uc-models"),
     vramFill: q(".vram-fill"), vramText: q(".vram-text"),
     select: q(".uc-select"), load: q(".uc-load"), unload: q(".uc-unload"),
   };
@@ -192,7 +201,9 @@ function gpuPanelHtml(unit) {
 
 function sparkPanelHtml(unit) {
   return headHtml(unit,
-    `DGX Spark node at ${esc(unit.host)} — driven by sparkrun. The node serves one workload at a time.`) + `
+    `DGX Spark node at ${esc(unit.host)} — driven by sparkrun. Its 128 GB unified pool holds `
+    + `up to ${unit.max_models || 1} models at once, each on its own port; loads are admitted `
+    + `against their declared memory budgets.`) + `
       <div class="lane-cols one">
         <div class="col">
           <h3>Curated recipes <small class="muted-inline">sparkrun</small></h3>
@@ -203,14 +214,17 @@ function sparkPanelHtml(unit) {
     </section>`;
 }
 
-function unitDefault(id) {
+function unitDefaults(id) {
   const u = UNITS.find((x) => x.id === id);
-  return u && u.default ? u.default : null;
+  return (u && u.defaults) || (u && u.default ? [u.default] : []);
+}
+
+function isUnitDefault(id, server, model) {
+  return unitDefaults(id).some((d) => d.server === server && d.model === model);
 }
 
 function modelCard(unitId, server, name, meta, status, loaded) {
-  const def = unitDefault(unitId);
-  const isDefault = def && def.server === server && def.model === name;
+  const isDefault = isUnitDefault(unitId, server, name);
 
   const card = document.createElement("div");
   card.className = "card" + (loaded ? " loaded-card" : "");
@@ -227,13 +241,13 @@ function modelCard(unitId, server, name, meta, status, loaded) {
   star.className = "btn star" + (isDefault ? " on" : "");
   star.title = isDefault ? "Startup default (click to clear)" : "Set as startup default";
   star.textContent = isDefault ? "★" : "☆";
-  star.disabled = isBusy(unitId);
+  star.disabled = isBusy(unitId, name);
   star.onclick = () => setDefault(unitId, server, name);
 
   const btn = document.createElement("button");
   btn.className = "btn";
   btn.textContent = loaded ? "Loaded" : "Load";
-  btn.disabled = loaded || isBusy(unitId);
+  btn.disabled = loaded || isBusy(unitId, name);
   btn.onclick = () => doLoad(unitId, server, name);
 
   actions.appendChild(star);
@@ -269,6 +283,47 @@ function describeContext(lm) {
   return `${CTX(lm.context_len)} ctx`;
 }
 
+// `loaded_models` is the real answer — a Spark holds several at once. Fall back to
+// the back-compat scalar so an older server (or a unit kind that predates the list)
+// still renders.
+function residentModels(l) {
+  if (l.loaded_models && l.loaded_models.length) return l.loaded_models;
+  return l.loaded ? [l.loaded] : [];
+}
+
+// One row per resident model, each with its own Unload — freeing the embedder must
+// not take the chat model down with it.
+function renderResident(host, l) {
+  const models = residentModels(l);
+  host.innerHTML = "";
+  host.classList.toggle("none", models.length === 0);
+  if (!models.length) {
+    host.textContent = "None";
+    return;
+  }
+  models.forEach((m) => {
+    const row = document.createElement("div");
+    row.className = "uc-model";
+    const ctx = describeContext(m);
+    const label = document.createElement("span");
+    label.className = "uc-model-name";
+    label.textContent = describeLoaded(m) + (ctx ? `  ·  ${ctx}` : "");
+    row.appendChild(label);
+    // Only worth offering per-model when there IS a neighbour to spare; with one
+    // occupant the unit-level "Free all" already says it better.
+    if (models.length > 1) {
+      const x = document.createElement("button");
+      x.className = "btn btn-warn uc-model-unload";
+      x.textContent = "×";
+      x.title = `Unload ${m.model}, leaving the others running`;
+      x.disabled = isBusy(l.id, m.model);
+      x.onclick = () => doUnload(l.id, m.model);
+      row.appendChild(x);
+    }
+    host.appendChild(row);
+  });
+}
+
 async function refreshStatus() {
   let d;
   try { d = await api("/api/status"); } catch (e) { return; }
@@ -284,9 +339,7 @@ async function refreshStatus() {
       c.el.classList.toggle("offline", offline);
       c.refs.owner.textContent = ownerText;
       c.refs.owner.className = "badge owner " + (offline ? "unknown" : l.owner);
-      c.refs.loaded.textContent = l.loaded ? describeLoaded(l.loaded) : "None";
-      c.refs.loaded.classList.toggle("none", !l.loaded);
-      c.refs.ctx.textContent = describeContext(l.loaded);
+      renderResident(c.refs.models, l);
       c.refs.vramFill.style.width = (g.found ? g.vram_pct : 0) + "%";
       c.refs.vramText.textContent = vramText;
       c.refs.unload.disabled = isBusy(l.id) || !l.loaded;
@@ -300,8 +353,11 @@ async function refreshStatus() {
       r.owner.className = "badge owner " + (offline ? "unknown" : l.owner);
       r.vramFill.style.width = (g.found ? g.vram_pct : 0) + "%";
       r.vramText.textContent = vramText;
-      const ctx = describeContext(l.loaded);
-      r.loaded.textContent = describeLoaded(l.loaded) + (ctx ? `  ·  ${ctx}` : "");
+      const resident = residentModels(l);
+      r.loaded.textContent = resident.length
+        ? resident.map((m) => describeLoaded(m) + (describeContext(m) ? `  ·  ${describeContext(m)}` : ""))
+                  .join("     +     ")
+        : describeLoaded(null);
       if (r.ollamaDot) r.ollamaDot.className = "dot ollama-dot" + (l.ollama_up ? " up" : "");
       if (r.vllmDot) r.vllmDot.className = "dot vllm-dot" + (l.vllm_up ? " up" : "");
       r.unload.disabled = isBusy(l.id);
@@ -379,32 +435,35 @@ async function refreshModels() {
 }
 
 // ---- actions -------------------------------------------------------------
-function markBusy(unitId, on) {
-  if (on) busyUnits.add(unitId); else busyUnits.delete(unitId);
+function markBusy(unitId, on, model) {
+  const key = busyKey(unitId, multiModel(unitId) ? model : null);
+  if (on) busyUnits.add(key); else busyUnits.delete(key);
   setButtons();
 }
 
 async function doLoad(unitId, server, model) {
-  if (isBusy(unitId)) return;
-  markBusy(unitId, true);
+  if (isBusy(unitId, model)) return;
+  markBusy(unitId, true, model);
   log(`loading ${model} on ${server} [${unitId}]…`);
   try {
     const job = await api("/api/load", { method: "POST", body: JSON.stringify({ server, model, lane: unitId }) });
     await pollJob(job.id);
   } catch (e) { log("error: " + e.message, true); }
-  markBusy(unitId, false);
+  markBusy(unitId, false, model);
   await refreshAll();
 }
 
-async function doUnload(unitId) {
-  if (isBusy(unitId)) return;
-  markBusy(unitId, true);
-  log(`unloading / freeing [${unitId}]…`);
+// `model` frees just that one and leaves co-residents running; without it the
+// whole unit is freed.
+async function doUnload(unitId, model) {
+  if (isBusy(unitId, model)) return;
+  markBusy(unitId, true, model);
+  log(model ? `unloading ${model} [${unitId}]…` : `freeing the whole unit [${unitId}]…`);
   try {
-    await api("/api/unload", { method: "POST", body: JSON.stringify({ lane: unitId }) });
-    log("unit freed", true);
+    await api("/api/unload", { method: "POST", body: JSON.stringify({ lane: unitId, model: model || null }) });
+    log(model ? `${model} unloaded` : "unit freed", true);
   } catch (e) { log("error: " + e.message, true); }
-  markBusy(unitId, false);
+  markBusy(unitId, false, model);
   await refreshAll();
 }
 
@@ -423,13 +482,16 @@ async function doPull(unitId, input) {
 }
 
 async function setDefault(unitId, server, model) {
-  if (isBusy(unitId)) return;
-  const cur = unitDefault(unitId);
-  const clearing = cur && cur.server === server && cur.model === model;
+  if (isBusy(unitId, model)) return;
+  const clearing = isUnitDefault(unitId, server, model);
+  // On a unit that holds several models, starring a second one ADDS to the startup
+  // set rather than displacing the first; a GPU lane keeps replace-only semantics.
+  const mode = multiModel(unitId) ? (clearing ? "remove" : "add") : "replace";
+  const body = clearing && mode === "replace" ? { server: "", model: "" } : { server, model, mode };
   try {
     await api(`/api/lanes/${encodeURIComponent(unitId)}/default`, {
       method: "PUT",
-      body: JSON.stringify(clearing ? { server: "", model: "" } : { server, model }),
+      body: JSON.stringify(body),
     });
     UNITS = await api("/api/lanes");
     log(clearing ? `cleared ${unitId} startup default` : `set ${unitId} startup default → ${model} [${server}]`, true);
@@ -452,20 +514,29 @@ async function pollJob(id) {
 }
 
 function setButtons() {
-  // Disable only the units that are actually busy — a load on the 3090 must not
-  // freeze the controls for a Spark.
+  // Disable only what is actually busy — a load on the 3090 must not freeze the
+  // controls for a Spark, and on a multi-model unit loading B must not freeze A.
+  // A whole-unit key (no model) still greys everything, which is what a GPU lane's
+  // evict-then-load always does.
   Object.entries(panels).forEach(([id, p]) => {
-    const b = isBusy(id);
-    p.el.querySelectorAll(".card .btn").forEach((x) => {
-      if (x.textContent !== "Loaded") x.disabled = b;
+    const unitBusy = isBusy(id);
+    p.el.querySelectorAll(".card").forEach((card) => {
+      const name = card.querySelector(".name")?.firstChild?.textContent?.trim() || "";
+      const b = isBusy(id, name);
+      card.querySelectorAll(".btn").forEach((x) => {
+        if (x.textContent !== "Loaded") x.disabled = b;
+      });
     });
-    p.el.querySelectorAll(".unload, .pull-btn").forEach((x) => (x.disabled = b));
+    p.el.querySelectorAll(".unload, .pull-btn").forEach((x) => (x.disabled = unitBusy));
   });
   Object.entries(cards).forEach(([id, c]) => {
     const b = isBusy(id);
     c.refs.load.disabled = b;
     c.refs.unload.disabled = b;
     c.el.classList.toggle("busy", b);
+    c.refs.models.querySelectorAll(".uc-model-unload").forEach((x) => {
+      if (b) x.disabled = true;
+    });
   });
 }
 

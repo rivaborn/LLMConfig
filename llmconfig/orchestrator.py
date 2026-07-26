@@ -127,31 +127,42 @@ class Orchestrator:
         return await self.status()
 
     # ---- per-unit defaults ("what runs on this unit") ----
-    def default_for(self, unit_id: str) -> Optional[dict]:
-        """Persisted override, else the static config seed."""
-        d = self.defaults.get(unit_id)
-        if d:
-            return d
+    def defaults_for(self, unit_id: str) -> list[dict]:
+        """Persisted overrides, else the static config seed (a list — a Spark can
+        hold several models, a GPU lane exactly one)."""
+        persisted = self.defaults.list(unit_id)
+        if persisted:
+            return persisted
         for cfg in self.s.units():
             if cfg.id != unit_id or not cfg.default_model:
                 continue
             if isinstance(cfg, SparkConfig):
-                return {"server": "spark", "model": cfg.default_model}
+                return [{"server": "spark", "model": cfg.default_model}]
             if cfg.default_server in ("ollama", "vllm"):
-                return {"server": cfg.default_server, "model": cfg.default_model}
-        return None
+                return [{"server": cfg.default_server, "model": cfg.default_model}]
+        return []
+
+    def default_for(self, unit_id: str) -> Optional[dict]:
+        """The unit's first default — the back-compat scalar view of `defaults_for`."""
+        d = self.defaults_for(unit_id)
+        return d[0] if d else None
 
     def autoload_defaults(self) -> list[Job]:
-        """Fire (don't await) a load Job for every enabled unit that has a default."""
+        """Fire (don't await) a load Job for every default on every enabled unit.
+
+        One job PER MODEL: the unit's own lock serialises them, so a Spark asked for
+        an embedder and a reranker loads them back-to-back rather than dropping all
+        but the last.
+        """
         jobs: list[Job] = []
         for cfg in self.s.units():
             if not cfg.enabled:
                 continue
-            d = self.default_for(cfg.id)
-            if not d or d["server"] not in ("ollama", "vllm", "spark") or not d["model"]:
-                continue
-            req = LoadRequest(server=d["server"], model=d["model"], lane=cfg.id)
-            jobs.append(self.unit(cfg.id).load(req))
+            for d in self.defaults_for(cfg.id):
+                if d["server"] not in ("ollama", "vllm", "spark") or not d["model"]:
+                    continue
+                req = LoadRequest(server=d["server"], model=d["model"], lane=cfg.id)
+                jobs.append(self.unit(cfg.id).load(req))
         return jobs
 
     async def aclose(self) -> None:

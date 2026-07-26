@@ -69,10 +69,14 @@ header {
 .uc-kind.spark { color: var(--vllm); border-color: var(--vllm); }
 .uc-kind.gpu { color: var(--ollama); border-color: var(--ollama); }
 .uc-sub { color: var(--muted); font-size: 11px; margin-top: -4px; }
-.uc-loaded { font-size: 13px; font-weight: 600; word-break: break-word; }
-.uc-loaded.none { color: var(--muted); font-weight: 400; }
+.uc-models { font-size: 13px; font-weight: 600; word-break: break-word;
+             display: flex; flex-direction: column; gap: 3px; }
+.uc-models.none { color: var(--muted); font-weight: 400; }
+/* One row per resident model — a Spark holds several at once. */
+.uc-model { display: flex; align-items: baseline; gap: 6px; }
+.uc-model-name { flex: 1; min-width: 0; }
+.uc-model-unload { padding: 0 6px; font-size: 12px; line-height: 1.4; flex: 0 0 auto; }
 /* Served context window — the number a client's prompt budget must respect. */
-.uc-ctx { font-size: 11px; color: var(--accent); font-family: var(--mono); margin-top: -4px; min-height: 1em; }
 .uc-switch { display: flex; gap: 6px; margin-top: 2px; }
 .uc-select {
   flex: 1; min-width: 0; background: var(--panel2); color: var(--ink);

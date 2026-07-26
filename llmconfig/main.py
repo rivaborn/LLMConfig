@@ -160,6 +160,7 @@ def create_app() -> FastAPI:
                 lane=ls.id,
                 state=ls.usage or "free",
                 model=ls.loaded.model if ls.loaded else None,
+                models=[m.model for m in ls.loaded_models],
                 idle_s=ls.idle_s,
                 lease=ls.lease,
             )
@@ -168,7 +169,7 @@ def create_app() -> FastAPI:
         mirror = next((u for u in lanes if u.lane == lane), lanes[0])
         return UsageResponse(
             lane=mirror.lane, state=mirror.state, model=mirror.model,
-            idle_s=mirror.idle_s, lease=mirror.lease, lanes=lanes,
+            models=mirror.models, idle_s=mirror.idle_s, lease=mirror.lease, lanes=lanes,
         )
 
     @app.get("/api/models", response_model=ModelsResponse)
@@ -208,7 +209,11 @@ def create_app() -> FastAPI:
                 "kind": getattr(cfg, "kind", "gpu"),
                 "host": getattr(cfg, "host", ""),
                 "enabled": cfg.enabled,
+                # `default` is the first entry, kept for existing clients; `defaults`
+                # is the real answer on a unit that can hold several models.
                 "default": orch.default_for(cfg.id),
+                "defaults": orch.defaults_for(cfg.id),
+                "max_models": getattr(cfg, "max_models", 1),
             }
             for cfg in settings.units()
         ]
@@ -251,26 +256,32 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------ #
     # Write endpoints (X-API-Key when configured)
     # ------------------------------------------------------------------ #
-    def _require_lease_ok(unit_id: str, x_llm_lease: Optional[str]) -> None:
+    def _require_lease_ok(unit_id: str, x_llm_lease: Optional[str],
+                          model: str = "") -> None:
         """Honour a non-preemptible lease on the load/unload endpoints too.
 
         Without this the /v1 gate is hollow: chat traffic gets a 409 while anyone
         can POST /api/load a different model over the held unit — the biggest
         interruption there is. The holder passes by sending its own lease id as
         X-LLM-Lease; preemptible leases stay advisory here, like on /v1.
+
+        Scoped to `model` so a per-model claim on a multi-model Spark refuses only
+        the model it names; a claim with no model still covers the whole node.
         """
         if not settings.lease_enabled:
             return
-        blocker = leases.blocks_unleased(unit_id)
+        blocker = leases.blocks_unleased(unit_id, model or None)
         if blocker is None or (x_llm_lease or "").strip() == blocker.id:
             return
+        held = f"model '{blocker.model}' on {unit_id}" if blocker.model else f"unit '{unit_id}'"
         brief = leases.brief(unit_id)
         raise HTTPException(status_code=409, detail={
             "error": "lease_held",
-            "message": f"unit '{unit_id}' is held by '{blocker.holder}' with a "
+            "message": f"{held} is held by '{blocker.holder}' with a "
                        f"non-preemptible lease — pass its id as X-LLM-Lease, or "
                        f"revoke it (POST /api/leases/{blocker.id}/revoke)",
             "unit": unit_id,
+            "model": blocker.model or None,
             "lease": brief.model_dump() if brief else None,
         })
 
@@ -284,14 +295,16 @@ def create_app() -> FastAPI:
             want = "'spark'" if isinstance(unit, SparkUnit) else "'ollama' or 'vllm'"
             raise HTTPException(status_code=400,
                                 detail=f"unit '{req.lane}' takes server {want}, not '{req.server}'")
-        _require_lease_ok(req.lane, x_llm_lease)
+        _require_lease_ok(req.lane, x_llm_lease, req.model)
         return orch.load(req)
 
     @app.post("/api/unload", response_model=StatusResponse, dependencies=write)
     async def api_unload(req: UnloadRequest,
                          x_llm_lease: Optional[str] = Header(default=None)) -> StatusResponse:
         _lane(req.lane)
-        _require_lease_ok(req.lane, x_llm_lease)
+        # `req.model` frees one model and leaves co-residents running; without it the
+        # whole unit is freed, which is what the UI's unit-level Unload still means.
+        _require_lease_ok(req.lane, x_llm_lease, req.model or "")
         return await orch.unload(req)
 
     @app.post("/api/ollama/pull", response_model=Job, dependencies=write)
@@ -340,16 +353,32 @@ def create_app() -> FastAPI:
 
     @app.put("/api/lanes/{lane_id}/default", dependencies=write)
     async def api_lane_default_set(lane_id: str, body: dict) -> dict:
+        """Set, add to, or clear a unit's startup defaults.
+
+        `mode` picks between the two meanings a multi-model unit needs: `replace`
+        (the default, and the only sane one for a GPU lane) makes this the unit's
+        sole default; `add`/`remove` co-schedule on a Spark.
+        """
         _lane(lane_id)  # validate
         server = (body.get("server") or "").strip()
         model = (body.get("model") or "").strip()
-        if not model:
+        mode = (body.get("mode") or "replace").strip()
+        if mode not in ("replace", "add", "remove"):
+            raise HTTPException(status_code=400, detail="mode must be 'replace', 'add' or 'remove'")
+        if mode == "remove":
+            if not model:
+                raise HTTPException(status_code=400, detail="'remove' needs a model")
+            orch.defaults.remove(lane_id, model)
+        elif not model:
             orch.defaults.clear(lane_id)
         elif server not in ("ollama", "vllm", "spark"):
             raise HTTPException(status_code=400, detail="server must be 'ollama', 'vllm' or 'spark'")
+        elif mode == "add":
+            orch.defaults.add(lane_id, server, model)
         else:
             orch.defaults.set(lane_id, server, model)
-        return {"lane": lane_id, "default": orch.default_for(lane_id)}
+        return {"lane": lane_id, "default": orch.default_for(lane_id),
+                "defaults": orch.defaults_for(lane_id)}
 
     # ---- curated Spark model catalog (mirrors the vLLM alias endpoints) ----
     def _spark(lane_id: str) -> SparkUnit:
@@ -444,7 +473,10 @@ def create_app() -> FastAPI:
                     "active_job_id": st.active_job_id,
                     "usage": usage,
                     "swap_in_progress": st.swap_in_progress,
+                    # `loaded` stays the primary occupant for existing clients; the
+                    # list is what a claimant on a multi-model node actually needs.
                     "loaded": st.loaded.model_dump() if st.loaded else None,
+                    "loaded_models": [m.model_dump() for m in st.loaded_models],
                 }
         except Exception:  # noqa: BLE001 — a status hiccup must not fail the claim
             pass

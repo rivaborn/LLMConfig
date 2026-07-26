@@ -38,6 +38,7 @@ models:
     served_name: gemma-4-26b-fp8
     tp: 1
     status: ok
+    mem_fraction: 0.40   # 26 GB fp8 weights; 0.40 of the pool leaves ~22 GB for KV at 65536.
     extra_args: ["--max-model-len", "65536"]
     notes: >-
       google/gemma-4-26B-A4B-it, MoE 26B/4B-active, served fp8 with fp8 KV.
@@ -53,6 +54,9 @@ models:
     served_name: gpt-oss-120b
     tp: 1
     status: unverified
+    # No mem_fraction: an MXFP4 120B is most of the pool, so it claims the whole
+    # node (0.0 = unset = whole-node claim, and LLMConfig refuses to co-schedule
+    # anything alongside an unbudgeted model).
     extra_args: ["--max-model-len", "65536"]
     notes: "MXFP4 via vllm-distributed. Community 1-node decode ~58.8 t/s, strong prefill (~6000 t/s)."
     load_timeout_s: 1200
@@ -62,6 +66,7 @@ models:
     served_name: qwen3-coder-next
     tp: 1
     status: unverified
+    mem_fraction: 0.45   # 52.53 GB measured (40.53 weights + 12.00 KV at 262144) of 121 GB.
     # 262144 rather than the 65536 the other recipes carry, because this one has
     # room for it and is the coding model: `sparkrun show` puts weights at 40.53 GB
     # (INT4) and the KV at only 12.00 GB for the full 262144 window — the arch is a
@@ -82,6 +87,7 @@ models:
     served_name: qwen35-35b-a3b
     tp: 1
     status: unverified
+    mem_fraction: 0.40   # ~35 GB FP8 weights + KV at 65536.
     extra_args: ["--max-model-len", "65536"]
     notes: "FP8 MoE on SGLang. ~50.8 t/s single-stream, ~196 t/s aggregate at c10."
     load_timeout_s: 900
@@ -99,6 +105,7 @@ models:
     served_name: qwen36-35b-a3b
     tp: 1
     status: unverified
+    mem_fraction: 0.40   # 44.89 GB (34.89 weights + 10 KV at 262144) of 121 GB.
     extra_args: ["--max-model-len", "262144"]
     notes: >-
       Qwen/Qwen3.6-35B-A3B-FP8 with MTP speculative decoding. 34.89 GB weights,
@@ -110,6 +117,7 @@ models:
     served_name: qwen36-27b
     tp: 1
     status: unverified
+    mem_fraction: 0.52   # 60.75 GB (28.75 weights + 32 KV at 262144) of 121 GB.
     extra_args: ["--max-model-len", "262144"]
     notes: >-
       Qwen/Qwen3.6-27B-FP8 with MTP speculative decoding. Dense 27B: 28.75 GB
@@ -118,20 +126,19 @@ models:
 
   # --- RAG services (pooling runners, NOT chat models) -------------------------
   # Both are `--runner pooling`, Nodes 1-1, and tiny for this hardware: ~20 GB of a
-  # 121 GB node. That is deliberate waste -- one sparkrun workload per node means a
-  # reranker occupies a whole Spark at ~17% utilisation. Worth it only on a node
-  # that would otherwise idle.
+  # 121 GB node. That used to be deliberate waste — one workload per node meant a
+  # reranker occupied a whole Spark at ~17% utilisation. It no longer does: a node
+  # holds several models, so the pair (0.18 + 0.18) sits beside a chat model with
+  # room to spare, each on its own port.
   #
-  # !! LLMConfig's /v1 gateway exposes ONLY /v1/models, /v1/chat/completions and
-  # /v1/completions -- there is NO /v1/embeddings and no rerank route. These load
-  # fine, but nothing can reach them THROUGH the gateway; a client must address the
-  # node directly (http://192.168.1.5x:8000/v1/embeddings). Same pre-existing gap as
-  # the 3090's `qwen3-embed` alias. Wire the gateway routes before relying on these.
+  # They are reachable through the gateway: /v1/embeddings, /v1/rerank and /v1/score
+  # route to whichever unit holds the model (address them by `served_name`).
   - alias: qwen3-vl-embedding-8b
     recipe: "@official/qwen3-vl-embedding-8b-vllm"
     served_name: qwen3-vl-embedding-8b
     tp: 1
     status: unverified
+    mem_fraction: 0.18   # 19.67 GB of 121 GB — small enough to sit beside a chat model.
     extra_args: ["--max-model-len", "32768"]
     notes: >-
       Qwen/Qwen3-VL-Embedding-8B, pooling runner. 15.17 GB weights + 4.50 GB KV at
@@ -143,6 +150,7 @@ models:
     served_name: qwen3-vl-reranker-8b
     tp: 1
     status: unverified
+    mem_fraction: 0.18   # 20.83 GB of 121 GB — pairs with the embedder on one node.
     extra_args: ["--max-model-len", "32768"]
     notes: >-
       Qwen/Qwen3-VL-Reranker-8B, pooling runner. 16.33 GB weights + 4.50 GB KV at
@@ -187,6 +195,7 @@ models:
     served_name: qwen35-122b-int4
     tp: 1
     status: unverified
+    mem_fraction: 0.72   # 83.5 GB (71.46 weights + ~12 KV at 131072); room for one pooling model beside it.
     extra_args: ["--max-model-len", "131072"]
     notes: >-
       Intel/Qwen3.5-122B-A10B-int4-AutoRound on ONE node. 71.46 GB weights, ~12 GB KV
