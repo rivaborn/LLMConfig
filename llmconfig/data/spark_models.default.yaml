@@ -19,13 +19,16 @@
 # only after the fabric is up (see the wiki runbook), and only for a recipe whose
 # `Nodes` column in `sparkrun list` supports it.
 #
-# mem_fraction sizing on GB10 (learned live 2026-07-26): vLLM charges ~15 GiB of
-# NON-TORCH overhead against --gpu-mem on this unified-memory platform (CUDA
-# context + host allocations sharing the pool), on top of weights and KV. Budget
-# = (weights + ~15 GiB + KV + margin) / 121. A budget sized on weights+KV alone
-# boots to "Available KV cache memory: -X GiB" and dies in ~45 s — the embedder's
-# original 0.18 (weights 15.2 + KV 4.5 = fine on paper) failed exactly that way,
-# while gemma's 0.40 (26 + 15 + 8 = 49 vs 48.4) barely cleared it.
+# mem_fraction sizing on GB10 (learned live 2026-07-26, twice):
+# 1) vLLM charges ~15 GiB of NON-TORCH overhead against --gpu-mem on this
+#    unified-memory platform, on top of weights and KV. Budget =
+#    (weights + ~15 GiB + KV + margin) / 121. Sized on weights+KV alone, boot
+#    dies at "Available KV cache memory: -X GiB" in ~45 s (the embedder's 0.18).
+# 2) The NODE also needs INFERENCE headroom outside every budget: Triton JIT
+#    workspace, cudagraph capture, and prefill activations are invisible to
+#    boot-time checks. The 122B at 0.85 BOOTED (94.8% pool) and died on its
+#    FIRST TOKEN (RayWorker killed, NVRM NV_ERR_NO_MEMORY). Keep total node
+#    occupancy after load ≤ ~90%; a budget that passes boot can still be fatal.
 #
 # status: "unverified" until it has been launched and recall-tested on THIS
 # cluster. The decode figures in the notes are community numbers from the Spark
