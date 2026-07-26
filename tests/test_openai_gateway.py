@@ -846,3 +846,22 @@ async def test_hold_shields_the_model_from_placement_eviction(monkeypatch, tmp_p
     assert free.unit_id == "s1" and free.victims == ["a"], "unleased model is evictable"
     both_held = rank("target", [cand("s1", True, 0), cand("s2", True, 1)], s)
     assert both_held.outcome == "no_capacity", "a held model is never a victim"
+
+
+async def test_hold_gives_session_affinity_across_requests(monkeypatch, tmp_path):
+    """Without this, "idle beats active" ping-pongs a session between two units
+    serving the same model — your own request makes A active, so the next prefers
+    idle B. Observed live: one opencode turn left leases on two Sparks."""
+    app, orch, jobs, world, captured, unit, placer = _auto_build(
+        monkeypatch, tmp_path, spark_models=(("model-a", 8000),))
+    leases = app.state.leases
+
+    async with _client(app) as c:
+        r1 = await c.post("/v1/chat/completions", headers={"X-LLM-Hold": "opencode"},
+                          json={"model": "model-a",
+                                "messages": [{"role": "user", "content": "one"}]})
+        r2 = await c.post("/v1/chat/completions", headers={"X-LLM-Hold": "opencode"},
+                          json={"model": "model-a",
+                                "messages": [{"role": "user", "content": "two"}]})
+    assert r1.headers["x-llm-unit"] == r2.headers["x-llm-unit"]
+    assert len(leases.active_all("spark1")) == 1, "one lease, not one per request"

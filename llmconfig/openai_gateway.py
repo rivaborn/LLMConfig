@@ -269,6 +269,17 @@ class OpenAIGateway:
                     return self._lease_reject(*reject, is_chat=is_chat, stream=stream)
                 return lane, [], lease_id
 
+        # Session affinity: go back to the unit this holder already holds for this
+        # model, so consecutive requests stay on one warm prefix cache.
+        holder = (request.headers.get("x-llm-hold") or "").strip()[:64]
+        if holder and self.s.auto_hold_enabled:
+            uid = self._hold_unit(holder, model)
+            if uid is not None:
+                lane = self.lane(uid)
+                reject = self._lease_gate(lane.cfg.id, lease_id, model)
+                if reject is None:
+                    return lane, [], lease_id
+
         exclude: frozenset[str] = frozenset()
         for attempt in range(2):
             decision = await self.placer.place(model, exclude=exclude)
@@ -295,6 +306,24 @@ class OpenAIGateway:
                 exclude = frozenset({decision.unit_id})
                 continue
             return self._lease_reject(*reject, is_chat=is_chat, stream=stream)
+
+    def _hold_unit(self, holder: str, model: str) -> Optional[str]:
+        """The unit where `holder` already holds `model`, if any (sync, dict scan).
+
+        Session affinity. Without it, "idle beats active" ping-pongs a client
+        between two units serving the same model: your own request makes unit A
+        active, so your NEXT request prefers idle unit B, and so on — observed
+        live, one opencode turn leaving leases on two Sparks. A holder that is
+        already holding this model somewhere has a warm prefix cache there and
+        should go back to it.
+        """
+        if self.leases is None or not holder:
+            return None
+        for lease in self.leases.list(active_only=True):
+            if lease.holder == holder and lease.model and lease.unit in self.orch.units:
+                if self.leases._canon(lease.unit, model) == lease.model:
+                    return lease.unit
+        return None
 
     def _auto_hold(self, lane: "Unit", model: str, request: Request) -> None:
         """Honour `X-LLM-Hold: <holder>` — claim/renew this holder's lease on the
