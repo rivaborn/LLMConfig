@@ -329,3 +329,43 @@ def test_a_garbled_defaults_file_does_not_raise(tmp_path):
     d = LaneDefaults(Settings(_env_file=None), path=path)
 
     assert d.all() == {} and d.get("primary") is None
+
+
+def test_explicit_empty_tombstone_survives_reload(tmp_path):
+    """`models: []` means "load nothing" — the cookbook pins a unit empty with it."""
+    d = LaneDefaults(Settings(_env_file=None), path=tmp_path / "ld.yaml")
+    d.set_empty("spark3")
+
+    again = LaneDefaults(Settings(_env_file=None), path=tmp_path / "ld.yaml")
+    assert again.entries_or_none("spark3") == [], "tombstone kept across reload"
+    assert again.entries_or_none("spark4") is None, "unset stays unset"
+
+
+def test_tombstone_suppresses_the_env_seed_in_defaults_for(tmp_path, monkeypatch):
+    """An explicitly-empty unit must NOT fall back to the .env default_model."""
+    import llmconfig.orchestrator as orch_mod
+    from llmconfig.jobs import JobManager
+    from llmconfig.orchestrator import Orchestrator
+    from llmconfig.registry import Registry
+
+    s = Settings(_env_file=None, gpu_uuid="GPU-x", registry_path=tmp_path / "reg.yaml",
+                 companion_enabled=True, companion_gpu_uuid="GPU-y",
+                 companion_registry_path=tmp_path / "comp.yaml",
+                 companion_default_server="ollama", companion_default_model="qwen2.5:1.5b")
+    orch = Orchestrator(s, Registry(s.registry_path), JobManager())
+    orch.defaults = LaneDefaults(s, path=tmp_path / "ld.yaml")
+
+    assert orch.defaults_for("companion") == [
+        {"server": "ollama", "model": "qwen2.5:1.5b"}], "unset -> .env seed applies"
+
+    orch.defaults.set_empty("companion")
+    assert orch.defaults_for("companion") == [], "tombstone beats the seed"
+
+
+def test_garbled_models_list_is_not_a_tombstone(tmp_path):
+    """A non-empty list of garbage means the author TRIED to configure something —
+    treat as unset (seed applies), never as deliberate emptiness."""
+    path = tmp_path / "ld.yaml"
+    path.write_text("lanes:\n  primary:\n    models: [{}, 3]\n", encoding="utf-8")
+    d = LaneDefaults(Settings(_env_file=None), path=path)
+    assert d.entries_or_none("primary") is None

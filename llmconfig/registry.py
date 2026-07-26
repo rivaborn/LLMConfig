@@ -56,6 +56,18 @@ class Registry:
         e = self.get(alias)
         return (e.served_name or e.alias) if e else None
 
+    def find_by_served_name(self, served: str) -> VllmAliasEntry | None:
+        """Reverse lookup: the alias entry behind a lane's served name.
+
+        Residency (`LaneStatus.loaded_models`) reports what vLLM SERVES, while
+        loads take the alias — without this, a cookbook snapshot of a vLLM lane
+        records a name no load can use (mirrors SparkRegistry's).
+        """
+        for e in self._entries.values():
+            if (e.served_name or e.alias) == served:
+                return e
+        return None
+
     # ---- mutations (model management) ----
     def upsert(self, entry: VllmAliasEntry) -> None:
         self._entries[entry.alias] = entry

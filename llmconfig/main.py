@@ -20,6 +20,8 @@ from .gpu import query_gpu
 from .idle import IdleReaper, classify_usage
 from .jobs import JobManager
 from .leases import LeaseConflict, LeaseError, LeaseManager, LeaseNotActive, LeaseSweeper, UnknownUnit
+from .cookbook import Cookbook
+from .load_times import LoadTimes
 from .monitor import Monitor
 from .openai_gateway import OpenAIGateway, build_gateway_router
 from .orchestrator import Orchestrator
@@ -58,6 +60,9 @@ def create_app() -> FastAPI:
     leases = LeaseManager(settings, orch)
     orch.attach_leases(leases)   # Spark units re-validate eviction victims under their lock
     monitor = Monitor(settings, orch)
+    load_times = LoadTimes()
+    orch.attach_load_times(load_times)   # units record real launch durations
+    cookbook = Cookbook(settings, orch, jobs, leases)
     placer = Placer(settings, orch, leases, monitor)
     gateway = OpenAIGateway(orch, jobs, settings, leases, placer)
     reaper = IdleReaper(settings, orch, monitor, leases)
@@ -195,6 +200,56 @@ def create_app() -> FastAPI:
         if isinstance(ln, SparkUnit):  # remote node — its own nvidia-smi over SSH
             return GpuOut.from_info(await ln.spark.gpu())
         return GpuOut.from_info(await query_gpu(settings, uuid=ln.cfg.gpu_uuid))
+
+    # ---- cookbook: named fleet states (save current / apply / default) ----
+    @app.get("/api/cookbook")
+    async def api_cookbook() -> dict:
+        return {"default": cookbook.default,
+                "default_in_sync": cookbook.default_in_sync(),
+                "states": cookbook.states()}
+
+    @app.put("/api/cookbook/{name}", dependencies=write)
+    async def api_cookbook_save(name: str) -> dict:
+        """Snapshot the CURRENT fleet under `name` (upsert)."""
+        name = name.strip()
+        if not name or name.lower() == "default":
+            raise HTTPException(status_code=400, detail="pick a real state name")
+        try:
+            state = await cookbook.snapshot(name)
+        except RuntimeError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+        return {"name": name, "state": state}
+
+    @app.post("/api/cookbook/{name}/apply", response_model=Job, dependencies=write)
+    async def api_cookbook_apply(name: str) -> Job:
+        try:
+            return cookbook.apply(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"no cookbook state '{name}'")
+        except RuntimeError as e:
+            raise HTTPException(status_code=409, detail=str(e))
+
+    @app.post("/api/cookbook/{name}/default", dependencies=write)
+    async def api_cookbook_default(name: str) -> dict:
+        try:
+            cookbook.set_default(name)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"no cookbook state '{name}'")
+        return {"default": cookbook.default, "default_in_sync": cookbook.default_in_sync()}
+
+    @app.delete("/api/cookbook/{name}", dependencies=write)
+    async def api_cookbook_delete(name: str) -> dict:
+        if not cookbook.delete(name):
+            raise HTTPException(status_code=404, detail=f"no cookbook state '{name}'")
+        return {"deleted": name, "default": cookbook.default}
+
+    @app.get("/api/load-times")
+    async def api_load_times() -> dict:
+        """Measured launch durations: {key: {est_s, n}}. Keys are
+        `spark:{alias}` (shared — the GB10s are identical) and
+        `{unit}:{server}:{alias}` for GPU lanes. The UI joins these onto the
+        model dropdowns; the cookbook sums them into apply estimates."""
+        return {"samples": load_times.all()}
 
     @app.get("/api/lanes")
     async def api_lanes() -> list[dict]:

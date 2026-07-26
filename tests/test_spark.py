@@ -1018,3 +1018,63 @@ def test_declared_budgets_matches_admit_arithmetic(cfg):
     unit = two_model_unit(cfg, f1=0.4, f2=0.18)
     b = unit.declared_budgets(["served-1", "served-2", "stranger"])
     assert b == {"served-1": 0.4, "served-2": 0.18, "stranger": 0.0},         "unknown residents read as whole-node claims, exactly as _admit treats them"
+
+
+# --------------------------------------------------------------------------- #
+# Fit-aware catalog — addable computed BESIDE the admission arithmetic
+# --------------------------------------------------------------------------- #
+@respx.mock
+async def test_list_models_addable_matches_admit(cfg, monkeypatch):
+    """For every non-resident, non-tp>1, non-needs-empty entry: addable=False
+    exactly when a load would be refused by the declared half of _admit."""
+    reg = SparkRegistry(cfg.registry_path)
+    reg.upsert(SparkModelEntry(alias="big", recipe="r-big", served_name="served-big",
+                               mem_fraction=0.6))
+    reg.upsert(SparkModelEntry(alias="small", recipe="r-small", served_name="served-small",
+                               mem_fraction=0.3))
+    reg.upsert(SparkModelEntry(alias="huge", recipe="r-huge", served_name="served-huge",
+                               mem_fraction=0.9))
+    reg.upsert(SparkModelEntry(alias="whole", recipe="r-whole", served_name="served-whole",
+                               mem_fraction=0.0))
+    reg.upsert(SparkModelEntry(alias="empty-only", recipe="r-eo", served_name="served-eo",
+                               mem_fraction=0.3, needs_empty_node=True))
+    unit = SparkUnit(Settings(_env_file=None), cfg, reg, JobManager())
+    stateful_node(monkeypatch, cfg, {8000: "served-big"})   # 0.6 committed
+
+    models = {m.alias: m for m in await unit.spark.list_models()}
+
+    assert models["big"].addable and "reload" in models["big"].add_note
+    assert models["small"].addable, "0.6 + 0.3 <= 0.95"
+    assert not models["huge"].addable and "needs 0.90" in models["huge"].add_note
+    assert not models["whole"].addable and "whole-node" in models["whole"].add_note
+    assert not models["empty-only"].addable and "EMPTY node" in models["empty-only"].add_note
+
+
+@respx.mock
+async def test_list_models_addable_on_an_empty_node(cfg, monkeypatch):
+    reg = SparkRegistry(cfg.registry_path)
+    reg.upsert(SparkModelEntry(alias="whole", recipe="r", served_name="served-w",
+                               mem_fraction=0.0))
+    reg.upsert(SparkModelEntry(alias="eo", recipe="r2", served_name="served-eo",
+                               mem_fraction=0.3, needs_empty_node=True))
+    unit = SparkUnit(Settings(_env_file=None), cfg, reg, JobManager())
+    stateful_node(monkeypatch, cfg, {})
+
+    models = {m.alias: m for m in await unit.spark.list_models()}
+    assert models["whole"].addable, "an empty node takes anything"
+    assert models["eo"].addable and "FIRST" in models["eo"].add_note
+
+
+@respx.mock
+async def test_list_models_unbudgeted_resident_blocks_everything(cfg, monkeypatch):
+    reg = SparkRegistry(cfg.registry_path)
+    reg.upsert(SparkModelEntry(alias="old", recipe="r", served_name="served-old",
+                               mem_fraction=0.0))
+    reg.upsert(SparkModelEntry(alias="small", recipe="r2", served_name="served-small",
+                               mem_fraction=0.2))
+    unit = SparkUnit(Settings(_env_file=None), cfg, reg, JobManager())
+    stateful_node(monkeypatch, cfg, {8000: "served-old"})
+
+    models = {m.alias: m for m in await unit.spark.list_models()}
+    assert not models["small"].addable
+    assert "served-old" in models["small"].add_note

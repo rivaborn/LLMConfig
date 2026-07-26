@@ -129,9 +129,14 @@ class Orchestrator:
     # ---- per-unit defaults ("what runs on this unit") ----
     def defaults_for(self, unit_id: str) -> list[dict]:
         """Persisted overrides, else the static config seed (a list — a Spark can
-        hold several models, a GPU lane exactly one)."""
-        persisted = self.defaults.list(unit_id)
-        if persisted:
+        hold several models, a GPU lane exactly one).
+
+        An EXPLICITLY empty persisted list is honoured as "load nothing" — the
+        cookbook's tombstone — and does NOT fall through to the .env seed;
+        only a unit with no persisted entry at all takes the seed.
+        """
+        persisted = self.defaults.entries_or_none(unit_id)
+        if persisted is not None:
             return persisted
         for cfg in self.s.units():
             if cfg.id != unit_id or not cfg.default_model:
@@ -164,6 +169,11 @@ class Orchestrator:
                 req = LoadRequest(server=d["server"], model=d["model"], lane=cfg.id)
                 jobs.append(self.unit(cfg.id).load(req))
         return jobs
+
+    def attach_load_times(self, load_times) -> None:
+        """Hand every unit the LoadTimes recorder (same fanout as attach_leases)."""
+        for u in self.units.values():
+            u.load_times = load_times
 
     def attach_leases(self, leases) -> None:
         """Hand every Spark unit the LeaseManager for under-lock victim checks.

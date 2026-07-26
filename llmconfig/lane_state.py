@@ -71,7 +71,18 @@ class LaneDefaults:
         if self.path.exists():
             raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
             lanes = raw.get("lanes", {}) or {}
-            self._data = {k: e for k, v in lanes.items() if (e := _entries(v))}
+            # A LITERALLY empty `models: []` is kept as a tombstone — "load
+            # nothing at startup" (how a cookbook default pins a unit empty). A
+            # non-empty list whose entries are all garbage is NOT a tombstone:
+            # the author meant to configure something, so treat it as unset and
+            # let the .env seed apply rather than silently suppressing it.
+            self._data = {}
+            for k, v in lanes.items():
+                ents = _entries(v)
+                if ents:
+                    self._data[k] = ents
+                elif isinstance(v, dict) and v.get("models") == []:
+                    self._data[k] = []                   # deliberate tombstone
         else:
             self._data = {}
 
@@ -84,6 +95,18 @@ class LaneDefaults:
         """The unit's FIRST default, or None — the back-compat scalar view."""
         entries = self._data.get(lane_id) or []
         return dict(entries[0]) if entries else None
+
+    def entries_or_none(self, lane_id: str) -> Optional[list[dict]]:
+        """Distinguish UNSET (None → the .env seed may apply) from explicitly
+        empty ([] → the tombstone: load nothing). `list()` collapses both to []
+        for callers that don't care."""
+        v = self._data.get(lane_id)
+        return None if v is None else [dict(e) for e in v]
+
+    def set_empty(self, lane_id: str) -> None:
+        """Write the tombstone: this unit deliberately starts with nothing."""
+        self._data[lane_id] = []
+        self.save()
 
     def all(self) -> dict[str, list[dict]]:
         return {k: [dict(e) for e in v] for k, v in self._data.items()}

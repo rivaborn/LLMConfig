@@ -100,6 +100,12 @@ class SparkModel(BaseModel):
     load_timeout_s: int = 900
     mem_fraction: float = 0.0  # declared share of the node pool; 0 = whole node
     port: int = 0              # the port it is CURRENTLY served on; 0 when not loaded
+    # Computed by SparkBackend.list_models BESIDE the admission arithmetic
+    # (declared_budgets), so the UI can gray an option without re-implementing
+    # _admit client-side — the two must never drift (invariant 14).
+    addable: bool = True
+    add_note: str = ""         # why not / what a load would do ("frees the whole node")
+    needs_empty_node: bool = False
 
 
 class SparkModelEntry(BaseModel):
@@ -126,6 +132,12 @@ class SparkModelEntry(BaseModel):
     # 0.0 means "unset" — treated as a whole-node claim, which is the pre-multi-model
     # behaviour and keeps old catalogs working.
     mem_fraction: float = 0.0
+    # This model may only LAUNCH on an empty node (runbook: load-order landmine).
+    # gemma: quantize-at-load needs a ~74 GB transient (~2x its runtime budget);
+    # the reranker: its fastsafetensors loader kills residents at the driver level.
+    # Cookbook-apply frees the node and reloads the full target set when one of
+    # these is missing; co-tenants may still join AFTER it is up.
+    needs_empty_node: bool = False
 
     def to_public(self) -> "SparkModel":
         return SparkModel(
@@ -137,6 +149,7 @@ class SparkModelEntry(BaseModel):
             notes=self.notes,
             load_timeout_s=self.load_timeout_s,
             mem_fraction=self.mem_fraction,
+            needs_empty_node=self.needs_empty_node,
         )
 
 

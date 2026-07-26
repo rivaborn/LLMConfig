@@ -46,6 +46,8 @@ class SparkUnit:
         # built after the units). Used ONLY for the sync under-lock re-validation
         # of placement-chosen eviction victims; None skips that check.
         self.leases = None
+        # Set by Orchestrator.attach_load_times(); None = don't record.
+        self.load_times = None
         self.spark = SparkBackend(settings, cfg, registry)
         self._lock = asyncio.Lock()
         self._active_job_id: Optional[str] = None
@@ -308,6 +310,10 @@ class SparkUnit:
             + (f", mem={entry.mem_fraction}" if entry.mem_fraction else "")
             + ")…",
         )
+        # Load-time clock starts HERE — after admission (whose SSH probe and any
+        # victim evictions are not part of "how long does this model take to
+        # launch") and only on the real-launch path, never the fast path.
+        launch_started = time.monotonic()
         timeout = float(entry.load_timeout_s or self.cfg.load_timeout_s)
         r = await self.spark.run_recipe(recipe, tp=entry.tp, extra=entry.extra_args,
                                         served=target, port=port,
@@ -341,6 +347,14 @@ class SparkUnit:
                 f"too small for weights + ~15 GiB GB10 overhead + KV).\n{tail}"
             )
 
+        # Success-only recording: a failed launch (dead-serve, timeout) raised
+        # above and must not poison the median. Sparks share one key across nodes
+        # (identical GB10 hardware).
+        if self.load_times is not None:
+            from .load_times import spark_key
+            self.load_times.record(spark_key(entry.alias),
+                                   time.monotonic() - launch_started,
+                                   unit=self.cfg.id)
         gpu = await self.spark.gpu()
         # A successful load proves the node is live — clear the probe breaker so
         # status() stops backing off immediately.

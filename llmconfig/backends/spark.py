@@ -142,16 +142,57 @@ class SparkBackend:
         return r.rc == 0
 
     async def list_models(self) -> list[SparkModel]:
-        """Catalog with residency. Several entries can be `loaded` at once, each
-        carrying the port it is actually reachable on."""
+        """Catalog with residency AND addability.
+
+        `addable`/`add_note` are computed here, beside the same declared-budget
+        arithmetic `_admit` enforces, so the UI can gray an option for the same
+        reason a load would be refused — computed in one place, never
+        re-implemented client-side (invariant 14). Notes deliberately mirror
+        `_admit`'s error messages.
+        """
         slots = await self.served_slots()
         by_name = {sm.name: port for port, sm in slots.items() if sm.name}
+        budgets = {name: (e.mem_fraction if (e := self.registry.find_by_served_name(name)) else 0.0)
+                   for name in by_name}
+        committed = sum(budgets.values())
+        unbudgeted = sorted(n for n, f in budgets.items() if f <= 0.0)
+        free_slot = len(by_name) < self.cfg.max_models
+        headroom = self.s.spark_mem_headroom
+
         out: list[SparkModel] = []
         for entry in self.registry.entries():
             pub = entry.to_public()
             port = by_name.get(pub.served_name)
             pub.loaded = port is not None
             pub.port = port or 0
+            if pub.loaded:
+                # A reload frees its own slot first — never grayed.
+                pub.addable, pub.add_note = True, "loaded — reload replaces in place"
+            elif not by_name:
+                pub.addable = True
+                if entry.needs_empty_node:
+                    pub.add_note = "must be the FIRST model on a node (it is)"
+            elif entry.tp > 1:
+                pub.addable, pub.add_note = True, f"{entry.tp}-node recipe — frees the whole node first"
+            elif entry.needs_empty_node:
+                pub.addable = False
+                pub.add_note = "must launch on an EMPTY node (load-order landmine — see runbook)"
+            elif unbudgeted:
+                pub.addable = False
+                pub.add_note = f"{', '.join(unbudgeted)} has no mem_fraction and claims the whole node"
+            elif entry.mem_fraction <= 0.0:
+                pub.addable = False
+                pub.add_note = "no mem_fraction — a whole-node claim cannot join residents"
+            elif not free_slot:
+                pub.addable = False
+                pub.add_note = f"all {self.cfg.max_models} slots in use"
+            elif committed + entry.mem_fraction > headroom + 1e-9:
+                pub.addable = False
+                pub.add_note = (f"needs {entry.mem_fraction:.2f}, only "
+                                f"{max(headroom - committed, 0):.2f} of {headroom:.2f} free")
+            else:
+                pub.addable = True
+                pub.add_note = f"fits: {committed:.2f} + {entry.mem_fraction:.2f} ≤ {headroom:.2f}"
             out.append(pub)
         return out
 

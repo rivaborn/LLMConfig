@@ -46,6 +46,7 @@ models:
     served_name: gemma-4-26b-fp8
     tp: 1
     status: ok
+    needs_empty_node: true   # quantize-at-load ~74 GB transient — runbook: load-order landmine
     mem_fraction: 0.4    # PROVEN live: 26 fp8 weights + ~15 overhead + 8 KV = 49 GB vs 48.4 budget — barely fits.
     extra_args: ["--max-model-len", "65536"]
     notes: >-
@@ -161,6 +162,7 @@ models:
     served_name: qwen3-vl-reranker-8b
     tp: 1
     status: unverified
+    needs_empty_node: true   # fastsafetensors loader kills residents at launch — runbook rule
     mem_fraction: 0.35   # ~18 profiled weights + ~15 overhead + 4.5 KV; sized off the embedder's measured failure.
     extra_args: ["--max-model-len", "32768"]
     notes: >-

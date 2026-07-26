@@ -53,6 +53,8 @@ class Lane:
         )
         self._lock = asyncio.Lock()
         self._active_job_id: Optional[str] = None
+        # Set by Orchestrator.attach_load_times(); None = don't record.
+        self.load_times = None
         # Idle-reaper input: wall-clock of the last observed activity (gateway
         # request, load completion, or a Monitor util spike). Construction time =
         # app start, so an autoloaded default gets a full idle window before reaping.
@@ -183,9 +185,17 @@ class Lane:
             raise RuntimeError("Ollama service is not reachable (check the Windows service / OLLAMA_URL)")
 
         num_gpu = None  # default: let Ollama auto-fit against the now-empty GPU
+        # Load-time clock: after the evict-wait gate (eviction time isn't launch
+        # time), through verify — max_pack's reload included, it's honest wall time.
+        launch_started = time.monotonic()
         self.jobs.log(job, f"loading {req.model} into Ollama…")
         await self.ollama.load(req.model, keep_alive=req.keep_alive, num_gpu=num_gpu)
-        return await self._verify_ollama(job, req, remediate=req.max_pack)
+        result = await self._verify_ollama(job, req, remediate=req.max_pack)
+        if self.load_times is not None:  # success only — an exception skipped this
+            from .load_times import lane_key
+            self.load_times.record(lane_key(self.cfg.id, "ollama", req.model),
+                                   time.monotonic() - launch_started, unit=self.cfg.id)
+        return result
 
     async def _load_vllm(self, job: Job, req: LoadRequest) -> dict:
         alias = req.model
@@ -214,6 +224,8 @@ class Lane:
             self.jobs.log(job, f"unloaded Ollama: {', '.join(names)}")
         await self._wait_vram_free(job)
 
+        # Load-time clock: after eviction + VRAM drain, from serve.sh start to ready.
+        launch_started = time.monotonic()
         self.jobs.log(job, f"starting vLLM: serve.sh {alias}…")
         r = await self.vllm.serve(alias)
         if not r.ok and ("not found" in r.err.lower() or "not loaded" in r.err.lower()):
@@ -240,6 +252,10 @@ class Lane:
                 f"(+{self.s.vllm_ready_grace_s}s grace).\n{tail}"
             )
 
+        if self.load_times is not None:  # success only — failures raised above
+            from .load_times import lane_key
+            self.load_times.record(lane_key(self.cfg.id, "vllm", alias),
+                                   time.monotonic() - launch_started, unit=self.cfg.id)
         gpu = await self._gpu()
         self.jobs.log(job, f"vLLM serving {served_target} (VRAM {gpu.vram_pct}% used)")
         return self._vllm_result(served_target, gpu)
