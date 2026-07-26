@@ -780,3 +780,69 @@ async def test_models_union_under_auto_and_per_lane_with_header(monkeypatch, tmp
     # pinned list has ONLY spark entries — nothing from primary's ollama/vllm.
     assert {"model-a", "model-b"} <= pinned_ids
     assert "qwen3:4b" not in pinned_ids, "explicit header keeps the per-unit list"
+
+
+# --------------------------------------------------------------------------- #
+# X-LLM-Hold — a static-config client leases the model it is using
+# --------------------------------------------------------------------------- #
+async def test_hold_header_claims_and_renews_a_preemptible_lease(monkeypatch, tmp_path):
+    """opencode's config cannot carry a lease id (none exists until claimed), so
+    the header is how a config-only client gets a lease at all."""
+    app, orch, jobs, world, captured, unit, placer = _auto_build(
+        monkeypatch, tmp_path, spark_models=(("model-a", 8000),))
+    leases = app.state.leases
+
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", headers={"X-LLM-Hold": "opencode"},
+                         json={"model": "model-a",
+                               "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200
+    held = leases.active_for("spark1", "a")
+    assert held is not None and held.holder == "opencode"
+    assert held.preemptible is True, "must not 409 other callers' traffic"
+    assert held.model == "a", "scoped to the model, folded to the catalog alias"
+    first_deadline = held._deadline
+
+    # A second request RENEWS in place rather than fragmenting into two leases.
+    async with _client(app) as c:
+        await c.post("/v1/chat/completions", headers={"X-LLM-Hold": "opencode"},
+                     json={"model": "model-a",
+                           "messages": [{"role": "user", "content": "again"}]})
+    assert len(leases.active_all("spark1")) == 1
+    assert leases.active_for("spark1", "a")._deadline >= first_deadline
+
+
+async def test_hold_never_steals_another_holders_lease(monkeypatch, tmp_path):
+    app, orch, jobs, world, captured, unit, placer = _auto_build(
+        monkeypatch, tmp_path, spark_models=(("model-a", 8000),))
+    leases = app.state.leases
+    mine, _ = leases.claim(LeaseClaimRequest(unit="spark1", holder="alice", model="a"))
+
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", headers={"X-LLM-Hold": "opencode"},
+                         json={"model": "model-a",
+                               "messages": [{"role": "user", "content": "hi"}]})
+    assert r.status_code == 200, "traffic still flows — the hold is a convenience"
+    assert leases.active_for("spark1", "a").id == mine.id, "alice keeps her lease"
+    assert not any(l.holder == "opencode" for l in leases.active_all("spark1"))
+
+
+async def test_hold_shields_the_model_from_placement_eviction(monkeypatch, tmp_path):
+    """The whole point: a held model is not an eviction candidate."""
+    from llmconfig.placement import ResidentFact, rank
+    s = Settings(_env_file=None)
+    from llmconfig.placement import CandidateFacts
+    st = _spark_status(("model-a", 8000))
+
+    def cand(uid, leased, order):
+        return CandidateFacts(
+            unit_id=uid, kind="spark", status=st, usage="idle", server="spark",
+            load_arg="target",
+            residents=[ResidentFact(model="model-a", alias="a", budget=0.9,
+                                    idle_s=99999, leased=leased)],
+            committed=0.9, want=0.3, order=order)
+
+    free = rank("target", [cand("s1", False, 0), cand("s2", True, 1)], s)
+    assert free.unit_id == "s1" and free.victims == ["a"], "unleased model is evictable"
+    both_held = rank("target", [cand("s1", True, 0), cand("s2", True, 1)], s)
+    assert both_held.outcome == "no_capacity", "a held model is never a victim"

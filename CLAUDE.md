@@ -220,6 +220,15 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    its siblings) a coroutine and a competing load can interleave and have its
    freshly loaded model unloaded out from under it.
    `tests/test_leases.py::test_query_methods_are_sync` pins this.
+16. **`X-LLM-Hold` claims a PREEMPTIBLE lease, deliberately.** A static-config client
+   (opencode) cannot send a lease id — none exists until claimed — so the header asks
+   the gateway to claim/renew one for it. It is preemptible because the goal is
+   "don't displace my model automatically" (idle reaper, placement eviction), NOT
+   "refuse everyone else" — a non-preemptible auto-hold would 409 every other client
+   the moment opencode touched a shared model. It never preempts an existing holder,
+   never raises into the request, and lapses `AUTO_HOLD_TTL_S` after the last request.
+   Non-preemptible exclusivity stays a deliberate, manual `/api/leases` claim.
+
 12. **A lease is additive on the API, never a fourth `usage` value.** `LaneUsage`
    stays `free|idle|active` because off-box consumers switch on it (see invariant 8);
    the claim rides alongside as `lanes[].lease`. Leases are also **advisory** —

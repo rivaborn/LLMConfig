@@ -30,7 +30,7 @@ from .jobs import JobManager
 from .lane import Lane
 from .orchestrator import Orchestrator, Unit
 from .placement import wants_auto
-from .schemas import LoadRequest
+from .schemas import LeaseClaimRequest, LoadRequest
 from .spark_unit import SparkUnit
 
 if TYPE_CHECKING:
@@ -296,6 +296,38 @@ class OpenAIGateway:
                 continue
             return self._lease_reject(*reject, is_chat=is_chat, stream=stream)
 
+    def _auto_hold(self, lane: "Unit", model: str, request: Request) -> None:
+        """Honour `X-LLM-Hold: <holder>` — claim/renew this holder's lease on the
+        model it is actually using.
+
+        A static client config cannot carry a lease id (one does not exist until
+        claimed), so this is how a config-only client gets a lease at all. The
+        claim is **preemptible**: it stops the idle reaper and auto-placement from
+        evicting this model, which is what "don't displace my session" means,
+        without refusing anybody else's traffic the way a non-preemptible hold
+        does (that escalation stays manual, via /api/leases).
+
+        Best-effort and never raises into the request: a hold is a convenience,
+        not the point of the call. Never preempts — if someone else already holds
+        this model, we leave it alone; their claim is at least as strong as ours.
+        """
+        holder = (request.headers.get("x-llm-hold") or "").strip()[:64]
+        if not holder or self.leases is None:
+            return
+        if not (self.s.lease_enabled and self.s.auto_hold_enabled):
+            return
+        try:
+            existing = self.leases.active_for(lane.cfg.id, model)
+            if existing is not None and existing.holder != holder:
+                return
+            self.leases.claim(LeaseClaimRequest(
+                unit=lane.cfg.id, holder=holder, model=model,
+                preemptible=True, ttl_s=self.s.auto_hold_ttl_s,
+                note="auto-hold (X-LLM-Hold)",
+            ))
+        except Exception:  # noqa: BLE001 — a failed hold must never fail the request
+            pass
+
     @staticmethod
     def _unit_headers(lane: "Unit") -> dict:
         """`X-LLM-Unit` on every success response — with auto-placement the client
@@ -524,6 +556,7 @@ class OpenAIGateway:
             )
         server, load_arg, backend = resolved
         lane.touch(model=model)  # inference traffic — reset this model's idle-unload window
+        self._auto_hold(lane, model, request)
 
         # Fast path: this model is ALREADY resident → forward, no load. Membership
         # over loaded_models, not equality against the unit's primary occupant: on a
@@ -694,6 +727,7 @@ class OpenAIGateway:
             )
 
         lane.touch(model=model)
+        self._auto_hold(lane, model, request)
 
         status = await lane.status()
         backend = self._route(lane, server, model, status, backend)

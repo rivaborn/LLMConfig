@@ -267,6 +267,13 @@ class Settings(BaseSettings):
     # (direct Ollama on :11434/:11435) can't be stopped, so a non-preemptible lease
     # is a cooperation contract, not a hard exclusivity guarantee.
     lease_enabled: bool = True
+    # `X-LLM-Hold: <holder>` — a client that cannot carry a dynamic lease id (a
+    # static config like opencode's) asks the gateway to hold its model for it.
+    # PREEMPTIBLE on purpose: it shields the model from AUTOMATIC displacement (the
+    # idle reaper, placement eviction) without 409-ing anyone else's traffic. Each
+    # request renews it, so it lapses this long after the client stops talking.
+    auto_hold_enabled: bool = True
+    auto_hold_ttl_s: float = 600.0
     lease_default_ttl_s: float = 600.0     # renewable leash when the claim omits ttl_s
     lease_min_ttl_s: float = 30.0
     lease_max_ttl_s: float = 7200.0        # claims are CLAMPED to this, never refused
