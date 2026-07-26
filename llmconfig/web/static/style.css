@@ -203,3 +203,11 @@ header {
 .chart-empty { color: var(--muted); font-size: 12px; padding: 70px 0; text-align: center; }
 .monitor-note { color: var(--muted); font: 12px var(--mono); margin-top: 14px; min-height: 1em; }
 @media (max-width: 720px) { .charts { grid-template-columns: 1fr; } .inst-temp { font-size: 44px; } }
+
+/* Cookbook bar — named fleet states on the Home view. */
+.cookbook-bar { display: flex; align-items: center; gap: 8px; margin: 0 0 14px; flex-wrap: wrap; }
+.cookbook-bar .cb-label { font-size: 12px; font-weight: 700; text-transform: uppercase;
+                          letter-spacing: .06em; color: var(--muted); }
+.cookbook-bar select { min-width: 220px; }
+.cookbook-bar .cb-note { font-size: 12px; color: var(--muted); }
+option:disabled { color: #777; }

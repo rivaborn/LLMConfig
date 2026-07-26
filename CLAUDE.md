@@ -138,6 +138,11 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 - `doctor.py` — read-only recon (`run_doctor`) that verifies every on-box assumption.
 - `openai_gateway.py` — the OpenAI-compatible `/v1` gateway (auto-load on first request;
   chat + completions + embeddings/rerank/score; auto-placement wiring in `_choose`).
+- `cookbook.py` — named fleet states: snapshot residency, apply-exactly (one meta-job,
+  units parallel, unload-extras-then-load-missing, `needs_empty_node` forces a full
+  rebuild), mark-default (syncs `LaneDefaults` incl. `[]` tombstones).
+- `load_times.py` — measured launch durations (units record success-only, launch-span
+  only; Sparks share one key per alias). Behind `/api/load-times` and the UI estimates.
 - `placement.py` — auto-placement: pure `rank()` over per-unit `CandidateFacts` +
   `Placer` (single-flight status sweep, sync lease/registry reads). Advisory by design
   — see invariant 15.
@@ -262,7 +267,9 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    the resident budgets plus the new one exceed `SPARK_MEM_HEADROOM` (0.95), and
    refuses co-residency with any model whose `mem_fraction` is unset (0.0 = a
    whole-node claim). Don't add a Spark load path that skips `_admit`, and keep new
-   catalog entries budgeted or they silently monopolise a node.
+   catalog entries budgeted or they silently monopolise a node. The UI's gray-out
+   (`SparkModel.addable`) is computed in `SparkBackend.list_models` beside this same
+   arithmetic (`declared_budgets`) — never re-implement it client-side.
 
 
 ## Build / run / test

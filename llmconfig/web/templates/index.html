@@ -22,6 +22,16 @@
   <section id="view-home" class="view active" role="tabpanel">
     <p class="hint">Every LLM unit at a glance. Pick a model to load it on that unit — a GPU lane
       swaps to it (one model per card), a Spark adds it alongside whatever is already resident.</p>
+    <!-- Cookbook: named fleet states — save what's loaded where, get back to it later. -->
+    <div id="cookbook-bar" class="cookbook-bar">
+      <span class="cb-label">Cookbook</span>
+      <select id="cb-select" aria-label="Saved fleet states"></select>
+      <button class="btn" id="cb-apply" title="Load exactly this state's models on every unit">Apply</button>
+      <button class="btn" id="cb-save" title="Save what is loaded right now as a named state">Save current…</button>
+      <button class="btn" id="cb-default" title="Mark the selected state as the startup default">Set default</button>
+      <button class="btn btn-warn" id="cb-delete" title="Delete the selected state">✕</button>
+      <span class="cb-note" id="cb-note"></span>
+    </div>
     <div id="unit-grid" class="unit-grid"></div>
   </section>
 

@@ -228,6 +228,92 @@ def doctor(local: bool = typer.Option(False, "--local", help="run in-process ins
 
 
 # --------------------------------------------------------------------------- #
+# cookbook — named fleet states (save what's loaded where; get back to it)
+# --------------------------------------------------------------------------- #
+cookbook_app = typer.Typer(add_completion=False,
+                           help="Save/apply named fleet states (which models run where).")
+app.add_typer(cookbook_app, name="cookbook")
+
+
+@cookbook_app.command("list")
+def cookbook_list() -> None:
+    """Saved states, the default marker, and per-unit contents."""
+    try:
+        with _client() as c:
+            d = c.get("/api/cookbook").json()
+    except httpx.HTTPError as e:
+        _bail(e)
+    states = d.get("states", {})
+    if not states:
+        typer.echo("no saved states")
+        return
+    for name in sorted(states):
+        star = "★ " if name == d.get("default") else "  "
+        typer.secho(f"{star}{name}", bold=True)
+        for uid, models in sorted(states[name].get("units", {}).items()):
+            names = ", ".join(m["model"] for m in models) or "(empty)"
+            typer.echo(f"    {uid:10s} {names}")
+    if d.get("default") and d.get("default_in_sync") is False:
+        typer.secho("  note: startup defaults have drifted from the ★ state", fg="yellow")
+
+
+@cookbook_app.command("save")
+def cookbook_save(name: str = typer.Argument(..., help="state name (upsert)")) -> None:
+    """Snapshot the CURRENT fleet under a name."""
+    try:
+        with _client() as c:
+            r = c.put(f"/api/cookbook/{name}")
+            if r.status_code == 409:
+                typer.secho(r.json().get("detail", "busy"), fg="red"); raise typer.Exit(3)
+            r.raise_for_status()
+    except httpx.HTTPError as e:
+        _bail(e)
+    typer.echo(f"saved '{name}'")
+
+
+@cookbook_app.command("apply")
+def cookbook_apply(name: str = typer.Argument(...)) -> None:
+    """Load exactly this state's models on every unit (streams the meta job)."""
+    try:
+        with _client() as c:
+            r = c.post(f"/api/cookbook/{name}/apply")
+            if r.status_code in (404, 409):
+                typer.secho(r.json().get("detail", "refused"), fg="red"); raise typer.Exit(3)
+            r.raise_for_status()
+            job = r.json()
+    except httpx.HTTPError as e:
+        _bail(e)
+    _poll_job(job["id"])
+
+
+@cookbook_app.command("set-default")
+def cookbook_set_default(name: str = typer.Argument(...)) -> None:
+    """Mark a state as the startup default (syncs the per-unit defaults)."""
+    try:
+        with _client() as c:
+            r = c.post(f"/api/cookbook/{name}/default")
+            if r.status_code == 404:
+                typer.secho(r.json().get("detail", "not found"), fg="red"); raise typer.Exit(3)
+            r.raise_for_status()
+    except httpx.HTTPError as e:
+        _bail(e)
+    typer.echo(f"'{name}' is now the startup default")
+
+
+@cookbook_app.command("delete")
+def cookbook_delete(name: str = typer.Argument(...)) -> None:
+    try:
+        with _client() as c:
+            r = c.delete(f"/api/cookbook/{name}")
+            if r.status_code == 404:
+                typer.secho(r.json().get("detail", "not found"), fg="red"); raise typer.Exit(3)
+            r.raise_for_status()
+    except httpx.HTTPError as e:
+        _bail(e)
+    typer.echo(f"deleted '{name}'")
+
+
+# --------------------------------------------------------------------------- #
 # leases — claim a unit so other callers know not to take it
 # --------------------------------------------------------------------------- #
 lease_app = typer.Typer(add_completion=False, help="Claim / inspect / release unit leases.")

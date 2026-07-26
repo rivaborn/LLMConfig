@@ -134,6 +134,8 @@ function buildCard(unit) {
   refs.load.onclick = () => {
     const v = refs.select.value;
     if (!v) return;
+    const chosen = refs.select.selectedOptions[0];
+    if (chosen && chosen.disabled) return;   // un-addable — reason is in its tooltip
     const [server, ...rest] = v.split("::");
     doLoad(unit.id, server, rest.join("::"));
   };
@@ -334,7 +336,11 @@ function renderResident(host, l) {
 async function refreshStatus() {
   let d;
   try { d = await api("/api/status"); } catch (e) { return; }
+  RESIDENT = {};
   (d.lanes || []).forEach((l) => {
+    // Fold served names onto catalog aliases (CANON) so estimates compare like
+    // with like — cookbook states store aliases.
+    RESIDENT[l.id] = (l.loaded_models || []).map((m) => canonName(l.id, m.model));
     const g = l.gpu || {};
     const offline = l.kind === "spark" && l.reachable === false;
     const ownerText = offline ? "offline" : l.owner;
@@ -389,13 +395,33 @@ function fillSelect(sel, options, loadedValue) {
     const opt = document.createElement("option");
     opt.value = o.value;
     opt.textContent = o.label;
+    if (o.disabled) opt.disabled = true;   // un-addable — reason in the tooltip
+    if (o.title) opt.title = o.title;      // load estimate + fit note on hover
     sel.appendChild(opt);
   });
-  const want = options.some((o) => o.value === prev) ? prev : (loadedValue || options[0].value);
-  sel.value = want;
+  // Keep the user's pick only while it stays selectable; never fall back onto a
+  // disabled option (the Add button would no-op confusingly).
+  const usable = (v) => options.some((o) => o.value === v && !o.disabled);
+  const firstUsable = (options.find((o) => !o.disabled) || options[0]).value;
+  sel.value = usable(prev) ? prev : (usable(loadedValue) ? loadedValue : firstUsable);
+}
+
+let LOAD_TIMES = {};   // {key: {est_s, n}} from /api/load-times
+
+function fmtDur(s) {
+  if (s == null) return null;
+  if (s < 90) return `${Math.round(s)}s`;
+  return `~${Math.round(s / 60)} min`;
+}
+
+function estFor(unit, server, alias) {
+  const key = unit.kind === "spark" ? `spark:${alias}` : `${unit.id}:${server}:${alias}`;
+  const rec = LOAD_TIMES[key];
+  return rec ? { text: `${fmtDur(rec.est_s)} load (median of ${rec.n})`, s: rec.est_s } : null;
 }
 
 async function refreshModels() {
+  try { LOAD_TIMES = (await api("/api/load-times")).samples || {}; } catch (e) { LOAD_TIMES = {}; }
   for (const unit of UNITS) {
     let d;
     try { d = await api("/api/models?lane=" + encodeURIComponent(unit.id)); } catch (e) { continue; }
@@ -403,11 +429,16 @@ async function refreshModels() {
     const opts = [];
     let loadedValue = "";
     (d.ollama || []).forEach((m) => {
-      opts.push({ value: `ollama::${m.name}`, label: `${m.name}  ·  ollama` });
+      const est = estFor(unit, "ollama", m.name);
+      opts.push({ value: `ollama::${m.name}`,
+                  label: `${m.name}  ·  ${GIB(m.size_bytes)}  ·  ollama`,
+                  title: est ? est.text : "no load data yet" });
       if (m.loaded) loadedValue = `ollama::${m.name}`;
     });
     (d.vllm || []).forEach((a) => {
-      opts.push({ value: `vllm::${a.alias}`, label: `${a.alias}  ·  vllm` });
+      const est = estFor(unit, "vllm", a.alias);
+      opts.push({ value: `vllm::${a.alias}`, label: `${a.alias}  ·  vllm`,
+                  title: est ? est.text : "no load data yet" });
       if (a.loaded) loadedValue = `vllm::${a.alias}`;
     });
     if (d.spark && d.spark.length) {
@@ -419,7 +450,16 @@ async function refreshModels() {
       CANON[unit.id] = map;
     }
     (d.spark || []).forEach((m) => {
-      opts.push({ value: `spark::${m.alias}`, label: `${m.alias}  ·  spark` });
+      // Size from the declared budget; addability computed server-side beside
+      // the admission arithmetic — never re-derived here (invariant 14).
+      const size = m.mem_fraction > 0 ? `≈${Math.round(m.mem_fraction * 121)} GB` : "whole node";
+      const est = estFor(unit, "spark", m.alias);
+      const bits = [est ? est.text : "no load data yet"];
+      if (m.add_note) bits.push(m.add_note);
+      opts.push({ value: `spark::${m.alias}`,
+                  label: `${m.alias}  ·  ${size}  ·  spark`,
+                  disabled: !m.addable && !m.loaded,
+                  title: bits.join(" — ") });
       if (m.loaded) loadedValue = `spark::${m.alias}`;
     });
 
@@ -555,6 +595,112 @@ function setButtons() {
   });
 }
 
+// ---- cookbook: named fleet states ----------------------------------------
+let COOKBOOK = { default: "", states: {} };
+
+function cbApplyEstimate(state) {
+  // Units apply in parallel; per-unit work is sequential — so the wall clock is
+  // the SLOWEST unit: unloads (~15s each) + the missing models' load estimates.
+  let worst = 0;
+  for (const [uid, targets] of Object.entries(state.units || {})) {
+    const unit = UNITS.find((u) => u.id === uid);
+    if (!unit) continue;
+    const resident = RESIDENT[uid] || [];
+    const want = targets.map((t) => t.model);
+    const extras = resident.filter((m) => !want.includes(m)).length;
+    let secs = extras * 15;
+    for (const t of targets) {
+      if (resident.includes(t.model)) continue;
+      const est = estFor(unit, t.server, t.model);
+      secs += est ? est.s : 120;             // unknown → assume ~2 min
+    }
+    worst = Math.max(worst, secs);
+  }
+  return worst;
+}
+
+// {unitId: [resident model names]} — refreshed from /api/status for estimates.
+let RESIDENT = {};
+
+function cbRefreshSelect() {
+  const sel = $("cb-select");
+  if (!sel) return;
+  const prev = sel.value;
+  sel.innerHTML = "";
+  const names = Object.keys(COOKBOOK.states || {});
+  if (!names.length) {
+    const o = document.createElement("option");
+    o.value = ""; o.textContent = "no saved states";
+    sel.appendChild(o); sel.disabled = true;
+    return;
+  }
+  sel.disabled = false;
+  names.sort().forEach((n) => {
+    const o = document.createElement("option");
+    const est = cbApplyEstimate(COOKBOOK.states[n]);
+    const star = n === COOKBOOK.default ? "★ " : "";
+    o.value = n;
+    o.textContent = `${star}${n}${est > 5 ? `  (${fmtDur(est)} to apply)` : ""}`;
+    sel.appendChild(o);
+  });
+  if (names.includes(prev)) sel.value = prev;
+  const note = $("cb-note");
+  if (note) {
+    note.textContent = COOKBOOK.default
+      ? (COOKBOOK.default_in_sync === false ? "startup defaults have drifted from ★" : "")
+      : "";
+  }
+}
+
+async function cbRefresh() {
+  try { COOKBOOK = await api("/api/cookbook"); } catch (e) { return; }
+  cbRefreshSelect();
+}
+
+async function cbApply() {
+  const name = $("cb-select").value;
+  if (!name) return;
+  if (!confirm(`Apply '${name}'? Models not in the state will be unloaded fleet-wide.`)) return;
+  log(`applying cookbook state '${name}'…`);
+  Object.keys(COOKBOOK.states[name].units || {}).forEach((uid) => markBusy(uid, true));
+  try {
+    const job = await api(`/api/cookbook/${encodeURIComponent(name)}/apply`, { method: "POST" });
+    await pollJob(job.id);
+  } catch (e) { log("error: " + e.message, true); }
+  Object.keys(COOKBOOK.states[name].units || {}).forEach((uid) => markBusy(uid, false));
+  await refreshAll(); await cbRefresh();
+}
+
+async function cbSave() {
+  const name = prompt("Save the current fleet state as:");
+  if (!name) return;
+  try {
+    await api(`/api/cookbook/${encodeURIComponent(name.trim())}`, { method: "PUT" });
+    log(`saved fleet state '${name.trim()}'`, true);
+  } catch (e) { log("error: " + e.message, true); }
+  await cbRefresh();
+}
+
+async function cbSetDefault() {
+  const name = $("cb-select").value;
+  if (!name) return;
+  try {
+    await api(`/api/cookbook/${encodeURIComponent(name)}/default`, { method: "POST" });
+    log(`'${name}' is now the startup default`, true);
+  } catch (e) { log("error: " + e.message, true); }
+  await cbRefresh();
+}
+
+async function cbDelete() {
+  const name = $("cb-select").value;
+  if (!name || !confirm(`Delete cookbook state '${name}'?`)) return;
+  try {
+    await api(`/api/cookbook/${encodeURIComponent(name)}`, { method: "DELETE" });
+    log(`deleted '${name}'`, true);
+  } catch (e) { log("error: " + e.message, true); }
+  await cbRefresh();
+}
+
 // ---- boot ----------------------------------------------------------------
 async function refreshAll() { await refreshStatus(); await refreshModels(); }
 
@@ -587,3 +733,9 @@ boot();
 // units' cards. The model catalog (which rebuilds DOM lists) still waits.
 setInterval(() => refreshStatus(), 2500);
 setInterval(() => { if (!anyBusy()) refreshModels(); }, 12000);
+["cb-apply", "cb-save", "cb-default", "cb-delete"].forEach((id, i) => {
+  const el = $(id);
+  if (el) el.onclick = [cbApply, cbSave, cbSetDefault, cbDelete][i];
+});
+cbRefresh();
+setInterval(() => { if (!anyBusy()) cbRefresh(); }, 30000);
