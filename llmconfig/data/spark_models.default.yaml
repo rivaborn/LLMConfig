@@ -146,7 +146,7 @@ models:
     served_name: qwen3-vl-embedding-8b
     tp: 1
     status: unverified
-    mem_fraction: 0.3    # 15.17 weights + 14.93 MEASURED overhead + 4.5 KV = 34.6 GB; 0.18 died at -10 GiB KV.
+    mem_fraction: 0.33   # MEASURED: 0.30 failed by 0.1 GiB (profiled weights ~17 + 14.9 overhead + 4.5 KV); 0.33 = 40 GB.
     extra_args: ["--max-model-len", "32768"]
     notes: >-
       Qwen/Qwen3-VL-Embedding-8B, pooling runner. 15.17 GB weights + 4.50 GB KV at
@@ -158,7 +158,7 @@ models:
     served_name: qwen3-vl-reranker-8b
     tp: 1
     status: unverified
-    mem_fraction: 0.32   # 16.33 weights + ~15 overhead + 4.5 KV = 35.8 GB; pairs with the embedder (0.62 total).
+    mem_fraction: 0.35   # ~18 profiled weights + ~15 overhead + 4.5 KV; sized off the embedder's measured failure.
     extra_args: ["--max-model-len", "32768"]
     notes: >-
       Qwen/Qwen3-VL-Reranker-8B, pooling runner. 16.33 GB weights + 4.50 GB KV at

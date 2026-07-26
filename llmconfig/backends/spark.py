@@ -24,6 +24,7 @@ powered off never breaks `/api/status`.
 from __future__ import annotations
 
 import asyncio
+import base64
 import shlex
 import time
 from typing import Callable, Optional
@@ -381,12 +382,22 @@ class SparkBackend:
     def _serve_probe(self, port: int, tail: int = 0) -> str:
         tail_cmd = (f"tail -{int(tail)} /tmp/sparkrun_serve.log 2>/dev/null; "
                     if tail else "")
-        return (
+        # Base64 the whole script, exactly as sparkrun does for its own exec'd
+        # commands. This probe crosses FOUR quoting layers (Python → Windows argv
+        # → wsl.exe argv reconstruction → remote sh), and quotes do not survive
+        # them: wsl.exe mangles embedded double quotes, and shlex.quote escapes
+        # inner single quotes AS double-quote sequences ('"'"'). The first,
+        # quoted, version of this probe degraded to matching every container, so
+        # gemma's SERVE_ALIVE masked the dead embedder and the fast-fail never
+        # fired (live, 2026-07-26). Base64's alphabet is transparent to all four.
+        script = (
             "for c in $(docker ps -q); do "
-            f"docker exec $c sh -c 'grep -q \"port {int(port)}\" /tmp/sparkrun_serve.sh 2>/dev/null "
+            f"docker exec $c sh -c 'grep -q port.{int(port)} /tmp/sparkrun_serve.sh 2>/dev/null "
             "&& { kill -0 $(cat /tmp/sparkrun_serve.pid) 2>/dev/null && echo SERVE_ALIVE "
             f"|| echo SERVE_DEAD; {tail_cmd}" + "}' 2>/dev/null; done"
         )
+        b64 = base64.b64encode(script.encode()).decode()
+        return f"echo {b64} | base64 -d | sh"
 
     async def serve_status(self, port: int) -> str:
         """'alive' | 'dead' | 'unknown' for the slot's exec'd server process.

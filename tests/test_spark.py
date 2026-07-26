@@ -930,15 +930,23 @@ async def test_serve_status_and_real_log_come_from_inside_the_container(cfg, cal
     `docker logs` shows only the CUDA banner. The probes must exec in."""
     b = make_unit(cfg).spark
 
-    calls.plan["docker ps -q"] = CmdResult(
+    calls.plan["base64 -d"] = CmdResult(
         0, "SERVE_DEAD\nAvailable KV cache memory: -10.07 GiB\n", "")
     assert await b.serve_status(8001) == "dead"
     tail = await b.logs(n=5, port=8001)
     assert "Available KV cache memory" in tail, "the REAL serve log must surface"
-    probe = next(c for c in calls if "sparkrun_serve.pid" in c)
-    assert "docker exec" in probe and "port 8001" in probe
+    # The probe crosses four quoting layers, none of which quotes survive, so
+    # the script must travel base64-encoded — the visible command may contain
+    # NO quote characters at all beyond the ssh template's own.
+    import base64 as _b64
+    probe = next(c for c in calls if "base64 -d" in c)
+    payload = probe.split("echo ", 1)[1].split(" |", 1)[0].strip("'")
+    script = _b64.b64decode(payload).decode()
+    assert "docker exec" in script and "port.8001" in script
+    assert "sparkrun_serve.pid" in script
+    assert '"' not in script.split("docker exec", 1)[0], "outer loop must stay quote-free"
 
-    calls.plan["docker ps -q"] = CmdResult(0, "SERVE_ALIVE\n", "")
+    calls.plan["base64 -d"] = CmdResult(0, "SERVE_ALIVE\n", "")
     assert await b.serve_status(8001) == "alive"
-    calls.plan["docker ps -q"] = CmdResult(0, "", "")
+    calls.plan["base64 -d"] = CmdResult(0, "", "")
     assert await b.serve_status(8001) == "unknown", "no matching container = unknown, never dead"
