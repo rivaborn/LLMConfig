@@ -227,18 +227,23 @@ class SparkUnit:
         job = self.jobs.create(kind=f"load:{self.cfg.id}:spark:{req.model}")
 
         async def body(job: Job) -> dict:
+            # BOUNDED acquire — mirrors Lane.load. An unbounded wait is what let
+            # one stuck Spark launch stack 29 jobs behind it on 2026-07-28; the
+            # unit reported "busy" for six hours instead of surfacing as wedged.
             if self._lock.locked():
-                self.jobs.log(job, "waiting for an in-progress swap to finish…")
-            async with self._lock:
-                self._active_job_id = job.id
-                try:
-                    return await self._load(job, req)
-                finally:
-                    self._active_job_id = None
-                    # Clock the TARGET model, not just the unit: a fresh load must start
-                    # its own idle window, or the reaper would fall back to the unit clock
-                    # and treat it as busy for as long as any neighbour keeps that fresh.
-                    self.touch(model=req.model)
+                self.jobs.log(job, "waiting for an in-progress swap to finish… "
+                                   f"(holder: {self._active_job_id or 'unknown'})")
+            await self._acquire_swap_lock("load")
+            self._active_job_id = job.id
+            try:
+                return await self._load(job, req)
+            finally:
+                self._active_job_id = None
+                # Clock the TARGET model, not just the unit: a fresh load must start
+                # its own idle window, or the reaper would fall back to the unit clock
+                # and treat it as busy for as long as any neighbour keeps that fresh.
+                self.touch(model=req.model)
+                self._lock.release()
 
         return self.jobs.start(job, body)
 
@@ -376,7 +381,12 @@ class SparkUnit:
         the whole node is freed, which is what the idle reaper's "free the unit"
         and a lease's `free_on_preempt` still mean.
         """
-        async with self._lock:
+        # Bounded like load(): unload is the natural "get me out of this" move
+        # when a unit is stuck, so it must not itself block on the wedged lock.
+        # On 2026-07-28 /api/unload hung with no response — the one call that
+        # should have cleared the wedge was queued behind it.
+        await self._acquire_swap_lock("unload")
+        try:
             self._active_job_id = None
             recipe = None
             if req.model:
@@ -396,7 +406,21 @@ class SparkUnit:
                 self.model_activity.pop(self.canonical_model(req.model), None)
             else:
                 self.model_activity.clear()
+        finally:
+            self._lock.release()
         return await self.status()
+
+    async def _acquire_swap_lock(self, what: str) -> None:
+        """Acquire the unit's swap lock, or raise rather than wait forever."""
+        try:
+            await asyncio.wait_for(self._lock.acquire(),
+                                   timeout=self.s.swap_wait_timeout_s)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"timed out after {self.s.swap_wait_timeout_s:.0f}s waiting for the "
+                f"{self.cfg.id} swap lock to {what} (held by job "
+                f"{self._active_job_id or 'unknown'}) — the unit is wedged, not busy"
+            ) from None
 
     # ------------------------------------------------------------------ #
     # Internals

@@ -322,6 +322,26 @@ class Settings(BaseSettings):
     vllm_ready_grace_s: int = 30  # readiness re-check after a load's per-alias timeout, so a
                                   # vLLM that came up just past the deadline isn't failed/torn down
 
+    # --- WSL readiness / recovery ---
+    # At boot the app starts seconds after logon, while WSL2 is still coming up.
+    # Firing autoload_defaults() into a cold distro deadlocks the exec path:
+    # `wsl --status` answers but `wsl -u <user>` never returns, and every later
+    # load inherits the wedge (2026-07-28: 6 h outage, 29 stacked jobs).
+    wsl_ready_timeout_s: float = 300.0        # give up gating the boot autoload after this
+    wsl_ready_probe_timeout_s: float = 15.0   # per-probe budget for `wsl -- true`
+    wsl_ready_backoff_s: float = 5.0          # pause between probes
+    # Self-heal: after this many consecutive probe timeouts, run the recovery
+    # ladder (kill orphans -> --shutdown -> restart WslService).
+    wsl_selfheal_enabled: bool = True
+    wsl_selfheal_after_failures: int = 3
+    wsl_selfheal_cooldown_s: float = 900.0    # never loop the ladder faster than this
+    wsl_service_restart_timeout_s: float = 120.0  # observed ~16 stop-poll cycles
+
+    # Bounded wait for a unit's swap lock. Must exceed the longest legitimate
+    # queue (spark_load_timeout_s 900 / default_vllm_load_timeout_s 240), but
+    # bounded so a wedged holder surfaces instead of queueing forever.
+    swap_wait_timeout_s: float = 1200.0
+
     @property
     def auth_enabled(self) -> bool:
         return bool(self.llmconfig_api_key.strip())

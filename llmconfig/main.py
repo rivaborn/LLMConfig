@@ -5,6 +5,8 @@ edits/download) require `X-API-Key` only when LLMCONFIG_API_KEY is set.
 """
 from __future__ import annotations
 
+import asyncio
+import logging
 import shlex
 from contextlib import asynccontextmanager
 from typing import Optional
@@ -47,7 +49,9 @@ from .schemas import (
     VllmAliasEntry,
 )
 from .spark_unit import SparkUnit
-from .wsl import run_wsl
+from .wsl import WslRecovery, run_wsl, wait_ready
+
+log = logging.getLogger(__name__)
 
 WEB_DIR = PACKAGE_DIR / "web"
 
@@ -68,14 +72,41 @@ def create_app() -> FastAPI:
     reaper = IdleReaper(settings, orch, monitor, leases)
     sweeper = LeaseSweeper(settings, orch, leases)
 
+    recovery = WslRecovery(settings)
+
+    async def _gated_autoload() -> None:
+        """Restore each unit's default model, but only once WSL can execute.
+
+        At boot this app starts seconds after logon while WSL2 is still coming
+        up. Firing the autoload into a cold distro is what wedged the exec path
+        on 2026-07-28 and cost a 6 h outage, so gate it — and self-heal if the
+        distro is wedged rather than merely slow. Runs in the BACKGROUND so
+        uvicorn binds :11430 immediately either way.
+        """
+        try:
+            if await wait_ready(settings=settings, on_stall=recovery.attempt):
+                orch.autoload_defaults()
+                return
+            log.error(
+                "WSL not ready after %.0fs (recovery: %s) — skipping the boot autoload of "
+                "unit defaults. The API is up; load a model to retry.",
+                settings.wsl_ready_timeout_s, recovery.last_outcome,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 — a failed restore must not break startup
+            log.exception("boot autoload gate failed")
+
     @asynccontextmanager
     async def lifespan(_app: FastAPI):
-        # Auto-load each lane's configured default model (fire-and-forget Jobs).
-        orch.autoload_defaults()
+        # Auto-load each lane's configured default model (fire-and-forget Jobs),
+        # gated on WSL readiness — see _gated_autoload.
+        boot_autoload = asyncio.create_task(_gated_autoload())
         monitor.start()  # begin sampling GPU/LLM telemetry for the Monitor tab
         reaper.start()   # idle auto-unload policy (reads the monitor's util samples)
         sweeper.start()  # lease expiry + deferred preemption frees
         yield
+        boot_autoload.cancel()
         await sweeper.stop()
         await reaper.stop()  # before the monitor: the reaper reads its samples
         await monitor.stop()
@@ -283,7 +314,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/doctor")
     async def api_doctor() -> dict:
-        report = await doctor_mod.run_doctor(settings, registry)
+        report = await doctor_mod.run_doctor(settings, registry, recovery)
         return report.model_dump()
 
     @app.get("/api/monitor")

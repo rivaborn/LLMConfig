@@ -36,8 +36,12 @@ async def start_service(name: str) -> CmdResult:
     return await _ps(f"Start-Service -Name '{name}'")
 
 
-async def restart_service(name: str) -> CmdResult:
-    return await _ps(f"Restart-Service -Name '{name}' -Force")
+async def restart_service(name: str, timeout: float = 25.0) -> CmdResult:
+    """Restart a service. `timeout` is overridable because not every service
+    stops promptly: WslService took ~16 stop-poll cycles (well past the 25 s
+    default) when it was reaped to clear a wedged distro.
+    """
+    return await _ps(f"Restart-Service -Name '{name}' -Force", timeout=timeout)
 
 
 def looks_like_access_denied(r: CmdResult) -> bool:

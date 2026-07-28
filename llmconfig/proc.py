@@ -11,6 +11,12 @@ import asyncio
 from dataclasses import dataclass
 
 
+# How long to wait for a killed process to actually die before abandoning it.
+# Short on purpose: this only runs on a path that has already timed out, and the
+# whole point is that the caller must get control back.
+REAP_TIMEOUT_S = 5.0
+
+
 @dataclass
 class CmdResult:
     rc: int
@@ -46,7 +52,22 @@ async def run_argv(argv: list[str], timeout: float = 30.0, env: dict | None = No
             proc.kill()
         except ProcessLookupError:
             pass
-        await proc.wait()
+        # Bound the reap. `kill()` is a REQUEST: a process wedged in an
+        # uninterruptible kernel call ignores it, and a bare `await proc.wait()`
+        # then never returns — which silently breaks this module's whole "a hang
+        # becomes rc 124" contract. On 2026-07-28 a wedged `wsl.exe` hung here
+        # for 5 h holding a unit's swap lock, stacked 29 jobs behind it, and
+        # stalled the Monitor loop (every sampler funnels through run_argv).
+        # If the reap fails, abandon the handle and report the timeout anyway;
+        # the orphan is cleaned up by the WSL recovery ladder.
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=REAP_TIMEOUT_S)
+        except asyncio.TimeoutError:
+            return CmdResult(
+                124, "",
+                f"timeout after {timeout}s running {argv[0]!r}; "
+                f"process survived kill() — abandoned (pid {proc.pid})",
+            )
         return CmdResult(124, "", f"timeout after {timeout}s running {argv[0]!r}")
 
     rc = proc.returncode if proc.returncode is not None else -1

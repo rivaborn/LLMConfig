@@ -157,17 +157,24 @@ class Lane:
         job = self.jobs.create(kind=f"load:{self.cfg.id}:{req.server}:{req.model}")
 
         async def body(job: Job) -> dict:
+            # BOUNDED acquire. An unbounded `async with self._lock` means one
+            # wedged holder blocks every later load forever: on 2026-07-28 a
+            # single stuck launch stacked 29 jobs behind it and the unit read as
+            # "busy" rather than broken, for six hours. Fail fast instead, and
+            # name the holder so the report points at the real culprit.
             if self._lock.locked():
-                self.jobs.log(job, "waiting for an in-progress swap to finish…")
-            async with self._lock:
-                self._active_job_id = job.id
-                try:
-                    if req.server == "ollama":
-                        return await self._load_ollama(job, req)
-                    return await self._load_vllm(job, req)
-                finally:
-                    self._active_job_id = None
-                    self.touch()  # a load (even a failed one) restarts the idle window
+                self.jobs.log(job, "waiting for an in-progress swap to finish… "
+                                   f"(holder: {self._active_job_id or 'unknown'})")
+            await self._acquire_swap_lock("load")
+            self._active_job_id = job.id
+            try:
+                if req.server == "ollama":
+                    return await self._load_ollama(job, req)
+                return await self._load_vllm(job, req)
+            finally:
+                self._active_job_id = None
+                self.touch()  # a load (even a failed one) restarts the idle window
+                self._lock.release()
 
         return self.jobs.start(job, body)
 
@@ -264,7 +271,12 @@ class Lane:
     # Unload (synchronous eviction)
     # ------------------------------------------------------------------ #
     async def unload(self, req: UnloadRequest) -> LaneStatus:
-        async with self._lock:
+        # Bounded like load(): unload is the natural "get me out of this" move
+        # when a unit is stuck, so it must not itself block on the wedged lock.
+        # On 2026-07-28 /api/unload hung with no response — the one call that
+        # should have cleared the wedge was queued behind it.
+        await self._acquire_swap_lock("unload")
+        try:
             self._active_job_id = None
             if req.server in (None, "vllm"):
                 if await self.vllm.up():
@@ -272,7 +284,21 @@ class Lane:
             if req.server in (None, "ollama"):
                 await self.ollama.unload_all()
             await self._wait_vram_free(None)
+        finally:
+            self._lock.release()
         return await self.status()
+
+    async def _acquire_swap_lock(self, what: str) -> None:
+        """Acquire the unit's swap lock, or raise rather than wait forever."""
+        try:
+            await asyncio.wait_for(self._lock.acquire(),
+                                   timeout=self.s.swap_wait_timeout_s)
+        except asyncio.TimeoutError:
+            raise RuntimeError(
+                f"timed out after {self.s.swap_wait_timeout_s:.0f}s waiting for the "
+                f"{self.cfg.id} swap lock to {what} (held by job "
+                f"{self._active_job_id or 'unknown'}) — the unit is wedged, not busy"
+            ) from None
 
     # ------------------------------------------------------------------ #
     # Internals

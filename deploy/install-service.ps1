@@ -55,9 +55,21 @@ else {
     # elevation needed to Start/Restart the Ollama service.
     $userId  = "$env:USERDOMAIN\$env:USERNAME"
     $action  = New-ScheduledTaskAction -Execute $py -Argument $uvArgs -WorkingDirectory $RepoPath
+
+    # Delay the start after logon. At boot this task fires seconds after logon,
+    # while WSL2 is still coming up; on 2026-07-28 that raced a cold distro and
+    # wedged its exec path for six hours. The app's own WSL readiness gate is the
+    # real fix — this is cheap defence-in-depth for the window before app code
+    # runs at all.
     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $userId
+    $trigger.Delay = 'PT2M'
+
+    # RestartCount/RestartInterval give crash recovery the task otherwise has
+    # none of: without them a crashed arbiter simply stays down until someone
+    # notices. ExecutionTimeLimit stays Zero (the app is meant to run forever).
     $set     = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero)
+        -StartWhenAvailable -ExecutionTimeLimit ([TimeSpan]::Zero) `
+        -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1)
     $principal = New-ScheduledTaskPrincipal -UserId $userId -LogonType Interactive -RunLevel Highest
     Register-ScheduledTask -TaskName $ServiceName -Action $action -Trigger $trigger `
         -Principal $principal -Settings $set -Force | Out-Null

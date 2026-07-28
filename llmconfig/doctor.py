@@ -17,7 +17,7 @@ from .backends.vllm import VllmBackend
 from .config import LaneConfig, Settings, get_settings
 from .gpu import query_gpu
 from .registry import DEFAULT_COMPANION_REGISTRY, Registry, make_registry
-from .wsl import run_wsl, user_systemctl
+from .wsl import WslRecovery, run_wsl, user_systemctl
 
 
 class Check(BaseModel):
@@ -113,7 +113,11 @@ async def _check_lane(add, settings: Settings, cfg: LaneConfig, registry: Regist
     await vllm.aclose()
 
 
-async def run_doctor(settings: Settings | None = None, registry: Registry | None = None) -> DoctorReport:
+async def run_doctor(
+    settings: Settings | None = None,
+    registry: Registry | None = None,
+    recovery: "WslRecovery | None" = None,
+) -> DoctorReport:
     settings = settings or get_settings()
     lane_cfgs = settings.lanes()
     checks: list[Check] = []
@@ -140,6 +144,15 @@ async def run_doctor(settings: Settings | None = None, registry: Registry | None
     r = await run_wsl("echo ok", login=False, timeout=20.0, settings=settings)
     wsl_ok = r.ok and "ok" in r.out
     add("wsl.distro", wsl_ok, f"{settings.wsl_distro} as {settings.wsl_user}" if wsl_ok else (r.text() or "wsl.exe unavailable"))
+
+    # A wedged distro answers `wsl --status` but hangs every exec, so report what
+    # the self-heal ladder has done — otherwise a recovered-then-rewedged box
+    # looks identical to one that never had a problem.
+    if recovery is not None:
+        add("wsl.selfheal",
+            None if wsl_ok else False,
+            f"enabled={recovery.s.wsl_selfheal_enabled} last={recovery.last_outcome}"
+            + (" (cooling down)" if recovery.cooling_down() else ""))
 
     if wsl_ok:
         r = await run_wsl(user_systemctl("show-environment >/dev/null 2>&1 && echo ok || echo FAIL"),
