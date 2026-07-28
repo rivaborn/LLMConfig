@@ -142,7 +142,10 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
   units parallel, unload-extras-then-load-missing, `needs_empty_node` forces a full
   rebuild), mark-default (syncs `LaneDefaults` incl. `[]` tombstones).
 - `load_times.py` — measured launch durations (units record success-only, launch-span
-  only; Sparks share one key per alias). Behind `/api/load-times` and the UI estimates.
+  only; Sparks share one key per alias) + per-unit consecutive-failure counters
+  (separate `failures:` section — never mixed into the medians). Behind
+  `/api/load-times`, `/api/load-times/{model}`, the UI estimates, and placement's
+  proven-load gate + blocklist.
 - `placement.py` — auto-placement: pure `rank()` over per-unit `CandidateFacts` +
   `Placer` (single-flight status sweep, sync lease/registry reads). Advisory by design
   — see invariant 15.
@@ -264,6 +267,19 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    a single-unit deployment behaves exactly as an explicit header would.
    `AUTO_PLACE_ENABLED=false` restores the implicit-primary default byte-for-byte.
    The id `auto` is reserved and can never name a unit.
+   **The proven-load gate** (`PLACEMENT_REQUIRE_PROVEN`, 2026-07-28) and the
+   consecutive-failure blocklist are further *ranking predicates*, not gates: a
+   fresh load is only CHOSEN on a unit where the model has launched successfully
+   before (a `LoadTimes` sample, or current residency), and a unit with
+   `PLACEMENT_FAIL_BLOCK_AFTER` consecutive launch failures is skipped until the
+   cooldown lapses. The tiers that don't choose are exempt on purpose — the
+   sole-candidate pin and the resident tier — which is how a first-ever load
+   gets seeded (pin, or an explicit lane). Mind the key asymmetry: success
+   samples are FLEET-WIDE for Sparks (`spark:{alias}` — identical GB10s, and
+   residency on any spark proves all four) while failure counters are PER-UNIT
+   for everyone (`fail_key` — launch failures are usually node-state-dependent,
+   so spark1 failing must not block spark2). "Proven" means the LAUNCH
+   succeeds, not that inference is stable.
 
 14. **A Spark load is admitted by summed `mem_fraction`, and there is nothing
    else.** A lane can watch `nvidia-smi` drain before it loads; a Spark has no

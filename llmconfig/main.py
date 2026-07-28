@@ -67,7 +67,7 @@ def create_app() -> FastAPI:
     load_times = LoadTimes()
     orch.attach_load_times(load_times)   # units record real launch durations
     cookbook = Cookbook(settings, orch, jobs, leases)
-    placer = Placer(settings, orch, leases, monitor)
+    placer = Placer(settings, orch, leases, monitor, load_times)
     gateway = OpenAIGateway(orch, jobs, settings, leases, placer)
     reaper = IdleReaper(settings, orch, monitor, leases)
     sweeper = LeaseSweeper(settings, orch, leases)
@@ -128,6 +128,7 @@ def create_app() -> FastAPI:
     app.state.leases = leases
     app.state.sweeper = sweeper
     app.state.placer = placer
+    app.state.load_times = load_times
 
     async def require_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         if settings.auth_enabled and x_api_key != settings.llmconfig_api_key:
@@ -282,6 +283,49 @@ def create_app() -> FastAPI:
         model dropdowns; the cookbook sums them into apply estimates."""
         return {"samples": load_times.all()}
 
+    @app.get("/api/load-times/{model:path}")
+    async def api_load_times_model(model: str) -> dict:
+        """One model's expected load time, per unit it resolves on (by alias OR
+        served name — same matching as auto-placement). `est_s: null` means no
+        measurement yet: estimates exist after the first successful load. Also
+        reports where the model is resident right now and any consecutive-failure
+        counters feeding the placement blocklist."""
+        from .load_times import fail_key, lane_key, spark_key
+
+        all_samples = load_times.all()
+        statuses = await placer._statuses()
+        estimates: list[dict] = []
+        failures: list[dict] = []
+        resident_on: list[str] = []
+        resolved_alias = ""
+        for unit in orch.units.values():
+            if not unit.cfg.enabled:
+                continue
+            resolved = await placer._resolve(unit, model)
+            if resolved is None:
+                continue
+            srv, alias, _entry = resolved
+            resolved_alias = alias
+            key = spark_key(alias) if srv == "spark" else lane_key(unit.cfg.id, srv, alias)
+            est = load_times.estimate(key)
+            estimates.append({"unit": unit.cfg.id, "server": srv, "key": key,
+                              "est_s": est, "n": all_samples.get(key, {}).get("n", 0)})
+            count, last_ts = load_times.failures_for(fail_key(unit.cfg.id, srv, alias))
+            if count:
+                failures.append({"unit": unit.cfg.id, "count": count, "last_ts": last_ts})
+            st = statuses.get(unit.cfg.id)
+            if st and any(m.model == model or m.model == alias
+                          or (hasattr(unit, "canonical_model")
+                              and unit.canonical_model(m.model) == alias)
+                          for m in st.loaded_models):
+                resident_on.append(unit.cfg.id)
+        if not estimates:
+            raise HTTPException(status_code=404,
+                                detail=f"model '{model}' not found on any unit")
+        return {"model": model, "resolved_alias": resolved_alias,
+                "estimates": estimates, "resident_on": resident_on,
+                "failures": failures}
+
     @app.get("/api/lanes")
     async def api_lanes() -> list[dict]:
         """Every LLM unit, in display order — what the UI turns into tabs/cards."""
@@ -394,7 +438,11 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400,
                                 detail=f"unit '{req.lane}' takes server {want}, not '{req.server}'")
         _require_lease_ok(req.lane, x_llm_lease, req.model)
-        return orch.load(req)
+        job = orch.load(req)
+        # The world just moved: a burst's next auto request must re-sweep and see
+        # this in-flight load, not rank on the pre-load snapshot.
+        placer.invalidate()
+        return job
 
     @app.post("/api/unload", response_model=StatusResponse, dependencies=write)
     async def api_unload(req: UnloadRequest,

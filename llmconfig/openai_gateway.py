@@ -385,6 +385,11 @@ class OpenAIGateway:
             # queue ours behind the unit lock (shows "waiting…")
         job = self.orch.load(LoadRequest(server=server, model=load_arg, lane=lane.cfg.id,
                                          evict=list(evict or [])))
+        # A load just committed: drop the placer's cached sweep, so a burst's
+        # next auto request re-sweeps and sees this in-flight job instead of
+        # double-placing onto the same unit off the stale snapshot.
+        if self.placer is not None:
+            self.placer.invalidate()
         return job, False
 
     def _fwd_headers(self, headers) -> dict:

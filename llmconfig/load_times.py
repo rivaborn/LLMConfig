@@ -23,6 +23,17 @@ so their keys carry the unit id (`{unit_id}:{server}:{alias}`).
 Persistence mirrors `LaneDefaults`: a small user-editable YAML in `data/`,
 tolerant loader, self-saving mutations. Last N samples per key; the estimate is
 the median, so one cold pull skews at most until real loads displace it.
+
+Failures are tracked too, but in a SEPARATE `failures:` section — a consecutive-
+failure counter per key, never mixed into the duration samples (a 60 s dead-serve
+fast-fail must not poison a 10-minute median). A success resets the counter.
+Failure keys are always PER-UNIT (`{unit_id}:{server}:{alias}`, even for Sparks):
+launch failures are usually node-state-dependent (a co-resident's quantize
+transient, a wedged node), so spark1 failing must not blocklist spark2 — the
+asymmetry with the shared success key is deliberate. `blocked()` is the placement
+blocklist: >= threshold consecutive failures within the cooldown; once the
+cooldown lapses one probe attempt is allowed (the counter survives, so the next
+failure re-blocks immediately).
 """
 from __future__ import annotations
 
@@ -47,15 +58,23 @@ def lane_key(unit_id: str, server: str, alias: str) -> str:
     return f"{unit_id}:{server}:{alias}"
 
 
+def fail_key(unit_id: str, server: str, alias: str) -> str:
+    """Failure-counter key. Same shape as `lane_key` but used for ALL units —
+    Sparks share their SUCCESS key (identical hardware) yet fail per-node."""
+    return f"{unit_id}:{server}:{alias}"
+
+
 class LoadTimes:
     def __init__(self, path: Path | None = None):
         self.path = path or LOAD_TIMES_PATH
         self._data: dict[str, list[dict]] = {}
+        self._failures: dict[str, dict] = {}     # key -> {count, last_ts}
         self.load()
 
     def load(self) -> None:
         """Tolerant: this file is user-editable and must never break startup."""
         self._data = {}
+        self._failures = {}
         if not self.path.exists():
             return
         try:
@@ -73,9 +92,17 @@ class LoadTimes:
                                  "ts": float(s.get("ts", 0.0))})
             if keep:
                 self._data[str(key)] = keep[-_MAX_SAMPLES:]
+        for key, f in (raw.get("failures") or {}).items():
+            if isinstance(f, dict) and isinstance(f.get("count"), int) and f["count"] > 0:
+                self._failures[str(key)] = {"count": int(f["count"]),
+                                            "last_ts": float(f.get("last_ts", 0.0))}
 
     def record(self, key: str, duration_s: float, unit: str = "") -> None:
-        """Append one successful launch measurement (last N kept)."""
+        """Append one successful launch measurement (last N kept).
+
+        Success and failure keys differ for Sparks (shared vs per-unit), so the
+        load bodies pair this with `clear_failures(<per-unit key>)`.
+        """
         if duration_s < 0:
             return
         samples = self._data.setdefault(key, [])
@@ -85,6 +112,33 @@ class LoadTimes:
                         "unit": unit, "ts": round(time.time(), 1)})
         del samples[:-_MAX_SAMPLES]
         self.save()
+
+    # ---- consecutive-failure blocklist -------------------------------- #
+    def record_failure(self, key: str) -> None:
+        """One failed launch. Counts CONSECUTIVE failures; `clear_failures`
+        (called on success) resets. Never touches the duration samples."""
+        f = self._failures.setdefault(key, {"count": 0, "last_ts": 0.0})
+        f["count"] += 1
+        f["last_ts"] = round(time.time(), 1)
+        self.save()
+
+    def clear_failures(self, key: str) -> None:
+        if self._failures.pop(key, None) is not None:
+            self.save()
+
+    def failures_for(self, key: str) -> tuple[int, float]:
+        """(consecutive failure count, last failure unix ts) — (0, 0.0) if clean."""
+        f = self._failures.get(key)
+        return (f["count"], f["last_ts"]) if f else (0, 0.0)
+
+    def blocked(self, key: str, *, threshold: int, cooldown_s: float) -> bool:
+        """Placement blocklist: >= threshold consecutive failures, the last one
+        within the cooldown. A lapsed cooldown allows ONE probe attempt — the
+        counter is kept, so another failure re-blocks for a fresh cooldown."""
+        f = self._failures.get(key)
+        if f is None or f["count"] < threshold:
+            return False
+        return (time.time() - f["last_ts"]) < cooldown_s
 
     def estimate(self, key: str) -> Optional[float]:
         """Median of the recorded samples, or None with no data."""
@@ -103,7 +157,10 @@ class LoadTimes:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        doc: dict = {"samples": self._data}
+        if self._failures:
+            doc["failures"] = self._failures
         self.path.write_text(
-            yaml.safe_dump({"samples": self._data}, sort_keys=True, allow_unicode=True),
+            yaml.safe_dump(doc, sort_keys=True, allow_unicode=True),
             encoding="utf-8",
         )

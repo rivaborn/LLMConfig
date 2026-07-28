@@ -195,6 +195,17 @@ class Settings(BaseSettings):
     # TTL on the placer's unit-status sweep; staleness only mis-ranks (admission,
     # the lane lock, and the lease gate are the real gates).
     placement_cache_ttl_s: float = 2.0
+    # Proven-load gate: auto-placement only CHOOSES a unit where this model has
+    # launched successfully before (a LoadTimes sample, or current residency —
+    # Sparks prove fleet-wide, lanes per-unit). The tiers that don't choose are
+    # exempt: a sole-candidate pin behaves as an explicit header (that's how a
+    # first-ever load gets seeded), and a resident model is its own proof.
+    placement_require_proven: bool = True
+    # Consecutive launch failures on ONE unit before placement stops choosing it
+    # (0 disables). After the cooldown one probe attempt is allowed; the counter
+    # survives, so another failure re-blocks. A success clears it.
+    placement_fail_block_after: int = 2
+    placement_fail_block_cooldown_s: float = 1800.0
 
     spark_max_models: int = 4
     # Total share of a node's pool that may be committed at once. Loads are refused

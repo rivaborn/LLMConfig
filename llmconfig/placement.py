@@ -35,8 +35,10 @@ answer with one re-place (`exclude=` the failed unit).
    tie-break in unit order, so repeated requests stick to one unit and its
    warm prefix cache.
 3. **Fits without displacement**: a Spark whose declared budgets leave room
-   (and has a free slot, and no unbudgeted resident), or a free lane. Emptiest
-   first.
+   (and has a free slot, and no unbudgeted resident), or a free lane. Fastest
+   measured load first (bucketed to the minute, from `LoadTimes`), then
+   emptiest — a fresh load should go where it comes up quickest, but minute-
+   level ties fall back to balance.
 4. **Fits with displacement** of idle+unleased models only:
    - a lane whose occupant is idle and unleased — victims stay EMPTY, because
      `Lane.load` evicts its occupant itself (that *is* its load semantics);
@@ -53,6 +55,25 @@ answer with one re-place (`exclude=` the failed unit).
 
 `swap_in_progress` deprioritizes a unit but never disqualifies it — the load
 path already coalesces onto identical in-flight loads.
+
+## The proven-load gate (tiers 3 and 4 only)
+
+A fresh load is only *placed* on a unit where this model has **launched
+successfully before** (`PLACEMENT_REQUIRE_PROVEN`, default on). Proof is a
+`LoadTimes` sample — recorded iff a real launch succeeded — or current
+residency: `spark:{alias}` samples are shared across the four identical GB10s
+(loaded on one Spark ⇒ provable on any), lanes prove per-unit. The tiers that
+don't CHOOSE are exempt on purpose: the sole-candidate pin (tier 1) behaves as
+an explicit header, which is how a first-ever load gets seeded at all, and a
+resident model (tier 2) is its own proof. Note the limit: proof means the
+LAUNCH succeeds, not that inference is stable.
+
+Alongside it, a **consecutive-failure blocklist**: N failed launches in a row
+(`PLACEMENT_FAIL_BLOCK_AFTER`) blocks that unit for
+`PLACEMENT_FAIL_BLOCK_COOLDOWN_S`, after which ONE probe attempt is allowed.
+Failure counters are per-unit even for Sparks — launch failures are usually
+node-state-dependent (a co-resident's quantize transient), so spark1 failing
+must not block spark2.
 """
 from __future__ import annotations
 
@@ -67,6 +88,7 @@ from .schemas import LaneStatus
 
 if TYPE_CHECKING:
     from .leases import LeaseManager
+    from .load_times import LoadTimes
     from .monitor import Monitor
     from .orchestrator import Orchestrator, Unit
 
@@ -109,6 +131,10 @@ class CandidateFacts:
     free_slot: bool = True                 # Spark: a port is available
     lease_refused: bool = False            # gateway lease gate would 409 this model
     order: int = 0                         # settings.units() position (tie-break)
+    proven: bool = True                    # launched successfully here before (see gate)
+    fail_blocked: bool = False             # consecutive-failure blocklist tripped
+    fail_count: int = 0                    # for the tier-5 reason text
+    est_s: Optional[float] = None          # measured load estimate (tier-3 tie-break)
 
 
 @dataclass
@@ -187,6 +213,11 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
     """Pure ranking — see the module docstring for the tiers."""
     cands = [c for c in candidates if c.unit_id not in exclude]
     if not cands:
+        if candidates:
+            # The model DOES resolve somewhere — every unit was excluded after a
+            # conflict. A 404 here would be a lie; report busy, not missing.
+            return Decision(outcome="no_capacity", reasons={
+                c.unit_id: "excluded after a load conflict" for c in candidates})
         return Decision(outcome="not_found")
 
     # Tier 1 — sole candidate pins, bypassing every predicate below.
@@ -199,9 +230,11 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
         return (c.status.swap_in_progress, c.order)   # mid-swap deprioritized, never out
 
     # Tier 2 — resident, not lease-refused; idle beats active; stable tie-break.
+    # Matched by served name OR canonical alias: /api/load passes aliases, and an
+    # alias request missing its warm resident would place a second copy elsewhere.
     resident = [c for c in cands
                 if not c.lease_refused
-                and any(r.model == model for r in c.residents)]
+                and any(r.model == model or r.alias == model for r in c.residents)]
     if resident:
         resident.sort(key=lambda c: (c.usage != "idle", *order_key(c)))
         c = resident[0]
@@ -211,12 +244,23 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
     headroom = settings.spark_mem_headroom
     window = settings.usage_active_window_s
 
-    # Tier 3 — fits without displacing anything; emptiest first.
-    fits = [c for c in cands if not c.lease_refused
+    def fresh_ok(c: CandidateFacts) -> bool:
+        """May this unit take a FRESH load? (The gate — tiers 3/4 only.)"""
+        if c.fail_blocked:
+            return False
+        return c.proven or not settings.placement_require_proven
+
+    # Tier 3 — fits without displacing anything; fastest measured load first
+    # (bucketed to the minute — sub-minute differences are noise), then emptiest.
+    fits = [c for c in cands if not c.lease_refused and fresh_ok(c)
             and _fits_without_displacement(c, headroom)]
     if fits:
-        # Emptiest first (mid-swap still deprioritized ahead of everything).
+        def est_bucket(c: CandidateFacts) -> float:
+            # No estimate (proven by residency alone) sorts last among proven —
+            # a measured launch beats an unmeasured one when both fit.
+            return round(c.est_s / 60.0) if c.est_s is not None else float("inf")
         fits.sort(key=lambda c: (c.status.swap_in_progress,
+                                 est_bucket(c),
                                  c.committed if c.kind == "spark"
                                  else (c.status.gpu.vram_pct if c.status.gpu else 0.0),
                                  c.order))
@@ -227,7 +271,7 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
     # Tier 4 — fits by displacing idle + unleased models only.
     displaceable: list[tuple[CandidateFacts, list[ResidentFact]]] = []
     for c in cands:
-        if c.lease_refused:
+        if c.lease_refused or not fresh_ok(c):
             continue
         if c.kind == "spark":
             v = _victims_for(c, headroom, window)
@@ -248,6 +292,13 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
     for c in cands:
         if c.lease_refused:
             reasons[c.unit_id] = "held by a non-preemptible lease"
+        elif c.fail_blocked:
+            reasons[c.unit_id] = (f"{c.fail_count} consecutive launch failures — "
+                                  f"blocked until the cooldown lapses "
+                                  f"(or load it explicitly)")
+        elif not c.proven and settings.placement_require_proven:
+            reasons[c.unit_id] = ("never loaded successfully here — load it once "
+                                  "explicitly to prove it")
         elif c.kind == "spark" and not c.free_slot:
             reasons[c.unit_id] = "all slots in use"
         elif c.kind == "spark" and any(r.budget <= 0.0 for r in c.residents):
@@ -277,17 +328,27 @@ CandidateFacts.free_slot_after = _free_slot_after
 # --------------------------------------------------------------------------- #
 class Placer:
     def __init__(self, settings: Settings, orch: "Orchestrator",
-                 leases: "LeaseManager", monitor: "Monitor"):
+                 leases: "LeaseManager", monitor: "Monitor",
+                 load_times: "Optional[LoadTimes]" = None):
         self.s = settings
         self.orch = orch
         self.leases = leases
         self.monitor = monitor
+        self.load_times = load_times   # proven-load gate + blocklist + estimates
         # Single-flight status sweep: one in-flight task shared by every awaiter,
         # then cached for placement_cache_ttl_s. Staleness only mis-ranks (see
         # module docstring); freshness costs a full-fleet probe per request.
         self._sweep_task: Optional[asyncio.Task] = None
         self._sweep_ts: float = 0.0
         self._sweep_result: dict[str, LaneStatus] = {}
+
+    def invalidate(self) -> None:
+        """Drop the cached sweep. Called when a load is COMMITTED off a placement
+        decision: within the TTL a burst's second request would otherwise rank on
+        a snapshot predating the first request's load and double-place onto the
+        same unit — admission still refuses (the gates hold), but it burns the
+        gateway's single re-place. A forced re-sweep sees the in-flight job."""
+        self._sweep_result, self._sweep_ts = {}, 0.0
 
     # ---- status sweep ----
     async def _statuses(self) -> dict[str, LaneStatus]:
@@ -312,14 +373,22 @@ class Placer:
 
     # ---- resolution (mirrors gateway.resolve, minus the URL) ----
     async def _resolve(self, unit: "Unit", model: str) -> Optional[tuple[str, str, object]]:
-        """(server, load_arg, spark_entry|None) if `model` can run on `unit`."""
+        """(server, load_arg, spark_entry|None) if `model` can run on `unit`.
+
+        Matches the served name OR the catalog alias — `/api/load {lane: auto}`
+        passes aliases, and served-name-only matching 404'd every alias whose
+        served name differs (found in review, 2026-07-28)."""
+        def hit(e) -> bool:
+            return (e.alias == model or (e.served_name or e.alias) == model) \
+                and e.status != "blocked"
+
         if hasattr(unit, "declared_budgets"):          # SparkUnit
             for e in unit.registry.entries():
-                if (e.served_name or e.alias) == model and e.status != "blocked":
+                if hit(e):
                     return ("spark", e.alias, e)
             return None
         for e in unit.registry.entries():
-            if (e.served_name or e.alias) == model and e.status != "blocked":
+            if hit(e):
                 return ("vllm", e.alias, None)
         if ":" in model:
             try:
@@ -342,8 +411,35 @@ class Placer:
         entry = unit.registry.get(alias)
         return entry.mem_fraction if entry else 0.0
 
+    def _gate_facts(self, unit: "Unit", server: str, alias: str, is_spark: bool,
+                    spark_resident: frozenset[str],
+                    residents: list[ResidentFact]) -> tuple[bool, bool, int, Optional[float]]:
+        """(proven, fail_blocked, fail_count, est_s) for the proven-load gate.
+
+        Proof = a LoadTimes sample (recorded iff a real launch succeeded), or
+        current residency — a running model is live proof even when it predates
+        the recorder. Spark proof is fleet-wide (identical GB10s: the success key
+        and residency on ANY spark both count); lanes prove per-unit. Failure
+        counters are per-unit for everyone (see load_times.fail_key).
+        """
+        if self.load_times is None:
+            return True, False, 0, None
+        from .load_times import fail_key, lane_key, spark_key
+        key = spark_key(alias) if is_spark else lane_key(unit.cfg.id, server, alias)
+        est = self.load_times.estimate(key)
+        proven = est is not None or (
+            alias in spark_resident if is_spark
+            else any(r.alias == alias or r.model == alias for r in residents))
+        fk = fail_key(unit.cfg.id, "spark" if is_spark else server, alias)
+        count, _ts = self.load_times.failures_for(fk)
+        threshold = self.s.placement_fail_block_after
+        blocked = threshold > 0 and self.load_times.blocked(
+            fk, threshold=threshold, cooldown_s=self.s.placement_fail_block_cooldown_s)
+        return proven, blocked, count, est
+
     def _facts_for(self, unit: "Unit", st: LaneStatus, server: str, load_arg: str,
-                   entry, order: int, model: str) -> CandidateFacts:
+                   entry, order: int, model: str,
+                   spark_resident: frozenset[str] = frozenset()) -> CandidateFacts:
         uid = unit.cfg.id
         usage = classify_usage(st, self.monitor.util_for(unit.cfg.gpu_uuid), self.s)
         is_spark = hasattr(unit, "declared_budgets")
@@ -370,6 +466,8 @@ class Placer:
         want = entry.mem_fraction if entry is not None else 0.0
         whole_node = bool(entry is not None and (entry.tp > 1 or want <= 0.0)) if is_spark else False
         free_slot = (len(st.loaded_models) < getattr(unit.cfg, "max_models", 1)) if is_spark else True
+        proven, fail_blocked, fail_count, est_s = self._gate_facts(
+            unit, server, load_arg, is_spark, spark_resident, residents)
         return CandidateFacts(
             unit_id=uid, kind="spark" if is_spark else "gpu", status=st, usage=usage,
             server=server, load_arg=load_arg, residents=residents,
@@ -377,6 +475,8 @@ class Placer:
             free_slot=free_slot,
             lease_refused=self.leases.blocks_unleased(uid, model) is not None,
             order=order,
+            proven=proven, fail_blocked=fail_blocked, fail_count=fail_count,
+            est_s=est_s,
         )
 
     # ---- the public entry point ----
@@ -387,6 +487,14 @@ class Placer:
         if not model:
             return Decision(outcome="not_found")
         statuses = await self._statuses()
+        # Aliases resident on ANY spark right now — live proof for the gate
+        # (identical hardware, same rule as the shared spark:{alias} sample key).
+        spark_resident = frozenset(
+            u.canonical_model(m.model)
+            for u in self.orch.units.values()
+            if hasattr(u, "declared_budgets") and u.cfg.id in statuses
+            for m in statuses[u.cfg.id].loaded_models
+        )
         candidates: list[CandidateFacts] = []
         for order, unit in enumerate(self.orch.units.values()):
             uid = unit.cfg.id
@@ -399,5 +507,6 @@ class Placer:
             srv, load_arg, entry = resolved
             if server is not None and srv != server:
                 continue
-            candidates.append(self._facts_for(unit, st, srv, load_arg, entry, order, model))
+            candidates.append(self._facts_for(unit, st, srv, load_arg, entry, order,
+                                              model, spark_resident))
         return rank(model, candidates, self.s, exclude=exclude)

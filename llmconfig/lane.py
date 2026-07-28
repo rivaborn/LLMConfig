@@ -196,12 +196,21 @@ class Lane:
         # time), through verify — max_pack's reload included, it's honest wall time.
         launch_started = time.monotonic()
         self.jobs.log(job, f"loading {req.model} into Ollama…")
-        await self.ollama.load(req.model, keep_alive=req.keep_alive, num_gpu=num_gpu)
-        result = await self._verify_ollama(job, req, remediate=req.max_pack)
+        try:
+            await self.ollama.load(req.model, keep_alive=req.keep_alive, num_gpu=num_gpu)
+            result = await self._verify_ollama(job, req, remediate=req.max_pack)
+        except Exception:
+            # Post-eviction launch failure — feeds placement's per-unit blocklist
+            # (consecutive count; the next success clears it).
+            if self.load_times is not None:
+                from .load_times import fail_key
+                self.load_times.record_failure(fail_key(self.cfg.id, "ollama", req.model))
+            raise
         if self.load_times is not None:  # success only — an exception skipped this
-            from .load_times import lane_key
+            from .load_times import fail_key, lane_key
             self.load_times.record(lane_key(self.cfg.id, "ollama", req.model),
                                    time.monotonic() - launch_started, unit=self.cfg.id)
+            self.load_times.clear_failures(fail_key(self.cfg.id, "ollama", req.model))
         return result
 
     async def _load_vllm(self, job: Job, req: LoadRequest) -> dict:
@@ -254,15 +263,22 @@ class Lane:
             ok = await self.vllm.wait_ready(served_target, float(self.s.vllm_ready_grace_s), alias=alias)
         if not ok:
             tail = await self.vllm.journal_tail(alias, n=25)
+            # Feeds placement's per-unit blocklist (consecutive count; a success
+            # clears). The systemd-unit-not-found raise above deliberately does
+            # NOT count — that's an install fault, not this model failing.
+            if self.load_times is not None:
+                from .load_times import fail_key
+                self.load_times.record_failure(fail_key(self.cfg.id, "vllm", alias))
             raise RuntimeError(
                 f"vLLM did not become ready for '{alias}' within {int(timeout)}s "
                 f"(+{self.s.vllm_ready_grace_s}s grace).\n{tail}"
             )
 
         if self.load_times is not None:  # success only — failures raised above
-            from .load_times import lane_key
+            from .load_times import fail_key, lane_key
             self.load_times.record(lane_key(self.cfg.id, "vllm", alias),
                                    time.monotonic() - launch_started, unit=self.cfg.id)
+            self.load_times.clear_failures(fail_key(self.cfg.id, "vllm", alias))
         gpu = await self._gpu()
         self.jobs.log(job, f"vLLM serving {served_target} (VRAM {gpu.vram_pct}% used)")
         return self._vllm_result(served_target, gpu)

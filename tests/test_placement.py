@@ -85,9 +85,15 @@ def test_sole_candidate_pins_even_when_active_and_leased():
 
 def test_no_candidates_is_not_found_never_503():
     assert rank("target", [], S).outcome == "not_found"
-    # excluded down to zero → also not_found (the retry gives up cleanly)
+
+
+def test_exclude_exhausted_is_no_capacity_not_a_404():
+    # The model DOES resolve on s1 — it was excluded after a load conflict. A
+    # 404 ("model not found") there is a lie; the truthful answer is busy.
     c = spark("s1")
-    assert rank("target", [c], S, exclude=frozenset({"s1"})).outcome == "not_found"
+    d = rank("target", [c], S, exclude=frozenset({"s1"}))
+    assert d.outcome == "no_capacity"
+    assert "excluded" in d.reasons["s1"]
 
 
 # --------------------------------------------------------------------------- #
@@ -258,13 +264,13 @@ def entry(alias, served=None, frac=0.3, tp=1):
                            mem_fraction=frac, tp=tp, status="ok")
 
 
-def make_placer(units):
+def make_placer(units, load_times=None):
     orch = SimpleNamespace(units={u.cfg.id: u for u in units},
                            jobs=SimpleNamespace(get=lambda _id: None))
     leases = SimpleNamespace(active_for=lambda *a, **k: None,
                              blocks_unleased=lambda *a, **k: None)
     monitor = SimpleNamespace(util_for=lambda uuid: None)
-    return Placer(S, orch, leases, monitor)
+    return Placer(S, orch, leases, monitor, load_times)
 
 
 async def test_placer_places_on_the_resident_unit():
@@ -308,3 +314,191 @@ async def test_placer_server_constraint_filters_candidates():
     u = FakeSparkUnit("s1", [entry("m")], served=["m"])
     d = await make_placer([u]).place("m", server="vllm")
     assert d.outcome == "not_found", "the /api/load server kind constrains candidates"
+
+
+async def test_placer_resolves_by_alias_when_served_name_differs():
+    """/api/load {lane: auto} passes ALIASES; served-name-only matching 404'd
+    them (review find, 2026-07-28)."""
+    u1 = FakeSparkUnit("s1", [entry("m", served="m-served")], served=[])
+    u2 = FakeSparkUnit("s2", [entry("m", served="m-served")], served=["m-served"])
+    p = make_placer([u1, u2])
+    d = await p.place("m")                       # by alias
+    assert d.outcome == "place" and d.unit_id == "s2", \
+        "alias resolves AND finds the warm resident (tier 2, not a second copy)"
+    d2 = await p.place("m-served")               # by served name still works
+    assert d2.outcome == "place" and d2.unit_id == "s2"
+
+
+async def test_invalidate_forces_a_resweep():
+    u = FakeSparkUnit("s1", [entry("m")], served=["m"])
+    calls = {"n": 0}
+    real_status = u.status
+
+    async def counted():
+        calls["n"] += 1
+        return await real_status()
+
+    u.status = counted
+    placer = make_placer([u])
+    await placer.place("m")
+    await placer.place("m")
+    assert calls["n"] == 1, "second placement inside the TTL rides the cache"
+    placer.invalidate()      # what a committed load calls
+    await placer.place("m")
+    assert calls["n"] == 2, "invalidate() drops the cache — the next place re-sweeps"
+
+
+# --------------------------------------------------------------------------- #
+# The proven-load gate + failure blocklist
+# --------------------------------------------------------------------------- #
+def test_unproven_unit_is_not_chosen_for_a_fresh_load():
+    unproven = spark("s1", order=0)
+    unproven.proven = False
+    proven = spark("s2", order=1)
+    d = rank("target", [unproven, proven], S)
+    assert d.unit_id == "s2", "tier 3 skips the unproven unit"
+
+
+def test_all_unproven_is_no_capacity_with_the_seeding_hint():
+    a = spark("s1")
+    a.proven = False
+    b = spark("s2", order=1)
+    b.proven = False
+    d = rank("target", [a, b], S)
+    assert d.outcome == "no_capacity"
+    assert "never loaded successfully" in d.reasons["s1"]
+    assert "load it once explicitly" in d.reasons["s2"]
+
+
+def test_gate_off_restores_the_old_ranking():
+    s_off = Settings(_env_file=None, placement_require_proven=False)
+    a = spark("s1")
+    a.proven = False
+    b = spark("s2", order=1)
+    b.proven = False
+    d = rank("target", [a, b], s_off)
+    assert d.outcome == "place" and d.unit_id == "s1"
+
+
+def test_sole_candidate_pin_bypasses_the_gate():
+    """The pin behaves as an explicit header — that's how a first-ever load gets
+    seeded at all (user decision, 2026-07-28)."""
+    c = spark("s1")
+    c.proven = False
+    d = rank("target", [c], S)
+    assert d.outcome == "pin" and d.unit_id == "s1"
+
+
+def test_resident_tier_is_exempt_from_the_gate():
+    # proven=False can coexist with residency (samples predate the recorder);
+    # a resident model is its own proof and must keep placing.
+    c = spark("s1", residents=[R("target")])
+    c.proven = False
+    other = spark("s2", order=1)
+    d = rank("target", [c, other], S)
+    assert d.outcome == "place" and d.unit_id == "s1"
+
+
+def test_fail_blocked_unit_is_skipped_even_when_proven():
+    blocked = spark("s1", order=0)
+    blocked.fail_blocked, blocked.fail_count = True, 2
+    ok = spark("s2", order=1)
+    d = rank("target", [blocked, ok], S)
+    assert d.unit_id == "s2"
+
+    lone_ok = spark("s2", order=1)
+    lone_ok.fail_blocked, lone_ok.fail_count = True, 3
+    d2 = rank("target", [blocked, lone_ok], S)
+    assert d2.outcome == "no_capacity"
+    assert "consecutive launch failures" in d2.reasons["s1"]
+
+
+def test_gate_applies_to_displacement_tier_too():
+    unproven = spark("s1", residents=[R("a", budget=0.8)], committed=0.8, want=0.3)
+    unproven.proven = False
+    active_only = spark("s2", residents=[R("b", budget=0.8, idle=1.0)],
+                        committed=0.8, want=0.3, order=1)
+    d = rank("target", [unproven, active_only], S)
+    assert d.outcome == "no_capacity", "no eviction on a unit that never ran the model"
+
+
+def test_tier2_resident_matches_by_alias_as_well_as_served_name():
+    c = spark("s1", residents=[R("target-served", alias="target")], usage="idle")
+    empty = spark("s2", order=1)
+    d = rank("target", [c, empty], S)
+    assert d.outcome == "place" and d.unit_id == "s1", \
+        "an alias request must find its warm resident, not start a second copy"
+
+
+def test_gate_facts_proof_scopes(tmp_path):
+    """Spark proof is fleet-wide (shared sample key / residency on ANY spark);
+    lane proof is strictly per-unit."""
+    from llmconfig.load_times import LoadTimes, fail_key, spark_key
+
+    lt = LoadTimes(path=tmp_path / "lt.yaml")
+    u = FakeSparkUnit("s1", [entry("m")])
+    lane = SimpleNamespace(cfg=SimpleNamespace(id="primary"))
+    p = make_placer([u], load_times=lt)
+
+    # No sample, not resident anywhere → unproven.
+    proven, blocked, count, est = p._gate_facts(u, "spark", "m", True, frozenset(), [])
+    assert not proven and not blocked and est is None
+
+    # Resident on ANOTHER spark → proven (identical hardware), no estimate yet.
+    proven, *_ = p._gate_facts(u, "spark", "m", True, frozenset({"m"}), [])
+    assert proven
+
+    # A sample recorded from any node → proven with an estimate.
+    lt.record(spark_key("m"), 300.0, unit="spark3")
+    proven, _b, _c, est = p._gate_facts(u, "spark", "m", True, frozenset(), [])
+    assert proven and est == 300.0
+
+    # The spark-wide proof does NOT leak onto a lane (per-unit key, no sample).
+    proven, *_ = p._gate_facts(lane, "vllm", "m", False, frozenset({"m"}), [])
+    assert not proven
+
+    # Failure blocklist: 2 consecutive per-unit failures trip it despite proof.
+    lt.record_failure(fail_key("s1", "spark", "m"))
+    lt.record_failure(fail_key("s1", "spark", "m"))
+    _p, blocked, count, _e = p._gate_facts(u, "spark", "m", True, frozenset(), [])
+    assert blocked and count == 2
+    # …but only THAT unit: s2 is clean.
+    u2 = FakeSparkUnit("s2", [entry("m")])
+    _p, blocked2, *_ = p._gate_facts(u2, "spark", "m", True, frozenset(), [])
+    assert not blocked2
+
+
+async def test_placer_end_to_end_gate_blocks_then_residency_proves(tmp_path):
+    from llmconfig.load_times import LoadTimes
+
+    lt = LoadTimes(path=tmp_path / "lt.yaml")
+    empty1 = FakeSparkUnit("s1", [entry("m")])
+    empty2 = FakeSparkUnit("s2", [entry("m")])
+    d = await make_placer([empty1, empty2], load_times=lt).place("m")
+    assert d.outcome == "no_capacity", "two candidates, neither proven — refused"
+    assert "never loaded successfully" in d.reasons["s1"]
+
+    # The same fleet with the model resident on s2: s2 wins tier 2, and if s2 is
+    # excluded the residency itself proves s1 (shared GB10 proof).
+    resident2 = FakeSparkUnit("s2", [entry("m")], served=["m"])
+    p = make_placer([empty1, resident2], load_times=lt)
+    assert (await p.place("m")).unit_id == "s2"
+    d2 = await p.place("m", exclude=frozenset({"s2"}))
+    # One remaining candidate → the sole-candidate pin (same effect as a place).
+    assert d2.outcome in ("place", "pin") and d2.unit_id == "s1"
+
+
+def test_tier3_prefers_the_faster_measured_load_bucketed():
+    slow_empty = spark("s1", order=0)                 # emptier but ~8 min
+    slow_empty.est_s = 480.0
+    fast_fuller = spark("s2", residents=[R("x", budget=0.3)], want=0.3, order=1)
+    fast_fuller.est_s = 120.0                         # ~2 min
+    d = rank("target", [slow_empty, fast_fuller], S)
+    assert d.unit_id == "s2", "minutes-level estimate difference beats emptiness"
+
+    near_a = spark("s1", residents=[R("x", budget=0.4)], want=0.3, order=0)
+    near_a.est_s = 130.0
+    near_b = spark("s2", order=1)
+    near_b.est_s = 125.0                              # same minute bucket
+    d2 = rank("target", [near_a, near_b], S)
+    assert d2.unit_id == "s2", "inside one bucket, emptiest-first still decides"

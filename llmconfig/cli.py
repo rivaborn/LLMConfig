@@ -227,6 +227,50 @@ def doctor(local: bool = typer.Option(False, "--local", help="run in-process ins
         raise typer.Exit(1)
 
 
+def _fmt_est(est_s: object, n: int = 0) -> str:
+    if not isinstance(est_s, (int, float)):
+        return "no data — records after the first load"
+    m, s = divmod(int(round(float(est_s))), 60)
+    dur = f"{m}m{s:02d}s" if m else f"{s}s"
+    return f"~{dur} (median of {n})" if n else f"~{dur}"
+
+
+@app.command(name="load-times")
+def load_times_cmd(
+    model: Optional[str] = typer.Argument(None, help="alias / served name / Ollama tag; omit for all keys"),
+) -> None:
+    """Measured model load times (recorded on every successful launch)."""
+    try:
+        with _client() as c:
+            if model is None:
+                d = c.get("/api/load-times").json()
+            else:
+                r = c.get(f"/api/load-times/{model}")
+                if r.status_code == 404:
+                    typer.secho(f"model '{model}' not found on any unit", fg="red")
+                    raise typer.Exit(1)
+                d = r.json()
+    except httpx.HTTPError as e:
+        _bail(e)
+    if model is None:
+        samples = d.get("samples", {})
+        if not samples:
+            typer.echo("no load times recorded yet — they appear after the first successful load")
+            return
+        for key in sorted(samples):
+            s = samples[key]
+            typer.echo(f"  {key:<40} {_fmt_est(s['est_s'], s['n'])}")
+        return
+    typer.secho(f"{d['model']} (alias: {d['resolved_alias']})", bold=True)
+    for e in d.get("estimates", []):
+        mark = "●" if e["unit"] in d.get("resident_on", []) else " "
+        typer.echo(f"  {mark} {e['unit']:<10} {e['server']:<7} {_fmt_est(e['est_s'], e['n'])}")
+    if d.get("resident_on"):
+        typer.secho("  ● = resident now (no load needed)", fg="bright_black")
+    for f in d.get("failures", []):
+        typer.secho(f"  ⚠ {f['unit']}: {f['count']} consecutive launch failure(s)", fg="yellow")
+
+
 # --------------------------------------------------------------------------- #
 # cookbook — named fleet states (save what's loaded where; get back to it)
 # --------------------------------------------------------------------------- #

@@ -319,6 +319,18 @@ class SparkUnit:
         # victim evictions are not part of "how long does this model take to
         # launch") and only on the real-launch path, never the fast path.
         launch_started = time.monotonic()
+
+        def _launch_failed(msg: str) -> RuntimeError:
+            # Post-admission launch failures feed placement's blocklist. The key
+            # is PER-UNIT (spark1 failing must not blocklist spark2 — failures
+            # are usually node-state-dependent) and counts consecutively (a
+            # success clears it). rc 127 above is an environment fault, not a
+            # model fault, and deliberately doesn't count.
+            if self.load_times is not None:
+                from .load_times import fail_key
+                self.load_times.record_failure(fail_key(self.cfg.id, "spark", entry.alias))
+            return RuntimeError(msg)
+
         timeout = float(entry.load_timeout_s or self.cfg.load_timeout_s)
         r = await self.spark.run_recipe(recipe, tp=entry.tp, extra=entry.extra_args,
                                         served=target, port=port,
@@ -331,8 +343,8 @@ class SparkUnit:
                     "(`uvx sparkrun setup install`) or fix SPARK_RUN_CMD"
                 )
             if r.rc == 124:
-                raise RuntimeError(f"sparkrun timed out launching '{recipe}': {r.text()[:400]}")
-            raise RuntimeError(f"sparkrun failed to launch '{recipe}' (rc={r.rc}): {r.text()[:400]}")
+                raise _launch_failed(f"sparkrun timed out launching '{recipe}': {r.text()[:400]}")
+            raise _launch_failed(f"sparkrun failed to launch '{recipe}' (rc={r.rc}): {r.text()[:400]}")
         for line in (r.out or "").splitlines()[-5:]:
             if line.strip():
                 self.jobs.log(job, line.strip())
@@ -346,7 +358,7 @@ class SparkUnit:
                                          on_log=lambda l: self.jobs.log(job, l), port=port)
         if not ok:
             tail = await self.spark.logs(n=25, port=port)
-            raise RuntimeError(
+            raise _launch_failed(
                 f"{self.cfg.name} did not serve '{target}' (see log tail below — "
                 f"'Available KV cache memory' negative means the mem_fraction is "
                 f"too small for weights + ~15 GiB GB10 overhead + KV).\n{tail}"
@@ -354,12 +366,13 @@ class SparkUnit:
 
         # Success-only recording: a failed launch (dead-serve, timeout) raised
         # above and must not poison the median. Sparks share one key across nodes
-        # (identical GB10 hardware).
+        # (identical GB10 hardware); the failure counter it clears is per-node.
         if self.load_times is not None:
-            from .load_times import spark_key
+            from .load_times import fail_key, spark_key
             self.load_times.record(spark_key(entry.alias),
                                    time.monotonic() - launch_started,
                                    unit=self.cfg.id)
+            self.load_times.clear_failures(fail_key(self.cfg.id, "spark", entry.alias))
         gpu = await self.spark.gpu()
         # A successful load proves the node is live — clear the probe breaker so
         # status() stops backing off immediately.

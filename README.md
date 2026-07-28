@@ -199,6 +199,8 @@ require `X-API-Key` only when `LLMCONFIG_API_KEY` is set. Read endpoints take
 | `GET /api/monitor/history?window=`      | Bucketed telemetry history over the last `window` seconds     |
 | `GET /api/doctor`                       | On-box recon report (per-lane checks)                         |
 | `GET /api/jobs/{id}`                    | Progress + log for a long load/pull/download                  |
+| `GET /api/load-times`                   | Measured launch durations, every key (`{key: {est_s, n}}`)    |
+| `GET /api/load-times/{model}`           | One model's expected load time per unit (+ residency/failures)|
 | `POST /api/load`                        | `{server,model,lane?,force?,max_pack?}` → a Job               |
 | `POST /api/unload`                      | `{server?,lane?}` → free that lane's GPU                      |
 | `GET / PUT /api/lanes/{id}/default`     | Get / set a lane's startup-default model                      |
@@ -275,6 +277,23 @@ the switch happens on the inference path.
   conflict is retried once on the runner-up. `AUTO_PLACE_ENABLED=false` restores the
   old implicit-`primary` default. `/v1/models` without a header lists the whole
   fleet's catalog union.
+- **Proven-load gate (2026-07-28):** a fresh load is only *chosen* on a unit where
+  the model has **launched successfully before** — a recorded load-time sample, or
+  current residency (Sparks prove fleet-wide, identical hardware; GPU lanes prove
+  per-unit). An unproven model answers `503` with *"never loaded successfully here —
+  load it once explicitly"*: seed it once via `/api/load` with an explicit lane (or
+  the UI) and auto-placement takes it from there. Sole-candidate pins and resident
+  models are exempt (a pin behaves as an explicit header). Alongside it, a
+  **failure blocklist**: `PLACEMENT_FAIL_BLOCK_AFTER` (default 2) consecutive
+  launch failures skip that unit for `PLACEMENT_FAIL_BLOCK_COOLDOWN_S` (30 min),
+  then allow one probe. `PLACEMENT_REQUIRE_PROVEN=false` disables the gate. Note
+  the limit: *proven* means the launch succeeds, not that inference is stable.
+- **Load-time estimates:** every successful launch records its duration;
+  `GET /api/load-times` lists all keys, `GET /api/load-times/{model}` answers for
+  one model per unit (`est_s: null` until the first load), and
+  `llmconfig load-times [MODEL]` is the CLI view. Placement uses the estimates as
+  a tier-3 tie-break — a fresh load goes where it comes up fastest (bucketed to
+  the minute; ties fall back to emptiest-first).
 - **Resolution (per unit):** a Spark catalog `served_name` → that node's own slot
   port (multi-model nodes route per model); a vLLM `served_name` → the lane's relay;
   else an Ollama tag (has a `:`) → the lane's Ollama; else `404`.
