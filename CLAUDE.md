@@ -283,6 +283,15 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    for everyone (`fail_key` — launch failures are usually node-state-dependent,
    so spark1 failing must not block spark2). "Proven" means the LAUNCH
    succeeds, not that inference is stable.
+   **Workload tiering** (2026-07-29) is a third predicate family, again a
+   preference and never a gate: the 3090 is the speed tier, the Sparks the
+   capacity tier. `classify_workload` (pure, in placement.py) reads the request
+   body — interactive prefers the GPU lane *after* idle-first (a latency
+   request never queues behind an active model); batch prefers a Spark
+   *before* idleness (an active Spark absorbs one more request into its batch;
+   bulk work must not occupy the speed tier). `X-LLM-Workload` overrides. No
+   workload (REST paths, kill switch) = the neutral ordering byte-for-byte —
+   don't add a call site that fabricates a Workload it didn't classify.
 
 14. **A Spark load is admitted by summed `mem_fraction`, and there is nothing
    else.** A lane can watch `nvidia-smi` drain before it loads; a Spark has no

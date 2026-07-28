@@ -742,6 +742,34 @@ async def test_auto_with_valid_lease_pins_to_the_lease_unit(monkeypatch, tmp_pat
     assert r.status_code == 200 and r.headers.get("x-llm-unit") == "spark1"
 
 
+async def test_workload_header_steers_between_speed_and_capacity_tiers(monkeypatch, tmp_path):
+    """The same served name resident on BOTH tiers: X-LLM-Workload picks the
+    tier — batch → the Spark (capacity), interactive/neutral → the 3090
+    (idle-first + speed-tier preference / plain unit order)."""
+    from llmconfig.schemas import VllmAliasEntry
+
+    app, orch, jobs, world, captured, unit, placer = _auto_build(
+        monkeypatch, tmp_path, spark_models=(("model-a", 8000),))
+    orch.primary.registry.upsert(VllmAliasEntry(alias="ma", served_name="model-a"))
+    world.vllm = "model-a"                       # resident on the lane too
+    # Age the lane's activity clock past the active window — a freshly built
+    # Lane reads "active", and idle-first would (correctly) route interactive
+    # traffic away from it. Here both units must read idle so the TIER decides.
+    # (Direct assignment: touch() refuses to move the clock backwards.)
+    orch.primary.last_activity = time.time() - 3600
+
+    body = {"model": "model-a", "messages": [{"role": "user", "content": "hi"}]}
+    async with _client(app) as c:
+        r_batch = await c.post("/v1/chat/completions",
+                               headers={"X-LLM-Workload": "batch"}, json=body)
+        r_inter = await c.post("/v1/chat/completions",
+                               headers={"X-LLM-Workload": "interactive"}, json=body)
+    assert r_batch.status_code == 200 and r_batch.headers.get("x-llm-unit") == "spark1"
+    assert r_inter.status_code == 200 and r_inter.headers.get("x-llm-unit") == "primary"
+    logged = {d["workload"] for d in placer.decisions()}
+    assert {"batch", "interactive"} <= logged, "the decision log shows the class"
+
+
 async def test_auto_not_found_stays_404(monkeypatch, tmp_path):
     app, orch, jobs, world, captured, unit, placer = _auto_build(monkeypatch, tmp_path)
     async with _client(app) as c:

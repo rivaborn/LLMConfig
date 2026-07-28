@@ -74,6 +74,32 @@ Alongside it, a **consecutive-failure blocklist**: N failed launches in a row
 Failure counters are per-unit even for Sparks — launch failures are usually
 node-state-dependent (a co-resident's quantize transient), so spark1 failing
 must not block spark2.
+
+## Workload-aware tiering (2026-07-29)
+
+The fleet has two performance tiers with opposite strengths: the RTX 3090 is
+the SPEED tier (highest single-stream decode, ~24 GB — best time-to-answer for
+one caller) and the Spark cluster is the CAPACITY/CONCURRENCY tier (121 GB
+unified pools, continuous batching that amortizes decode across requests —
+measured 43:1 prefill:decode on batch work without breaking a sweat). When a
+model resolves on BOTH tiers, the request's shape decides:
+
+* **interactive** — small prompt, bounded generation, a human waiting. Prefer
+  the GPU lane: tier 2 keeps idle-first (never queue a latency request behind
+  an active model) and breaks ties toward the 3090; tier 3 keeps
+  fastest-load-first and breaks est-bucket ties toward the 3090.
+* **batch** — long prompt, bulk generation, or a pooling body. Prefer a Spark
+  BEFORE idleness: an active Spark absorbs one more request into its batch by
+  design, and it keeps the 3090 free for interactive traffic.
+
+Classification (`classify_workload`) is heuristic-from-the-body — prompt chars
+vs `PLACEMENT_INTERACTIVE_MAX_PROMPT_CHARS`, `max_tokens` vs
+`PLACEMENT_INTERACTIVE_MAX_NEW_TOKENS`, pooling bodies always batch — with an
+`X-LLM-Workload: interactive|batch` header override. No workload (REST
+`/api/load`, `PLACEMENT_WORKLOAD_ENABLED=false`) means the neutral ordering,
+byte-for-byte as before. Like everything here it is a PREFERENCE, not a gate:
+it reorders candidates and never disqualifies one — capacity, leases, the
+proven gate and admission still govern.
 """
 from __future__ import annotations
 
@@ -100,6 +126,76 @@ DECISION_LOG_SIZE = 50
 def wants_auto(lane_header: Optional[str]) -> bool:
     """Absent, empty, or the literal 'auto' (any case) → auto-place."""
     return not lane_header or lane_header.strip().lower() == AUTO
+
+
+# --------------------------------------------------------------------------- #
+# Workload classification — interactive (speed tier) vs batch (capacity tier)
+# --------------------------------------------------------------------------- #
+@dataclass
+class Workload:
+    """What kind of request this is, for tier preference in rank()."""
+
+    cls: str                        # "interactive" | "batch"
+    prompt_chars: int = 0
+    max_tokens: Optional[int] = None
+    source: str = "heuristic"       # "header" | "heuristic" | "pooling"
+
+    @property
+    def preferred_kind(self) -> str:
+        return "gpu" if self.cls == "interactive" else "spark"
+
+
+_WORKLOAD_HEADER_VALUES = {
+    "interactive": "interactive", "latency": "interactive",
+    "batch": "batch", "throughput": "batch", "bulk": "batch",
+}
+
+
+def _prompt_chars(body: dict) -> int:
+    """Rough request size without tokenizing (~4 chars/token). Good enough to
+    split 'a question' from 'a document' — the only distinction we need."""
+    msgs = body.get("messages")
+    if isinstance(msgs, list):
+        total = 0
+        for m in msgs:
+            content = m.get("content") if isinstance(m, dict) else None
+            if isinstance(content, str):
+                total += len(content)
+            elif isinstance(content, list):        # multi-part content blocks
+                total += sum(len(p.get("text", "")) for p in content
+                             if isinstance(p, dict))
+        return total
+    prompt = body.get("prompt")
+    if isinstance(prompt, str):
+        return len(prompt)
+    if isinstance(prompt, list):
+        return sum(len(p) for p in prompt if isinstance(p, str))
+    return 0
+
+
+def classify_workload(body: dict, header: Optional[str],
+                      settings: Settings) -> Optional[Workload]:
+    """Classify one /v1 request, or None (= neutral ranking, the pre-workload
+    ordering). An explicit `X-LLM-Workload` header always wins; otherwise a
+    heuristic on the body: pooling bodies (no messages/prompt) are batch — bulk
+    data paths by construction — and a chat/completion is interactive iff the
+    prompt is small AND the requested generation is bounded small."""
+    if not settings.placement_workload_enabled:
+        return None
+    hdr = _WORKLOAD_HEADER_VALUES.get((header or "").strip().lower())
+    chars = _prompt_chars(body)
+    max_tokens = body.get("max_tokens") or body.get("max_completion_tokens")
+    max_tokens = int(max_tokens) if isinstance(max_tokens, (int, float)) else None
+    if hdr:
+        return Workload(cls=hdr, prompt_chars=chars, max_tokens=max_tokens,
+                        source="header")
+    if "messages" not in body and "prompt" not in body:
+        return Workload(cls="batch", prompt_chars=chars, source="pooling")
+    interactive = (chars <= settings.placement_interactive_max_prompt_chars
+                   and (max_tokens is None
+                        or max_tokens <= settings.placement_interactive_max_new_tokens))
+    return Workload(cls="interactive" if interactive else "batch",
+                    prompt_chars=chars, max_tokens=max_tokens)
 
 
 # --------------------------------------------------------------------------- #
@@ -213,8 +309,11 @@ def _lane_evictable(c: CandidateFacts, active_window_s: float) -> bool:
 
 
 def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
-         *, exclude: frozenset[str] = frozenset()) -> Decision:
-    """Pure ranking — see the module docstring for the tiers."""
+         *, exclude: frozenset[str] = frozenset(),
+         workload: Optional[Workload] = None) -> Decision:
+    """Pure ranking — see the module docstring for the tiers. `workload` biases
+    tier-2/tier-3 ordering toward the speed tier (gpu) or the capacity tier
+    (spark); None keeps the neutral ordering byte-for-byte."""
     cands = [c for c in candidates if c.unit_id not in exclude]
     if not cands:
         if candidates:
@@ -240,7 +339,19 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
                 if not c.lease_refused
                 and any(r.model == model or r.alias == model for r in c.residents)]
     if resident:
-        resident.sort(key=lambda c: (c.usage != "idle", *order_key(c)))
+        if workload is not None and workload.cls == "batch":
+            # Capacity tier BEFORE idleness: an active Spark absorbs one more
+            # request into its continuous batch by design, and bulk work on the
+            # 3090 would evict the speed tier's availability.
+            resident.sort(key=lambda c: (c.kind != "spark", c.usage != "idle",
+                                         *order_key(c)))
+        elif workload is not None:   # interactive
+            # Idle-first still (never queue a latency request behind an active
+            # model), speed tier breaks the tie.
+            resident.sort(key=lambda c: (c.usage != "idle", c.kind != "gpu",
+                                         *order_key(c)))
+        else:
+            resident.sort(key=lambda c: (c.usage != "idle", *order_key(c)))
         c = resident[0]
         return Decision(outcome="place", unit_id=c.unit_id, server=c.server,
                         load_arg=c.load_arg, tier="resident")
@@ -263,11 +374,23 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
             # No estimate (proven by residency alone) sorts last among proven —
             # a measured launch beats an unmeasured one when both fit.
             return round(c.est_s / 60.0) if c.est_s is not None else float("inf")
-        fits.sort(key=lambda c: (c.status.swap_in_progress,
-                                 est_bucket(c),
-                                 c.committed if c.kind == "spark"
-                                 else (c.status.gpu.vram_pct if c.status.gpu else 0.0),
-                                 c.order))
+        def emptiness(c: CandidateFacts) -> float:
+            return (c.committed if c.kind == "spark"
+                    else (c.status.gpu.vram_pct if c.status.gpu else 0.0))
+
+        if workload is not None and workload.cls == "batch":
+            # Capacity tier first even if the lane loads faster — bulk work
+            # belongs on the Sparks, and nobody is watching a batch job's TTFB.
+            fits.sort(key=lambda c: (c.status.swap_in_progress, c.kind != "spark",
+                                     est_bucket(c), emptiness(c), c.order))
+        elif workload is not None:   # interactive
+            # Load time dominates (a human is blocked on the cold load); the
+            # speed tier breaks est-bucket ties.
+            fits.sort(key=lambda c: (c.status.swap_in_progress, est_bucket(c),
+                                     c.kind != "gpu", emptiness(c), c.order))
+        else:
+            fits.sort(key=lambda c: (c.status.swap_in_progress, est_bucket(c),
+                                     emptiness(c), c.order))
         c = fits[0]
         return Decision(outcome="place", unit_id=c.unit_id, server=c.server,
                         load_arg=c.load_arg, tier="fits")
@@ -513,9 +636,11 @@ class Placer:
 
     # ---- the public entry point ----
     async def place(self, model: str, *, server: Optional[str] = None,
-                    exclude: frozenset[str] = frozenset()) -> Decision:
+                    exclude: frozenset[str] = frozenset(),
+                    workload: Optional[Workload] = None) -> Decision:
         """Decide where `model` should run. `server` constrains candidates (the
-        /api/load path, whose request already names a server kind)."""
+        /api/load path, whose request already names a server kind); `workload`
+        biases the ranking toward the speed or capacity tier (None = neutral)."""
         if not model:
             return Decision(outcome="not_found")
         statuses = await self._statuses()
@@ -541,14 +666,15 @@ class Placer:
                 continue
             candidates.append(self._facts_for(unit, st, srv, load_arg, entry, order,
                                               model, spark_resident))
-        decision = rank(model, candidates, self.s, exclude=exclude)
-        self._record(model, server, exclude, candidates, decision)
+        decision = rank(model, candidates, self.s, exclude=exclude,
+                        workload=workload)
+        self._record(model, server, exclude, candidates, decision, workload)
         return decision
 
     # ---- the decision log ----
     def _record(self, model: str, server: Optional[str],
                 exclude: frozenset[str], candidates: list[CandidateFacts],
-                decision: Decision) -> None:
+                decision: Decision, workload: Optional[Workload] = None) -> None:
         """Append to the ring buffer (see __init__ for the dedupe rationale)."""
         boring = (decision.outcome in ("place", "pin")
                   and not decision.victims and not exclude)
@@ -557,7 +683,8 @@ class Placer:
             if (last.get("_boring")
                     and last["model"] == model
                     and last["unit"] == decision.unit_id
-                    and last["tier"] == decision.tier):
+                    and last["tier"] == decision.tier
+                    and last["workload"] == (workload.cls if workload else "")):
                 last["count"] += 1
                 last["ts"] = round(time.time(), 1)
                 return
@@ -568,6 +695,7 @@ class Placer:
             "outcome": decision.outcome,
             "unit": decision.unit_id,
             "tier": decision.tier,
+            "workload": workload.cls if workload else "",
             "victims": list(decision.victims),
             "server_constraint": server or "",
             "exclude": sorted(exclude),

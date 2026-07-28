@@ -211,6 +211,16 @@ class Settings(BaseSettings):
     # negative cache: a down Ollama answers "no tags" for the TTL instead of
     # stacking its client timeout onto every auto request for a tag.
     placement_tags_ttl_s: float = 15.0
+    # Workload tiering: the 3090 is the SPEED tier (single-stream latency), the
+    # Sparks are the CAPACITY tier (121 GB pools + continuous batching). When a
+    # model resolves on both, the request's shape biases the choice: interactive
+    # (small prompt AND bounded generation, thresholds below) prefers the GPU
+    # lane; batch/bulk (long prompt, big max_tokens, or a pooling body) prefers
+    # a Spark even over an idle lane. `X-LLM-Workload: interactive|batch`
+    # overrides the heuristic. A preference only — never disqualifies a unit.
+    placement_workload_enabled: bool = True
+    placement_interactive_max_prompt_chars: int = 16000   # ~4k tokens at 4 chars/tok
+    placement_interactive_max_new_tokens: int = 2048
 
     spark_max_models: int = 4
     # Total share of a node's pool that may be committed at once. Loads are refused

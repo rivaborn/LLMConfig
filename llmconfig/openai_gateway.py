@@ -29,7 +29,7 @@ from .config import Settings
 from .jobs import JobManager
 from .lane import Lane
 from .orchestrator import Orchestrator, Unit
-from .placement import wants_auto
+from .placement import classify_workload, wants_auto
 from .schemas import LeaseClaimRequest, LoadRequest
 from .spark_unit import SparkUnit
 
@@ -233,7 +233,7 @@ class OpenAIGateway:
         return JSONResponse(status_code=409, content=payload)
 
     async def _choose(self, request: Request, model: str, *, is_chat: bool,
-                      stream: bool):
+                      stream: bool, body: dict | None = None):
         """Pick the unit for this request. Returns (lane, victims, lease_id) or an
         error Response. The ONE place auto-placement is wired, shared by the chat
         and pooling handlers so the two cannot drift.
@@ -253,6 +253,11 @@ class OpenAIGateway:
         lease_id = (request.headers.get("x-llm-lease") or "").strip()
         auto = (self.placer is not None and self.s.auto_place_enabled
                 and wants_auto(header))
+        # Workload tiering: interactive → the 3090 (speed tier), batch → the
+        # Sparks (capacity tier). Classified from the body, X-LLM-Workload
+        # header wins; only a preference inside rank(), never a gate.
+        workload = classify_workload(body or {}, request.headers.get("x-llm-workload"),
+                                     self.s) if auto else None
         if not auto:
             lane = self.lane(header or "primary")
             reject = self._lease_gate(lane.cfg.id, lease_id, model)
@@ -282,7 +287,8 @@ class OpenAIGateway:
 
         exclude: frozenset[str] = frozenset()
         for attempt in range(2):
-            decision = await self.placer.place(model, exclude=exclude)
+            decision = await self.placer.place(model, exclude=exclude,
+                                               workload=workload)
             if decision.outcome == "not_found":
                 return JSONResponse(
                     status_code=404,
@@ -576,7 +582,8 @@ class OpenAIGateway:
         # Admission + placement BEFORE resolve() and before the first lane.touch():
         # the decision shouldn't depend on model resolution, and a refused request
         # must not extend anyone's idle window (it never reached a backend).
-        chosen = await self._choose(request, model, is_chat=is_chat, stream=stream)
+        chosen = await self._choose(request, model, is_chat=is_chat, stream=stream,
+                                    body=body)
         if isinstance(chosen, Response):
             return chosen
         lane, victims, _lease_id = chosen
@@ -682,7 +689,10 @@ class OpenAIGateway:
             return None
         if not any(m in (err or "") for m in self._CONFLICT_MARKERS):
             return None
-        decision = await self.placer.place(model, exclude=frozenset({failed_lane.cfg.id}))
+        decision = await self.placer.place(
+            model, exclude=frozenset({failed_lane.cfg.id}),
+            workload=classify_workload(body or {},
+                                       request.headers.get("x-llm-workload"), self.s))
         if decision.outcome not in ("place", "pin"):
             return None
         lane = self.lane(decision.unit_id)
@@ -736,7 +746,8 @@ class OpenAIGateway:
 
         # Same ordering as the chat path: admission + placement before resolve()
         # and before the first touch(). `stream` is always False — see docstring.
-        chosen = await self._choose(request, model, is_chat=False, stream=False)
+        chosen = await self._choose(request, model, is_chat=False, stream=False,
+                                    body=body)
         if isinstance(chosen, Response):
             return chosen
         lane, victims, _lease_id = chosen

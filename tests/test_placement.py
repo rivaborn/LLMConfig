@@ -9,6 +9,8 @@ from llmconfig.placement import (
     CandidateFacts,
     Placer,
     ResidentFact,
+    Workload,
+    classify_workload,
     rank,
     wants_auto,
 )
@@ -593,6 +595,98 @@ async def test_down_ollama_is_negative_cached():
     assert (await p.place("q:1b")).outcome == "not_found"
     assert lane.calls["n"] == 1, \
         "a down Ollama is probed once per TTL, not once per request"
+
+
+# --------------------------------------------------------------------------- #
+# Workload tiering — interactive → 3090 (speed), batch → Sparks (capacity)
+# --------------------------------------------------------------------------- #
+def test_classify_small_chat_is_interactive_and_big_is_batch():
+    small = {"messages": [{"role": "user", "content": "how do I sort a list?"}],
+             "max_tokens": 500}
+    w = classify_workload(small, None, S)
+    assert w.cls == "interactive" and w.source == "heuristic"
+
+    long_prompt = {"messages": [{"role": "user", "content": "x" * 50_000}]}
+    assert classify_workload(long_prompt, None, S).cls == "batch"
+
+    bulk_gen = {"messages": [{"role": "user", "content": "summarize"}],
+                "max_tokens": 16000}
+    assert classify_workload(bulk_gen, None, S).cls == "batch"
+
+    parts = {"messages": [{"role": "user", "content": [
+        {"type": "text", "text": "y" * 50_000}]}]}
+    assert classify_workload(parts, None, S).cls == "batch", \
+        "multi-part content blocks are counted too"
+
+
+def test_classify_header_overrides_and_pooling_is_batch():
+    small = {"messages": [{"role": "user", "content": "hi"}]}
+    assert classify_workload(small, "batch", S).source == "header"
+    assert classify_workload(small, "THROUGHPUT", S).cls == "batch"
+    big = {"messages": [{"role": "user", "content": "x" * 50_000}]}
+    assert classify_workload(big, "latency", S).cls == "interactive"
+    assert classify_workload(small, "nonsense", S).cls == "interactive", \
+        "an unknown header value falls back to the heuristic"
+
+    pooling = {"input": ["doc one", "doc two"], "model": "embedder"}
+    w = classify_workload(pooling, None, S)
+    assert w.cls == "batch" and w.source == "pooling"
+
+    s_off = Settings(_env_file=None, placement_workload_enabled=False)
+    assert classify_workload(small, "batch", s_off) is None
+
+
+def test_batch_resident_prefers_an_active_spark_over_an_idle_lane():
+    lane = gpu_lane("primary", usage="idle", occupant="target", order=0)
+    busy_spark = spark("s1", residents=[R("target")], usage="active", order=5)
+    batch = Workload(cls="batch")
+    d = rank("target", [lane, busy_spark], S, workload=batch)
+    assert d.unit_id == "s1", \
+        "capacity tier absorbs bulk work even mid-batch; the 3090 stays free"
+
+    # Interactive flips it: idle lane wins.
+    d2 = rank("target", [lane, busy_spark], S, workload=Workload(cls="interactive"))
+    assert d2.unit_id == "primary"
+
+    # Neutral (no workload): idle-first, unchanged.
+    assert rank("target", [lane, busy_spark], S).unit_id == "primary"
+
+
+def test_interactive_resident_still_never_queues_behind_an_active_model():
+    active_lane = gpu_lane("primary", usage="active", occupant="target", order=0)
+    idle_spark = spark("s1", residents=[R("target")], usage="idle", order=5)
+    d = rank("target", [active_lane, idle_spark], S,
+             workload=Workload(cls="interactive"))
+    assert d.unit_id == "s1", "idle-first outranks the speed-tier preference"
+
+
+def test_tier3_workload_preference_on_fresh_loads():
+    lane = gpu_lane("companion", usage="free", order=5)
+    lane.est_s = 120.0
+    sp = spark("s1", order=0)
+    sp.est_s = 120.0                       # same est bucket
+
+    batch = rank("target", [lane, sp], S, workload=Workload(cls="batch"))
+    assert batch.unit_id == "s1", "bulk fresh load goes to the capacity tier"
+
+    inter = rank("target", [lane, sp], S, workload=Workload(cls="interactive"))
+    assert inter.unit_id == "companion", "interactive fresh load goes to the speed tier"
+
+    # Batch preference outranks even a faster lane load.
+    lane.est_s, sp.est_s = 60.0, 600.0
+    still = rank("target", [lane, sp], S, workload=Workload(cls="batch"))
+    assert still.unit_id == "s1", "nobody watches a batch job's TTFB"
+
+    # Interactive: est bucket still dominates — a 10-min Spark load loses.
+    inter2 = rank("target", [lane, sp], S, workload=Workload(cls="interactive"))
+    assert inter2.unit_id == "companion"
+
+
+async def test_decision_log_records_the_workload():
+    u1 = FakeSparkUnit("s1", [entry("m")], served=["m"])
+    p = make_placer([u1])
+    await p.place("m", workload=Workload(cls="batch"))
+    assert p.decisions()[0]["workload"] == "batch"
 
 
 def test_tier3_prefers_the_faster_measured_load_bucketed():

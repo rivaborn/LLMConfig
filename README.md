@@ -295,6 +295,19 @@ the switch happens on the inference path.
   `llmconfig load-times [MODEL]` is the CLI view. Placement uses the estimates as
   a tier-3 tie-break — a fresh load goes where it comes up fastest (bucketed to
   the minute; ties fall back to emptiest-first).
+- **Workload tiering (2026-07-29):** the fleet has two performance tiers with
+  opposite strengths — the **RTX 3090 is the speed tier** (best single-stream
+  latency) and the **Spark cluster is the capacity/concurrency tier** (121 GB
+  pools, continuous batching). When a model resolves on both, the request's
+  shape picks the tier: **interactive** (prompt ≤ ~4k tokens *and* bounded
+  `max_tokens`) prefers the 3090 — idle-first still applies, a latency request
+  never queues behind an active model; **batch** (long prompt, big
+  `max_tokens`, or a pooling body) prefers a Spark *even over an idle 3090* —
+  an active Spark absorbs one more request into its batch by design, and bulk
+  work must not occupy the speed tier. `X-LLM-Workload: interactive|batch`
+  overrides the heuristic; `PLACEMENT_WORKLOAD_ENABLED=false` disables it. A
+  preference only — capacity, leases, the proven gate and admission still
+  govern, and requests without a workload signal rank exactly as before.
 - **Decision log:** `GET /api/placement/decisions` shows the last ~50 placements,
   newest first — which unit won, which tier fired (`pin`/`resident`/`fits`/
   `displace`), and per-candidate facts (proven, fail-blocked, lease-refused,
