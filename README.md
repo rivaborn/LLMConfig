@@ -427,6 +427,32 @@ gotchas, is in [`deploy/README-deploy.md`](deploy/README-deploy.md).
 - **A model loads on the wrong card** → a GPU was pinned by index somewhere. Everything
   pins by UUID; `serve.sh` resolves the vLLM index via torch (vLLM ignores
   `CUDA_DEVICE_ORDER` and uses FASTEST_FIRST order). Run `llmconfig doctor`.
+- **A unit looks "busy" for hours and loads queue behind it** → it is *wedged*, not
+  busy. Check `llmconfig doctor` for `wsl.distro` ✗ and `wsl.selfheal`. Since
+  2026-07-28 loads and unloads acquire the unit lock with a timeout and fail naming
+  the blocking job, so this surfaces instead of stacking (29 jobs stacked, once).
+- **Everything WSL-side hangs after a reboot** → the distro's *exec* path is wedged.
+  Diagnose by contrast: `wsl --status` answers normally while `wsl -u <user> -- echo hi`
+  hangs. `WslRecovery` runs automatically (kill orphans → `--shutdown` → restart
+  `WslService`); by hand, note that **`wsl --shutdown` alone is not enough** — it can
+  time out without reaping `vmmemWSL`, and only `Restart-Service WslService -Force`
+  clears it.
+
+## Surviving reboots
+
+The box patches itself and Windows Update may auto-restart it unattended (permitted
+window 00:00-06:00). LLMConfig is expected to come back **clean, with no keyboard**:
+
+| Layer | What it does |
+| ----------------------------- | ----------------------------------------------- |
+| Auto-logon (LSA secret)       | Guarantees the interactive session the task needs — the trigger is *at logon*, and the app must run as a real user because `wsl.exe -u <user>` has no Session 0 equivalent |
+| Task delay `PT2M` + `RestartCount 3` | Keeps the app off a cold WSL, and restarts it if it crashes |
+| `wsl.wait_ready()` gate       | The real fix — the boot `autoload_defaults()` waits until WSL can actually *execute*, not merely respond |
+| `WslRecovery`                 | Self-heals a distro that comes up wedged |
+| Bounded locks + bounded reap  | A stuck operation fails and names itself instead of hanging the unit forever |
+
+Without the gate, the app starting ~58 s after boot raced WSL's first-boot init and
+deadlocked its exec path — a 60-second reboot became a six-hour outage.
 
 ## Project layout
 

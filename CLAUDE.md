@@ -276,6 +276,34 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    catalog entries budgeted or they silently monopolise a node. The UI's gray-out
    (`SparkModel.addable`) is computed in `SparkBackend.list_models` beside this same
    arithmetic (`declared_budgets`) — never re-implement it client-side.
+17. **Nothing may wait on WSL without a bound, and the boot restore is gated.**
+    Windows Update auto-restarted the box at 00:29 on 2026-07-28 (its permitted
+    window is 00:00-06:00; no AU policy is set, so this recurs). The box was back in
+    60 s; the lab was degraded for six hours. Three rules came out of it:
+    - **`run_argv` must always return.** It ran `proc.kill()` then a bare
+      `await proc.wait()`. `kill()` is a *request* — a process wedged in an
+      uninterruptible kernel call ignores it, so `wait()` never returned and the
+      module's own "a hang becomes rc 124" contract broke silently. Every external
+      command funnels through here, so that one line caused a 5 h lock hold, an
+      orphaned `wsl.exe` pile-up and a stalled Monitor simultaneously. The reap is
+      bounded (`REAP_TIMEOUT_S`); a survivor is abandoned and still reports 124.
+    - **Probe WSL by EXEC, never by `--status`.** Throughout the incident
+      `wsl --status` answered normally while every `wsl -u folar` hung forever.
+      Only the exec path (`wsl.probe`) tells the truth. `main.py` gates the boot
+      `autoload_defaults()` on `wsl.wait_ready()` — in the background, so uvicorn
+      still binds immediately, and non-fatally, so a box with no `wsl.exe` still
+      serves (rc 127).
+    - **Unit locks are acquired with a timeout, on load AND unload.** An unbounded
+      `async with self._lock` let one wedged holder stack 29 jobs while the unit
+      read as "busy" rather than broken. Unload is included on purpose: it is the
+      natural way out of a wedge, and during the incident the one call that should
+      have cleared it was queued behind it.
+
+    `WslRecovery` escalates a wedged distro in the order that actually worked: kill
+    orphans → attempt `--shutdown` (**it timed out twice and never reaped the
+    utility VM — attempted, never trusted**) → restart `WslService`, the only
+    effective step (~16 stop-poll cycles, hence the timeout arg on
+    `winsvc.restart_service`).
 
 
 ## Build / run / test
