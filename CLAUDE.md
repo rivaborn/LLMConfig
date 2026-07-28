@@ -135,6 +135,9 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 - `wsl.py` — `run_wsl()`, `WslKeepalive`, `user_systemctl`/`user_journalctl` helpers.
 - `winsvc.py` — Windows service control (status/start/restart, elevation check).
 - `proc.py` — `run_argv()` subprocess wrapper (`CmdResult`).
+- `fsio.py` — `atomic_write_text()`: every YAML `save()` goes through it (temp +
+  `os.replace`); a mid-write power cut must never torch a state file (invariant
+  17's reboots are a live path). Route any new persisted-file write through it.
 - `doctor.py` — read-only recon (`run_doctor`) that verifies every on-box assumption.
 - `openai_gateway.py` — the OpenAI-compatible `/v1` gateway (auto-load on first request;
   chat + completions + embeddings/rerank/score; auto-placement wiring in `_choose`).
@@ -230,7 +233,13 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    — find them with `sparkrun search`.
    `tests/test_spark.py::test_launch_command_matches_verified_sparkrun_flags` and
    `::test_targeted_stop_resolves_the_job_id_on_this_host` pin this.
-11. **`LeaseManager`'s query/mutation methods must stay synchronous.** `idle.py`'s
+11. **`LeaseManager`'s query/mutation methods must stay synchronous.** And the
+   unit swap-lock acquire must stay a BARE `await lock.acquire()` on the
+   uncontended path (`_acquire_swap_lock` in both unit kinds): `asyncio.wait_for`
+   wraps the acquire in a task and always yields even on a free lock, re-opening
+   the reaper/sweeper check-then-act window this invariant closes. Also:
+   `claim()` contends with EVERY overlapping live lease (a whole-unit claim
+   overlaps them all) — never reduce it back to first-match. `idle.py`'s
    final guard and `LeaseSweeper._free_unit` both rely on there being **no await**
    between the last check and `Unit.unload()` — an uncontended `asyncio.Lock`
    acquires without yielding, so that pair is atomic. Make `active_for` (or any of
