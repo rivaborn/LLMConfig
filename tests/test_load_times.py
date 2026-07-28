@@ -125,6 +125,12 @@ def test_per_model_endpoint_resolves_alias_and_served_name(tmp_path, monkeypatch
             "served-name lookup works too"
         assert c.get("/api/load-times/no-such-model").status_code == 404
 
+        # The decision log endpoint (empty here — per-model lookups resolve
+        # without ranking; only real place() calls record).
+        r = c.get("/api/placement/decisions")
+        assert r.status_code == 200
+        assert r.json()["decisions"] == []
+
 
 # --------------------------------------------------------------------------- #
 # Recording hooks — SparkUnit

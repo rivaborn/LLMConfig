@@ -206,6 +206,11 @@ class Settings(BaseSettings):
     # survives, so another failure re-blocks. A success clears it.
     placement_fail_block_after: int = 2
     placement_fail_block_cooldown_s: float = 1800.0
+    # TTL on the per-lane Ollama tag list used by placement resolution — its only
+    # real I/O. Tags change on pull timescales; staleness only mis-ranks. Also a
+    # negative cache: a down Ollama answers "no tags" for the TTL instead of
+    # stacking its client timeout onto every auto request for a tag.
+    placement_tags_ttl_s: float = 15.0
 
     spark_max_models: int = 4
     # Total share of a node's pool that may be committed at once. Loads are refused

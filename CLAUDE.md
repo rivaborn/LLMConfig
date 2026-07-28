@@ -147,8 +147,11 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
   `/api/load-times`, `/api/load-times/{model}`, the UI estimates, and placement's
   proven-load gate + blocklist.
 - `placement.py` — auto-placement: pure `rank()` over per-unit `CandidateFacts` +
-  `Placer` (single-flight status sweep, sync lease/registry reads). Advisory by design
-  — see invariant 15.
+  `Placer` (single-flight status sweep, TTL'd Ollama tag cache — its only I/O —
+  sync lease/registry reads). Advisory by design — see invariant 15. Every
+  `place()` records into a ~50-entry decision ring buffer (`/api/placement/
+  decisions`, consecutive routine repeats deduped) — the debugging surface for
+  "why did that land there", since the always-on task's console isn't captured.
 - `cli.py` — the `llmconfig` typer CLI (thin client over the REST API + `serve`).
 - `web/` — static UI (`app.js`, `monitor.js`, `style.css`) + `templates/index.html`.
 - `data/*.default.yaml` (in the package) — shipped registry seeds; `../data/*.yaml`

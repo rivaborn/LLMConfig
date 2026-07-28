@@ -326,6 +326,17 @@ def create_app() -> FastAPI:
                 "estimates": estimates, "resident_on": resident_on,
                 "failures": failures}
 
+    @app.get("/api/placement/decisions")
+    async def api_placement_decisions() -> dict:
+        """The last ~50 auto-placement decisions, newest first — which unit won,
+        which tier fired (pin/resident/fits/displace), and per-candidate facts
+        (proven / fail_blocked / lease_refused / committed…) for the losers.
+        Consecutive identical routine placements collapse into one entry with a
+        `count`. In-memory only; empty after a restart. The uvicorn console on
+        the always-on task is effectively write-only, so this is the debugging
+        surface: 'why did that land on spark3?' is answered here, not in logs."""
+        return {"decisions": placer.decisions()}
+
     @app.get("/api/lanes")
     async def api_lanes() -> list[dict]:
         """Every LLM unit, in display order — what the UI turns into tabs/cards."""

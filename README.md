@@ -201,6 +201,7 @@ require `X-API-Key` only when `LLMCONFIG_API_KEY` is set. Read endpoints take
 | `GET /api/jobs/{id}`                    | Progress + log for a long load/pull/download                  |
 | `GET /api/load-times`                   | Measured launch durations, every key (`{key: {est_s, n}}`)    |
 | `GET /api/load-times/{model}`           | One model's expected load time per unit (+ residency/failures)|
+| `GET /api/placement/decisions`          | Last ~50 auto-placement decisions: unit, tier, candidate facts|
 | `POST /api/load`                        | `{server,model,lane?,force?,max_pack?}` → a Job               |
 | `POST /api/unload`                      | `{server?,lane?}` → free that lane's GPU                      |
 | `GET / PUT /api/lanes/{id}/default`     | Get / set a lane's startup-default model                      |
@@ -294,6 +295,13 @@ the switch happens on the inference path.
   `llmconfig load-times [MODEL]` is the CLI view. Placement uses the estimates as
   a tier-3 tie-break — a fresh load goes where it comes up fastest (bucketed to
   the minute; ties fall back to emptiest-first).
+- **Decision log:** `GET /api/placement/decisions` shows the last ~50 placements,
+  newest first — which unit won, which tier fired (`pin`/`resident`/`fits`/
+  `displace`), and per-candidate facts (proven, fail-blocked, lease-refused,
+  committed budgets) for the losers. Consecutive identical routine placements
+  collapse into one entry with a `count`; in-memory only, empty after a restart.
+  This is the "why did that land on spark3?" surface — the always-on task's
+  console is effectively write-only, so it's an endpoint, not a log line.
 - **Resolution (per unit):** a Spark catalog `served_name` → that node's own slot
   port (multi-model nodes route per model); a vLLM `served_name` → the lane's relay;
   else an Ollama tag (has a `:`) → the lane's Ollama; else `404`.

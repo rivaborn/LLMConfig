@@ -488,6 +488,113 @@ async def test_placer_end_to_end_gate_blocks_then_residency_proves(tmp_path):
     assert d2.outcome in ("place", "pin") and d2.unit_id == "s1"
 
 
+# --------------------------------------------------------------------------- #
+# Decision log + tier stamping
+# --------------------------------------------------------------------------- #
+def test_rank_stamps_the_winning_tier():
+    lone = spark("s1")
+    assert rank("target", [lone], S).tier == "pin"
+
+    res = spark("s1", residents=[R("target")])
+    assert rank("target", [res, spark("s2", order=1)], S).tier == "resident"
+
+    assert rank("target", [spark("s1"), spark("s2", order=1)], S).tier == "fits"
+
+    full = spark("s1", residents=[R("a", budget=0.8)], committed=0.8, want=0.3)
+    full2 = spark("s2", residents=[R("b", budget=0.8)], committed=0.8, want=0.3, order=1)
+    d = rank("target", [full, full2], S)
+    assert d.tier == "displace" and d.victims
+
+    refused = rank("target", [spark("s1", refused=True), spark("s2", refused=True, order=1)], S)
+    assert refused.outcome == "no_capacity" and refused.tier == ""
+
+
+async def test_decision_log_records_candidates_and_dedupes_boring_repeats():
+    u1 = FakeSparkUnit("s1", [entry("m")], served=["m"])
+    u2 = FakeSparkUnit("s2", [entry("m")])
+    p = make_placer([u1, u2])
+
+    for _ in range(3):                       # identical routine placements
+        await p.place("m")
+    log = p.decisions()
+    assert len(log) == 1, "three identical boring decisions collapse into one"
+    d = log[0]
+    assert d["count"] == 3 and d["unit"] == "s1" and d["tier"] == "resident"
+    assert d["outcome"] == "place" and "_boring" not in d
+    assert {c["unit"] for c in d["candidates"]} == {"s1", "s2"}
+    winner = next(c for c in d["candidates"] if c["unit"] == "s1")
+    assert winner["resident"] is True and winner["kind"] == "spark"
+
+    # An exclude is never boring — it appends its own entry with the exclusion.
+    await p.place("m", exclude=frozenset({"s1"}))
+    log = p.decisions()
+    assert len(log) == 2
+    assert log[0]["exclude"] == ["s1"] and log[0]["unit"] == "s2"
+
+    # A refusal records its reasons.
+    await p.place("m", exclude=frozenset({"s1", "s2"}))
+    assert p.decisions()[0]["outcome"] == "no_capacity"
+    assert "excluded" in p.decisions()[0]["reasons"]["s1"]
+
+
+async def test_decision_log_is_bounded():
+    from collections import deque
+    u = FakeSparkUnit("s1", [entry("m")], served=["m"])
+    p = make_placer([u])
+    p._decisions = deque(maxlen=3)
+    for i in range(5):
+        await p.place("m", exclude=frozenset({f"never-{i}"}))   # unique → no dedupe
+    assert len(p.decisions()) == 3, "the ring buffer drops the oldest"
+
+
+# --------------------------------------------------------------------------- #
+# Ollama tag TTL cache
+# --------------------------------------------------------------------------- #
+class FakeLane:
+    """Duck-typed GPU lane: no declared_budgets, registry + ollama only."""
+
+    def __init__(self, uid, tags=(), fail=False):
+        self.cfg = SimpleNamespace(id=uid, gpu_uuid=f"GPU-{uid}", enabled=True)
+        self.registry = SimpleNamespace(entries=lambda: [])
+        self.calls = {"n": 0}
+        self._tags, self._fail = list(tags), fail
+        outer = self
+
+        class _Ollama:
+            async def list_models(self):
+                outer.calls["n"] += 1
+                if outer._fail:
+                    raise RuntimeError("ollama is wedged")
+                return [SimpleNamespace(name=t) for t in outer._tags]
+
+        self.ollama = _Ollama()
+
+    async def status(self):
+        return st(self.cfg.id, owner="free")
+
+
+async def test_ollama_tags_cached_within_ttl_and_refetched_after():
+    lane = FakeLane("primary", tags=["q:1b"])
+    p = make_placer([lane])
+    assert (await p.place("q:1b")).unit_id == "primary"
+    await p.place("q:1b")
+    assert lane.calls["n"] == 1, "second placement inside the TTL rides the tag cache"
+
+    ts, names = p._tags_cache["primary"]
+    p._tags_cache["primary"] = (ts - S.placement_tags_ttl_s - 1, names)   # age it out
+    await p.place("q:1b")
+    assert lane.calls["n"] == 2, "an expired cache refetches"
+
+
+async def test_down_ollama_is_negative_cached():
+    lane = FakeLane("primary", fail=True)
+    p = make_placer([lane])
+    assert (await p.place("q:1b")).outcome == "not_found"
+    assert (await p.place("q:1b")).outcome == "not_found"
+    assert lane.calls["n"] == 1, \
+        "a down Ollama is probed once per TTL, not once per request"
+
+
 def test_tier3_prefers_the_faster_measured_load_bucketed():
     slow_empty = spark("s1", order=0)                 # emptier but ~8 min
     slow_empty.est_s = 480.0

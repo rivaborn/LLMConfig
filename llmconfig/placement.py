@@ -79,6 +79,7 @@ from __future__ import annotations
 
 import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional
 
@@ -93,6 +94,7 @@ if TYPE_CHECKING:
     from .orchestrator import Orchestrator, Unit
 
 AUTO = "auto"
+DECISION_LOG_SIZE = 50
 
 
 def wants_auto(lane_header: Optional[str]) -> bool:
@@ -147,6 +149,8 @@ class Decision:
     load_arg: str = ""
     victims: list[str] = field(default_factory=list)   # canonical aliases to evict
     reasons: dict[str, str] = field(default_factory=dict)  # unit -> why not (no_capacity)
+    tier: str = ""                         # which tier fired: pin|resident|fits|displace
+                                           # ("" on refusals) — for the decision log
 
 
 def _fits_without_displacement(c: CandidateFacts, headroom: float) -> bool:
@@ -224,7 +228,7 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
     if len(cands) == 1:
         c = cands[0]
         return Decision(outcome="pin", unit_id=c.unit_id, server=c.server,
-                        load_arg=c.load_arg)
+                        load_arg=c.load_arg, tier="pin")
 
     def order_key(c: CandidateFacts):
         return (c.status.swap_in_progress, c.order)   # mid-swap deprioritized, never out
@@ -239,7 +243,7 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
         resident.sort(key=lambda c: (c.usage != "idle", *order_key(c)))
         c = resident[0]
         return Decision(outcome="place", unit_id=c.unit_id, server=c.server,
-                        load_arg=c.load_arg)
+                        load_arg=c.load_arg, tier="resident")
 
     headroom = settings.spark_mem_headroom
     window = settings.usage_active_window_s
@@ -266,7 +270,7 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
                                  c.order))
         c = fits[0]
         return Decision(outcome="place", unit_id=c.unit_id, server=c.server,
-                        load_arg=c.load_arg)
+                        load_arg=c.load_arg, tier="fits")
 
     # Tier 4 — fits by displacing idle + unleased models only.
     displaceable: list[tuple[CandidateFacts, list[ResidentFact]]] = []
@@ -285,7 +289,8 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
                                           *order_key(cv[0])))
         c, victims = displaceable[0]
         return Decision(outcome="place", unit_id=c.unit_id, server=c.server,
-                        load_arg=c.load_arg, victims=[r.alias for r in victims])
+                        load_arg=c.load_arg, victims=[r.alias for r in victims],
+                        tier="displace")
 
     # Tier 5 — nothing admissible: say why, per unit.
     reasons = {}
@@ -341,6 +346,18 @@ class Placer:
         self._sweep_task: Optional[asyncio.Task] = None
         self._sweep_ts: float = 0.0
         self._sweep_result: dict[str, LaneStatus] = {}
+        # Ollama tag lists, per lane, with their own TTL. The registry halves of
+        # _resolve are in-memory; this is its ONLY real I/O, and it sat on the
+        # hot path serialized per lane — a wedged Ollama stacked its client
+        # timeout onto every auto request for a tag. Failures cache too
+        # (negative cache): a down Ollama answers "no tags" instantly for the
+        # TTL instead of being re-probed per request.
+        self._tags_cache: dict[str, tuple[float, frozenset[str]]] = {}
+        # The decision log: last N placements, newest last. Consecutive
+        # identical boring decisions (same model→unit→tier, nothing displaced
+        # or excluded) collapse into one entry with a count, so a chatty client
+        # can't wash the interesting entries out of the window.
+        self._decisions: deque[dict] = deque(maxlen=DECISION_LOG_SIZE)
 
     def invalidate(self) -> None:
         """Drop the cached sweep. Called when a load is COMMITTED off a placement
@@ -391,13 +408,28 @@ class Placer:
             if hit(e):
                 return ("vllm", e.alias, None)
         if ":" in model:
-            try:
-                names = {m.name for m in await unit.ollama.list_models()}
-            except Exception:  # noqa: BLE001 — a down Ollama just isn't a candidate
-                names = set()
-            if model in names:
+            if model in await self._ollama_tags(unit):
                 return ("ollama", model, None)
         return None
+
+    async def _ollama_tags(self, unit: "Unit") -> frozenset[str]:
+        """This lane's Ollama tag set, cached for placement_tags_ttl_s.
+
+        Tags change on the timescale of pulls, not requests, and staleness only
+        mis-ranks (placement is advisory) — so even a generous TTL is safe.
+        Failures cache as an empty set on purpose: without that, a lane whose
+        Ollama is down-but-not-refusing re-pays its client timeout on EVERY auto
+        request for a tag, serialized per lane."""
+        uid = unit.cfg.id
+        cached = self._tags_cache.get(uid)
+        if cached and time.monotonic() - cached[0] < self.s.placement_tags_ttl_s:
+            return cached[1]
+        try:
+            names = frozenset(m.name for m in await unit.ollama.list_models())
+        except Exception:  # noqa: BLE001 — a down Ollama just isn't a candidate
+            names = frozenset()
+        self._tags_cache[uid] = (time.monotonic(), names)
+        return names
 
     def _inflight_budget(self, unit: "Unit", st: LaneStatus) -> float:
         """Declared budget of a load already in flight on a Spark (job kind
@@ -509,4 +541,57 @@ class Placer:
                 continue
             candidates.append(self._facts_for(unit, st, srv, load_arg, entry, order,
                                               model, spark_resident))
-        return rank(model, candidates, self.s, exclude=exclude)
+        decision = rank(model, candidates, self.s, exclude=exclude)
+        self._record(model, server, exclude, candidates, decision)
+        return decision
+
+    # ---- the decision log ----
+    def _record(self, model: str, server: Optional[str],
+                exclude: frozenset[str], candidates: list[CandidateFacts],
+                decision: Decision) -> None:
+        """Append to the ring buffer (see __init__ for the dedupe rationale)."""
+        boring = (decision.outcome in ("place", "pin")
+                  and not decision.victims and not exclude)
+        if boring and self._decisions:
+            last = self._decisions[-1]
+            if (last.get("_boring")
+                    and last["model"] == model
+                    and last["unit"] == decision.unit_id
+                    and last["tier"] == decision.tier):
+                last["count"] += 1
+                last["ts"] = round(time.time(), 1)
+                return
+        self._decisions.append({
+            "ts": round(time.time(), 1),
+            "count": 1,
+            "model": model,
+            "outcome": decision.outcome,
+            "unit": decision.unit_id,
+            "tier": decision.tier,
+            "victims": list(decision.victims),
+            "server_constraint": server or "",
+            "exclude": sorted(exclude),
+            "reasons": dict(decision.reasons),
+            "sweep_age_s": round(max(time.monotonic() - self._sweep_ts, 0.0), 2)
+                           if self._sweep_ts else None,
+            "candidates": [{
+                "unit": c.unit_id,
+                "kind": c.kind,
+                "usage": c.usage,
+                "resident": any(r.model == model or r.alias == model
+                                for r in c.residents),
+                "proven": c.proven,
+                "fail_blocked": c.fail_blocked,
+                "lease_refused": c.lease_refused,
+                "swap": c.status.swap_in_progress,
+                "committed": round(c.committed, 2),
+                "want": round(c.want, 2),
+                "est_s": c.est_s,
+            } for c in candidates],
+            "_boring": boring,
+        })
+
+    def decisions(self) -> list[dict]:
+        """Newest-first copy of the log, without the internal dedupe marker."""
+        return [{k: v for k, v in d.items() if not k.startswith("_")}
+                for d in reversed(self._decisions)]
