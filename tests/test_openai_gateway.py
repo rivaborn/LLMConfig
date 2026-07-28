@@ -160,7 +160,7 @@ def _build(monkeypatch, tmp_path):
     lane.vllm = FakeVllm(world, lane.registry)
     lane.keepalive = FakeKeepalive()
 
-    async def fake_query_gpu(set_=None, uuid=None):
+    async def fake_query_gpu(set_=None, uuid=None, **kw):
         return world.gpu(uuid or "GPU-P")
 
     monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)

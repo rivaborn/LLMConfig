@@ -465,7 +465,11 @@ def create_app() -> FastAPI:
         # `req.model` frees one model and leaves co-residents running; without it the
         # whole unit is freed, which is what the UI's unit-level Unload still means.
         _require_lease_ok(req.lane, x_llm_lease, req.model or "")
-        return await orch.unload(req)
+        result = await orch.unload(req)
+        # Symmetric with api_load: for up to the cache TTL after an unload,
+        # tier 2 would still rank the freed unit as resident and route there.
+        placer.invalidate()
+        return result
 
     @app.post("/api/ollama/pull", response_model=Job, dependencies=write)
     async def api_pull(body: dict) -> Job:

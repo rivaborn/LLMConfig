@@ -62,7 +62,7 @@ async def wait_ready(
     *,
     settings: Settings | None = None,
     deadline_s: float | None = None,
-    on_stall: "Callable[[int], Awaitable[None]] | None" = None,
+    on_stall: "Callable[[int], Awaitable[object]] | None" = None,
 ) -> bool:
     """Block until the distro can execute a command, or the deadline passes.
 
@@ -72,13 +72,14 @@ async def wait_ready(
 
     `on_stall(consecutive_timeouts)` is invoked when probes keep timing out, so
     the caller can escalate to recovery without this module owning that policy.
+    A truthy return (WslRecovery.attempt returns True on success) triggers an
+    immediate re-probe, deadline notwithstanding.
     """
     settings = settings or get_settings()
     budget = settings.wsl_ready_timeout_s if deadline_s is None else deadline_s
     loop = asyncio.get_running_loop()
     end = loop.time() + budget
     timeouts = 0
-    stalled_at = 0
     while True:
         r = await probe(settings=settings)
         if r.ok:
@@ -87,13 +88,15 @@ async def wait_ready(
         if r.rc == 127:
             return False
         timeouts = timeouts + 1 if r.rc == 124 else 0
-        if (
-            on_stall is not None
-            and timeouts >= settings.wsl_selfheal_after_failures
-            and timeouts != stalled_at
-        ):
-            stalled_at = timeouts
-            await on_stall(timeouts)
+        if on_stall is not None and timeouts >= settings.wsl_selfheal_after_failures:
+            recovered = await on_stall(timeouts)
+            timeouts = 0   # a fresh consecutive count either way
+            if recovered:
+                # The ladder just fixed the distro — re-probe IMMEDIATELY, even
+                # past the deadline: returning False after a successful recovery
+                # (the ladder can take ~3.5 min of a 5 min budget) would skip
+                # the boot autoload on a box that now works (review 2026-07-29).
+                continue
         if loop.time() >= end:
             return False
         await asyncio.sleep(settings.wsl_ready_backoff_s)

@@ -5,6 +5,7 @@ residency); `size_vram < size` in /api/ps is how we detect CPU spill.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 from typing import Callable, Optional
 
@@ -130,11 +131,17 @@ class OllamaBackend:
 
     async def unload_all(self) -> list[str]:
         names = await self.loaded_names()
-        for n in names:
+
+        async def _one(n: str) -> None:
             try:
                 await self.unload(n)
             except httpx.HTTPError:
                 pass
+
+        # Concurrent: with >1 resident (a direct-to-Ollama client can park a
+        # second model) sequential unloads serialized the eviction phase.
+        if names:
+            await asyncio.gather(*(_one(n) for n in names))
         return names
 
     # ---- service control ----

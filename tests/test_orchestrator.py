@@ -130,7 +130,7 @@ def _make(monkeypatch, tmp_path):
     lane.vllm = FakeVllm(world, registry)
     lane.keepalive = FakeKeepalive()
 
-    async def fake_query_gpu(s=None, uuid=None):
+    async def fake_query_gpu(s=None, uuid=None, **kw):
         return world.gpu()
 
     async def fake_query_all(s=None):

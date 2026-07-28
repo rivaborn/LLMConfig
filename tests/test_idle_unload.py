@@ -129,7 +129,7 @@ def _make(monkeypatch, tmp_path, *, two_lanes=False, mon=None, **overrides):
         lane.vllm = FakeVllm(w)
         lane.keepalive = keepalive
 
-    async def fake_query_gpu(s=None, uuid=None):
+    async def fake_query_gpu(s=None, uuid=None, **kw):
         for w in worlds.values():
             if w.uuid == uuid:
                 return w.gpu()

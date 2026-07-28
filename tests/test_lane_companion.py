@@ -140,7 +140,7 @@ def _make(monkeypatch, tmp_path):
         lane.keepalive = FakeKeepalive()
     worlds = {"GPU-P": wp, "GPU-C": wc}
 
-    async def fake_query_gpu(set_=None, uuid=None):
+    async def fake_query_gpu(set_=None, uuid=None, **kw):
         return worlds[uuid].gpu(uuid)
 
     monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)
@@ -244,7 +244,7 @@ async def test_autoload_fires_configured_default(monkeypatch, tmp_path):
         lane.keepalive = FakeKeepalive()
     worlds = {"GPU-P": wp, "GPU-C": wc}
 
-    async def fake_query_gpu(set_=None, uuid=None):
+    async def fake_query_gpu(set_=None, uuid=None, **kw):
         return worlds[uuid].gpu(uuid)
 
     monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)

@@ -11,6 +11,8 @@ from pathlib import Path
 
 import yaml
 
+from .fsio import atomic_write_text
+
 from .config import PACKAGE_DIR, Settings, get_settings
 from .schemas import SparkModelEntry, VllmAliasEntry
 
@@ -30,10 +32,16 @@ class Registry:
     def load(self) -> None:
         if not self.path.exists():
             self._seed()
-        raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
         self._entries = {}
+        try:
+            raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001 — user-editable; never crash startup
+            return
         for item in raw.get("aliases", []) or []:
-            entry = VllmAliasEntry(**item)
+            try:
+                entry = VllmAliasEntry(**item)
+            except Exception:  # noqa: BLE001 — skip the bad row, keep the rest
+                continue
             self._entries[entry.alias] = entry
 
     def _seed(self) -> None:
@@ -43,7 +51,7 @@ class Registry:
     def save(self) -> None:
         data = {"aliases": [e.model_dump() for e in self._entries.values()]}
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        atomic_write_text(self.path, yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
 
     # ---- queries ----
     def entries(self) -> list[VllmAliasEntry]:
@@ -99,10 +107,16 @@ class SparkRegistry:
     def load(self) -> None:
         if not self.path.exists():
             self._seed()
-        raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
         self._entries = {}
+        try:
+            raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
+        except Exception:  # noqa: BLE001 — user-editable; never crash startup
+            return
         for item in raw.get("models", []) or []:
-            entry = SparkModelEntry(**item)
+            try:
+                entry = SparkModelEntry(**item)
+            except Exception:  # noqa: BLE001 — skip the bad row, keep the rest
+                continue
             self._entries[entry.alias] = entry
 
     def _seed(self) -> None:
@@ -110,12 +124,12 @@ class SparkRegistry:
         if self.default_path.exists():
             shutil.copyfile(self.default_path, self.path)
         else:  # no packaged seed — start empty rather than failing to boot
-            self.path.write_text("models: []\n", encoding="utf-8")
+            atomic_write_text(self.path, "models: []\n")
 
     def save(self) -> None:
         data = {"models": [e.model_dump() for e in self._entries.values()]}
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(yaml.safe_dump(data, sort_keys=False, allow_unicode=True), encoding="utf-8")
+        atomic_write_text(self.path, yaml.safe_dump(data, sort_keys=False, allow_unicode=True))
 
     # ---- queries ----
     def entries(self) -> list[SparkModelEntry]:

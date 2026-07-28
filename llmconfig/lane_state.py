@@ -32,6 +32,8 @@ from typing import Optional
 
 import yaml
 
+from .fsio import atomic_write_text
+
 from .config import REPO_ROOT, Settings, get_settings
 
 DEFAULTS_PATH = REPO_ROOT / "data" / "lane_defaults.yaml"
@@ -69,8 +71,13 @@ class LaneDefaults:
 
     def load(self) -> None:
         if self.path.exists():
-            raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
-            lanes = raw.get("lanes", {}) or {}
+            try:
+                raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
+                lanes = raw.get("lanes", {}) or {}
+                lanes = lanes if isinstance(lanes, dict) else {}
+            except Exception:  # noqa: BLE001 — user-editable; a corrupt file must
+                self._data = {}  # never take the control plane down at boot
+                return
             # A LITERALLY empty `models: []` is kept as a tombstone — "load
             # nothing at startup" (how a cookbook default pins a unit empty). A
             # non-empty list whose entries are all garbage is NOT a tombstone:
@@ -153,7 +160,4 @@ class LaneDefaults:
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {k: {"models": v} for k, v in self._data.items()}
-        self.path.write_text(
-            yaml.safe_dump({"lanes": data}, sort_keys=False, allow_unicode=True),
-            encoding="utf-8",
-        )
+        atomic_write_text(self.path, yaml.safe_dump({"lanes": data}, sort_keys=False, allow_unicode=True))

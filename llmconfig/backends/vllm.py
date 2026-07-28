@@ -141,10 +141,15 @@ class VllmBackend:
         """Poll the relay until `served_name` is being served, or timeout."""
         deadline = time.monotonic() + timeout
         last_tail = ""
+        next_tail = 0.0
         while time.monotonic() < deadline:
             if (await self.served()) == served_name:
                 return True
-            if on_log and alias:
+            # Throttle the journal peek: each one is a full wsl.exe+journalctl
+            # spawn (~200 over a 600 s load when run every poll) and it exists
+            # only to surface progress lines, not to gate readiness.
+            if on_log and alias and time.monotonic() >= next_tail:
+                next_tail = time.monotonic() + 10.0
                 tail = await self.journal_tail(alias, n=1)
                 if tail and tail != last_tail:
                     last_tail = tail

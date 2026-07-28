@@ -130,7 +130,7 @@ def gpu(lane: str = typer.Option("primary", "--lane", help="primary (3090) | com
 
 @app.command()
 def load(
-    server: str = typer.Argument(..., help="ollama | vllm"),
+    server: str = typer.Argument(..., help="ollama | vllm | spark"),
     model: str = typer.Argument(..., help="Ollama tag or vLLM serve.sh alias"),
     lane: str = typer.Option("primary", "--lane",
                              help="primary (3090) | companion (3070 Ti) | spark1..4 | "
@@ -139,8 +139,8 @@ def load(
     max_pack: bool = typer.Option(False, "--max-pack", help="fill VRAM (num_gpu) before spilling (Ollama)"),
 ) -> None:
     """Load a model on a server, evicting everything else from that lane's GPU first."""
-    if server not in ("ollama", "vllm"):
-        typer.secho("server must be 'ollama' or 'vllm'", fg="red")
+    if server not in ("ollama", "vllm", "spark"):
+        typer.secho("server must be 'ollama', 'vllm' or 'spark'", fg="red")
         raise typer.Exit(2)
     try:
         with _client() as c:
@@ -621,7 +621,12 @@ def _poll_job(jid: str) -> None:
     try:
         with _client() as c:
             while True:
-                j = c.get(f"/api/jobs/{jid}").json()
+                r = c.get(f"/api/jobs/{jid}")
+                if r.status_code == 404:
+                    typer.secho("job gone (pruned or server restarted) — "
+                                "check /api/status for the outcome", fg="yellow")
+                    raise typer.Exit(1)
+                j = r.json()
                 for line in j["log"][seen:]:
                     typer.echo(f"  {line}")
                 seen = len(j["log"])

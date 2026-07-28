@@ -104,7 +104,7 @@ def test_per_model_endpoint_resolves_alias_and_served_name(tmp_path, monkeypatch
                  registry_path=tmp_path / "reg.yaml", gpu_uuid="GPU-x")
     monkeypatch.setattr(main_mod, "get_settings", lambda: s)
 
-    async def fake_query_gpu(set_=None, uuid=None):
+    async def fake_query_gpu(set_=None, uuid=None, **kw):
         return GpuInfo(found=True, uuid=uuid or "GPU-x", total_mb=24576,
                        used_mb=400, free_mb=24176)
 

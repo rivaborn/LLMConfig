@@ -120,9 +120,14 @@ async def sample_gpu_metrics(settings: Settings | None = None) -> list[GpuMetric
     return out
 
 
-async def query_gpu(settings: Settings | None = None, uuid: str | None = None) -> GpuInfo:
+async def query_gpu(settings: Settings | None = None, uuid: str | None = None,
+                    with_processes: bool = True) -> GpuInfo:
     """Query one GPU by UUID. Defaults to the primary card (`settings.gpu_uuid`);
-    pass `uuid` to target another lane's card (e.g. the 3070 Ti companion)."""
+    pass `uuid` to target another lane's card (e.g. the 3070 Ti companion).
+
+    `with_processes=False` skips the second nvidia-smi spawn — the eviction-wait
+    poll only reads the memory numbers and was paying ~2 subprocess spawns per
+    2 s tick for a process list nobody looked at."""
     settings = settings or get_settings()
     target = uuid or settings.gpu_uuid
     r = await _run_smi(GPU_QUERY, settings)
@@ -139,7 +144,8 @@ async def query_gpu(settings: Settings | None = None, uuid: str | None = None) -
         if u == target:
             util = _parse_float(parts[4]) if len(parts) > 4 else None
             info = GpuInfo(found=True, uuid=u, total_mb=total, used_mb=used, free_mb=free, util_pct=util)
-            info.processes = await _query_processes(settings)
+            if with_processes:
+                info.processes = await _query_processes(settings)
             return info
 
     return GpuInfo(

@@ -92,6 +92,23 @@ async def wait_job(job, timeout: float = 10.0):
     return job
 
 
+def drain_after_stop(unit, calls, port):
+    """Make the fake node behave like a real one across a reload: the old model
+    vanishes after `sparkrun stop` and reappears once `sparkrun run` fires —
+    the drain re-probe (invariant 10: stop's rc lies) requires exactly that."""
+    from llmconfig.schemas import ServedModel
+    real = unit.spark.served_info
+
+    async def fake(p=None):
+        stopped = any("sparkrun stop" in c for c in calls)
+        ran = any("sparkrun run" in c for c in calls)
+        if p == port and stopped and not ran:
+            return ServedModel()
+        return await real(p)
+
+    unit.spark.served_info = fake
+
+
 def models_route(served: str | None):
     data = [{"id": served}] if served else []
     return respx.get(f"{BASE}/v1/models").mock(
@@ -295,7 +312,9 @@ async def test_real_nvidia_smi_numbers_still_win(cfg, calls):
 
 @respx.mock
 async def test_probe_backoff_after_repeated_failures(cfg, calls):
-    route = respx.get(f"{BASE}/v1/models").mock(side_effect=httpx.ConnectError("down"))
+    # Timeout, not ConnectError: a fast refusal now means "alive, slot empty"
+    # and correctly does NOT open the breaker (review 2026-07-29).
+    route = respx.get(f"{BASE}/v1/models").mock(side_effect=httpx.ConnectTimeout("down"))
     u = make_unit(cfg)
     for _ in range(6):
         await u.status()
@@ -311,6 +330,7 @@ async def test_load_stops_then_runs_then_waits(cfg, calls):
     models_route("served-1")
     u = make_unit(cfg)
     calls.plan["sparkrun status"] = CmdResult(0, "Job: recipe-1  (tp=1)  [aaaa0000bbbb]  (1 container(s))\n  solo       10.9.9.9   Up 1 hour   img", "")
+    drain_after_stop(u, calls, 8000)
     job = u.load(LoadRequest(server="spark", model="m1", lane="spark1", force=True))
     await wait_job(job)
 
@@ -337,6 +357,7 @@ async def test_launch_command_matches_verified_sparkrun_flags(cfg, calls):
     models_route("served-1")
     u = make_unit(cfg)
     calls.plan["sparkrun status"] = CmdResult(0, "Job: recipe-1  (tp=1)  [aaaa0000bbbb]  (1 container(s))\n  solo       10.9.9.9   Up 1 hour   img", "")
+    drain_after_stop(u, calls, 8000)
     await wait_job(u.load(LoadRequest(server="spark", model="m1", lane="spark1", force=True)))
 
     run = next(c for c in calls if "sparkrun run" in c)
@@ -736,6 +757,7 @@ async def test_reloading_a_resident_model_reuses_its_slot(cfg, calls):
     slot_route(8001, "served-2")
     slot_route(8002, None)
     slot_route(8003, None)
+    drain_after_stop(unit, calls, 8001)
 
     calls.plan["sparkrun status"] = CmdResult(0, "Job: recipe-2  (tp=1)  [cccc0000dddd]  (1 container(s))\n  solo       10.9.9.9   Up 1 hour   img", "")
     job = await wait_job(

@@ -162,8 +162,8 @@ def _prompt_chars(body: dict) -> int:
             if isinstance(content, str):
                 total += len(content)
             elif isinstance(content, list):        # multi-part content blocks
-                total += sum(len(p.get("text", "")) for p in content
-                             if isinstance(p, dict))
+                total += sum(len(txt) for p in content if isinstance(p, dict)
+                             and isinstance(txt := p.get("text"), str))
         return total
     prompt = body.get("prompt")
     if isinstance(prompt, str):
@@ -290,6 +290,16 @@ def _victims_for(c: CandidateFacts, headroom: float,
         return (committed + c.want <= headroom + 1e-9
                 and c.free_slot_after(len(victims)))
 
+    if not fits():
+        # Prefer a SINGLE sufficient victim (stalest among those that suffice)
+        # over greedy stalest-first accumulation — greedy could evict two
+        # models where the second alone was enough (review 2026-07-29).
+        lone = next((r for r in eligible if r not in victims
+                     and committed - r.budget + c.want <= headroom + 1e-9
+                     and c.free_slot_after(len(victims) + 1)), None)
+        if lone is not None:
+            victims.append(lone)
+            committed -= lone.budget
     for r in (x for x in eligible if x not in victims):
         if fits():
             break
@@ -431,6 +441,9 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
             reasons[c.unit_id] = "all slots in use"
         elif c.kind == "spark" and any(r.budget <= 0.0 for r in c.residents):
             reasons[c.unit_id] = "an unbudgeted resident claims the whole node"
+        elif c.kind == "spark" and c.whole_node:
+            reasons[c.unit_id] = ("whole-node recipe (tp>1 or unbudgeted) — "
+                                  "residents are active or leased")
         elif c.kind == "spark":
             reasons[c.unit_id] = (f"committed {c.committed:.2f} + {c.want:.2f} "
                                   f"exceeds {headroom:.2f}; no idle unleased co-tenant frees enough")
@@ -469,6 +482,7 @@ class Placer:
         self._sweep_task: Optional[asyncio.Task] = None
         self._sweep_ts: float = 0.0
         self._sweep_result: dict[str, LaneStatus] = {}
+        self._sweep_gen: int = 0     # bumped by invalidate(); stale sweeps don't publish
         # Ollama tag lists, per lane, with their own TTL. The registry halves of
         # _resolve are in-memory; this is its ONLY real I/O, and it sat on the
         # hot path serialized per lane — a wedged Ollama stacked its client
@@ -487,7 +501,13 @@ class Placer:
         decision: within the TTL a burst's second request would otherwise rank on
         a snapshot predating the first request's load and double-place onto the
         same unit — admission still refuses (the gates hold), but it burns the
-        gateway's single re-place. A forced re-sweep sees the in-flight job."""
+        gateway's single re-place. A forced re-sweep sees the in-flight job.
+
+        The generation bump + task drop matter: a sweep that STARTED before the
+        load would otherwise complete after this call and re-publish the
+        pre-load snapshot with a fresh timestamp (review 2026-07-29)."""
+        self._sweep_gen += 1
+        self._sweep_task = None
         self._sweep_result, self._sweep_ts = {}, 0.0
 
     # ---- status sweep ----
@@ -500,7 +520,8 @@ class Placer:
         return await asyncio.shield(self._sweep_task)
 
     async def _sweep(self) -> dict[str, LaneStatus]:
-        units = list(self.orch.units.values())
+        gen = self._sweep_gen
+        units = [u for u in self.orch.units.values() if u.cfg.enabled]
         results = await asyncio.gather(*(u.status() for u in units),
                                        return_exceptions=True)
         out: dict[str, LaneStatus] = {}
@@ -508,7 +529,8 @@ class Placer:
             if isinstance(res, LaneStatus):
                 out[u.cfg.id] = res
             # a raising unit simply isn't a candidate this round
-        self._sweep_result, self._sweep_ts = out, time.monotonic()
+        if gen == self._sweep_gen:   # stale sweeps (invalidated mid-flight) don't publish
+            self._sweep_result, self._sweep_ts = out, time.monotonic()
         return out
 
     # ---- resolution (mirrors gateway.resolve, minus the URL) ----
@@ -612,8 +634,13 @@ class Placer:
                 ))
         else:
             for m in st.loaded_models:
+                # Resolve the catalog alias — vLLM residency reports the SERVED
+                # name, and alias=m.model left tier-2 alias matching and the
+                # gate's residency-proof broken for GPU lanes (the 2026-07-28
+                # alias fix was only half-applied; review 2026-07-29).
+                e = unit.registry.find_by_served_name(m.model)
                 residents.append(ResidentFact(
-                    model=m.model, alias=m.model, budget=0.0,
+                    model=m.model, alias=(e.alias if e else m.model), budget=0.0,
                     idle_s=st.idle_s or 0.0,
                     leased=self.leases.active_for(uid) is not None,
                 ))
@@ -652,13 +679,15 @@ class Placer:
             if hasattr(u, "declared_budgets") and u.cfg.id in statuses
             for m in statuses[u.cfg.id].loaded_models
         )
+        eligible = [(order, unit, statuses[unit.cfg.id])
+                    for order, unit in enumerate(self.orch.units.values())
+                    if unit.cfg.enabled and unit.cfg.id in statuses]
+        # Resolve concurrently: registry halves are in-memory, but a cold Ollama
+        # tag fetch is real I/O and was paid back-to-back per lane.
+        resolutions = await asyncio.gather(
+            *(self._resolve(unit, model) for _, unit, _ in eligible))
         candidates: list[CandidateFacts] = []
-        for order, unit in enumerate(self.orch.units.values()):
-            uid = unit.cfg.id
-            st = statuses.get(uid)
-            if st is None or not unit.cfg.enabled:
-                continue
-            resolved = await self._resolve(unit, model)
+        for (order, unit, st), resolved in zip(eligible, resolutions):
             if resolved is None:
                 continue
             srv, load_arg, entry = resolved
@@ -684,6 +713,7 @@ class Placer:
                     and last["model"] == model
                     and last["unit"] == decision.unit_id
                     and last["tier"] == decision.tier
+                    and last["server_constraint"] == (server or "")
                     and last["workload"] == (workload.cls if workload else "")):
                 last["count"] += 1
                 last["ts"] = round(time.time(), 1)

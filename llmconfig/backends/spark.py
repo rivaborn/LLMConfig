@@ -59,6 +59,7 @@ class SparkBackend:
         self.s = settings
         self.cfg = cfg
         self.registry = registry
+        self.last_probe_timeout = False   # set by served_info/served_slots (breaker input)
         # One pooled client per slot port — a node can serve several models at
         # once and each lives on its own port.
         self._clients: dict[int, httpx.AsyncClient] = {}
@@ -110,6 +111,12 @@ class SparkBackend:
                 root=d.get("root") or "",
                 context_len=int(d.get("max_model_len") or 0),
             )
+        except httpx.TimeoutException:
+            # No answer at all within the probe budget — the "node is off /
+            # unroutable" shape the status breaker exists for. A fast refusal
+            # (ConnectError below) means the node is alive with an empty slot.
+            self.last_probe_timeout = True
+            return ServedModel()
         except (httpx.HTTPError, KeyError, IndexError, TypeError, ValueError):
             return ServedModel()
 
@@ -122,6 +129,7 @@ class SparkBackend:
         is on the UI's 2.5 s poll path (invariant 9).
         """
         ports = self.cfg.slot_ports
+        self.last_probe_timeout = False   # set by any served_info timeout below
         results = await asyncio.gather(
             *(self.served_info(p) for p in ports), return_exceptions=True
         )
@@ -268,7 +276,7 @@ class SparkBackend:
             if m:
                 current = (m.group(1), m.group(2))
                 continue
-            if current and self.cfg.host in line and current[0] == recipe:
+            if current and self.cfg.host in line.split() and current[0] == recipe:
                 return current[1]
         return None
 

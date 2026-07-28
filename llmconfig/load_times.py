@@ -44,6 +44,8 @@ from typing import Optional
 
 import yaml
 
+from .fsio import atomic_write_text
+
 from .config import REPO_ROOT
 
 LOAD_TIMES_PATH = REPO_ROOT / "data" / "load_times.yaml"
@@ -160,7 +162,4 @@ class LoadTimes:
         doc: dict = {"samples": self._data}
         if self._failures:
             doc["failures"] = self._failures
-        self.path.write_text(
-            yaml.safe_dump(doc, sort_keys=True, allow_unicode=True),
-            encoding="utf-8",
-        )
+        atomic_write_text(self.path, yaml.safe_dump(doc, sort_keys=True, allow_unicode=True))

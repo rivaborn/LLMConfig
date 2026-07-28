@@ -131,7 +131,12 @@ class IdleReaper:
             except Exception as e:  # noqa: BLE001 — one unit's failure can't starve the others
                 log.warning("idle reaper: lane %s check failed: %s: %s",
                             lane.cfg.id, type(e).__name__, e)
-        if reaped_vllm:
+        # Every tick, not only reap ticks: a release skipped once (another lane
+        # mid-swap at that instant) would otherwise never be retried and the
+        # keepalive would pin the whole distro's RAM indefinitely. The method's
+        # own guards make the no-op case cheap.
+        ka = getattr(self.orch, "keepalive", None)
+        if reaped_vllm or (ka is not None and ka.alive()):
             await self._maybe_release_keepalive()
 
     async def _check_lane(self, lane: "Unit") -> bool:

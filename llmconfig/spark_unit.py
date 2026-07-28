@@ -129,7 +129,14 @@ class SparkUnit:
             return {}  # presumed still down; re-probe once the backoff expires
         self._served_ts = now
         slots = await self.spark.served_slots()
-        self._served_fails = 0 if slots else self._served_fails + 1
+        if slots or not getattr(self.spark, "last_probe_timeout", False):
+            # An answer — even "every slot empty" (fast connection-refused on an
+            # idle node) — means the node is alive; only timeouts open the
+            # breaker. Counting idle as failure delayed residency discovery of
+            # externally-launched models by the whole backoff (review 2026-07-29).
+            self._served_fails = 0
+        else:
+            self._served_fails += 1
         return slots
 
     def _refresh_gpu_soon(self) -> None:
@@ -287,6 +294,18 @@ class SparkUnit:
             stop = await self.spark.stop(recipe=recipe)
             if not stop.ok and stop.rc not in (0, 1):
                 self.jobs.log(job, f"stop reported rc={stop.rc}: {stop.text()[:200]}")
+            # The rc CANNOT be trusted (invariant 10: stop swallows SSH failures
+            # into rc=0) — the slot re-probe is the real check. If the old
+            # server still answers, relaunching would let wait_ready see the OLD
+            # process and report a reload that never happened.
+            for _ in range(15):
+                if not (await self.spark.served_info(port)).name:
+                    break
+                await asyncio.sleep(1.0)
+            else:
+                raise RuntimeError(
+                    f"'{target}' still serving on port {port} 15s after the stop — "
+                    f"sparkrun stop silently failed; not relaunching over it")
             resident.pop(target, None)
             slots.pop(port, None)
         else:
@@ -424,7 +443,14 @@ class SparkUnit:
         return await self.status()
 
     async def _acquire_swap_lock(self, what: str) -> None:
-        """Acquire the unit's swap lock, or raise rather than wait forever."""
+        """Acquire the unit's swap lock, or raise rather than wait forever.
+
+        Bare acquire on the uncontended path — `wait_for` always yields even on
+        a free lock, re-opening the reaper/sweeper check-then-act window that
+        invariant 11's sync guard exists to close (mirrors Lane)."""
+        if not self._lock.locked():
+            await self._lock.acquire()
+            return
         try:
             await asyncio.wait_for(self._lock.acquire(),
                                    timeout=self.s.swap_wait_timeout_s)

@@ -138,7 +138,9 @@ class LeaseManager:
         self.s = settings
         self.orch = orch
         self._leases: dict[str, Lease] = {}
-        self._pending_free: dict[str, PendingFree] = {}
+        # Keyed by (unit, model): two claimants freeing DIFFERENT models on one
+        # Spark within a sweep tick must not overwrite each other (model '' = whole unit).
+        self._pending_free: dict[tuple[str, str], PendingFree] = {}
         self.started_at = time.time()
 
     # ------------------------------------------------------------------ #
@@ -339,11 +341,11 @@ class LeaseManager:
                 return lease
         return None
 
-    def pending_free(self) -> dict[str, PendingFree]:
+    def pending_free(self) -> dict[tuple[str, str], PendingFree]:
         return dict(self._pending_free)
 
-    def clear_pending(self, unit_id: str) -> None:
-        self._pending_free.pop(unit_id, None)
+    def clear_pending(self, unit_id: str, model: str = "") -> None:
+        self._pending_free.pop((unit_id, model), None)
 
     # ------------------------------------------------------------------ #
     # Mutations (sync)
@@ -399,23 +401,34 @@ class LeaseManager:
             existing.renew_count += 1
             existing.expires_at = now + ttl_s
             existing._deadline = now_mono + ttl_s
+            if req.free_on_preempt:
+                # A retried claim after a lost response must still get its
+                # eviction — the extend path skipped the queue entirely.
+                self._pending_free[(req.unit, existing.model)] = PendingFree(
+                    existing.id, now, "claimed", existing.model)
             return existing, None
 
-        displaced: Optional[Lease] = None
-        if existing is not None:
-            if not existing.preemptible:
+        # Contend with EVERY overlapping live lease, not just the first found —
+        # a whole-unit claim overlaps them all, and checking one let it slip past
+        # a non-preemptible per-model lease hiding behind a preemptible neighbour
+        # (the same pattern blocks_unleased already guards; review 2026-07-29).
+        model_c = self._canon(req.unit, req.model)
+        overlapping = [l for l in self.active_all(req.unit)
+                       if not model_c or not l.model or l.model == model_c]
+        for other in (l for l in overlapping if l.holder != holder):
+            if not other.preemptible:
                 raise LeaseConflict(
-                    f"unit '{req.unit}' is held by '{existing.holder}' (non-preemptible) "
-                    f"for another {max(0.0, existing._deadline - now_mono):.0f}s",
-                    lease=existing,
+                    f"unit '{req.unit}' is held by '{other.holder}' (non-preemptible) "
+                    f"for another {max(0.0, other._deadline - now_mono):.0f}s",
+                    lease=other,
                 )
-            if priority <= existing.priority and not req.force:
+            if priority <= other.priority and not req.force:
                 raise LeaseConflict(
-                    f"unit '{req.unit}' is held by '{existing.holder}' at priority "
-                    f"{existing.priority}; claim at a higher priority or pass force=true",
-                    lease=existing,
+                    f"unit '{req.unit}' is held by '{other.holder}' at priority "
+                    f"{other.priority}; claim at a higher priority or pass force=true",
+                    lease=other,
                 )
-            displaced = existing  # preempted below, once the new lease has an id
+        displaced = overlapping[0] if overlapping else None  # reported; ALL are preempted below
 
         lease = Lease(
             id=uuid.uuid4().hex[:12],
@@ -436,11 +449,11 @@ class LeaseManager:
         )
         lease._deadline = now_mono + ttl_s
 
-        if displaced is not None:
-            self._terminate(displaced, "revoked", by=holder, reason="preempted",
+        for other in overlapping:
+            self._terminate(other, "revoked", by=holder, reason="preempted",
                             displaced_by=lease.id)
             log.info("lease %s (%s) preempted %s (%s) on %s",
-                     lease.id, holder, displaced.id, displaced.holder, req.unit)
+                     lease.id, holder, other.id, other.holder, req.unit)
 
         # `free_on_preempt` is the CLAIMANT's request for an empty card — "give me
         # this unit with nothing loaded on it" (an external CUDA job, Wait-GpuIdle).
@@ -448,7 +461,7 @@ class LeaseManager:
         # baseline itself, so freeing first is usually a wasted drain/refill plus a
         # window in which a third party can grab the empty card.
         if req.free_on_preempt:
-            self._pending_free[req.unit] = PendingFree(lease.id, now, "claimed", lease.model)
+            self._pending_free[(req.unit, lease.model)] = PendingFree(lease.id, now, "claimed", lease.model)
 
         self._leases[lease.id] = lease
         self._prune()
@@ -501,7 +514,7 @@ class LeaseManager:
         if free:
             # No requesting lease — an operator asked, so honour it only while the
             # unit stays unclaimed (see LeaseSweeper._free_unit).
-            self._pending_free[lease.unit] = PendingFree("", time.time(), reason, lease.model)
+            self._pending_free[(lease.unit, lease.model)] = PendingFree("", time.time(), reason, lease.model)
         return lease
 
     def note_request(self, lease_id: str) -> None:
@@ -598,9 +611,9 @@ class LeaseSweeper:
         pending = self.leases.pending_free()
         if not pending:
             return
-        for unit in list(self.orch.units.values()):
-            pf = pending.get(unit.cfg.id)
-            if pf is None:
+        for (uid, _model), pf in pending.items():
+            unit = self.orch.units.get(uid)
+            if unit is None:
                 continue
             try:
                 await self._free_unit(unit, pf)
@@ -676,15 +689,15 @@ class LeaseSweeper:
         if unit._lock.locked() or unit._active_job_id:
             return                                        # swap in flight — retry next tick
         if not self._still_wanted(unit.cfg.id, pf):
-            self.leases.clear_pending(unit.cfg.id)
+            self.leases.clear_pending(unit.cfg.id, pf.model)
             return
         st = await unit.status()                          # the ONLY await in this ladder
         if st.swap_in_progress or st.owner not in MANAGED_OWNERS:
-            self.leases.clear_pending(unit.cfg.id)        # nothing loaded to free
+            self.leases.clear_pending(unit.cfg.id, pf.model)        # nothing loaded to free
             return
         if pf.model and not any(self.leases._canon(unit.cfg.id, m.model) == pf.model
                                 for m in st.loaded_models):
-            self.leases.clear_pending(unit.cfg.id)        # that model already gone
+            self.leases.clear_pending(unit.cfg.id, pf.model)        # that model already gone
             return
         # Final sync re-check. No await between here and unload(): an uncontended
         # asyncio.Lock acquires without yielding and active_for() is plain dict
@@ -692,7 +705,7 @@ class LeaseSweeper:
         # probe above can interleave.
         if unit._lock.locked() or not self._still_wanted(unit.cfg.id, pf):
             return
-        self.leases.clear_pending(unit.cfg.id)
+        self.leases.clear_pending(unit.cfg.id, pf.model)
         log.info("lease sweeper: freeing %s on %s after %s (lease %s)",
                  pf.model or "everything", unit.cfg.id, pf.reason, pf.lease_id)
         # invariant 3 — always through Unit.unload

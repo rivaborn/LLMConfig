@@ -243,7 +243,10 @@ class Monitor:
                              m.mem_used_mb))
         order.extend(await self._sample_sparks(now, gpu_rows))
         if order:
-            self._order = order
+            # MERGE, don't replace: one flaky local nvidia-smi tick would
+            # otherwise drop the GPU lanes out of the display order while the
+            # Sparks stayed, blanking their series until the next good sample.
+            self._order = order + [u for u in self._order if u not in order]
         await self._sample_ollama(now)
         if self._db is not None:
             ollama_row = self._ollama[-1] if self._ollama else None

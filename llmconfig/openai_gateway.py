@@ -110,10 +110,13 @@ class OpenAIGateway:
             return ("vllm", match, lane.cfg.vllm_relay_url)
         # Ollama: a tag present in the lane's catalog
         if ":" in model:
-            try:
-                names = {m.name for m in await lane.ollama.list_models()}
-            except Exception:
-                names = set()
+            if self.placer is not None:
+                names = await self.placer._ollama_tags(lane)   # TTL + negative cache
+            else:
+                try:
+                    names = {m.name for m in await lane.ollama.list_models()}
+                except Exception:
+                    names = set()
             if model in names:
                 return ("ollama", model, lane.cfg.ollama_url)
         return None
@@ -267,7 +270,13 @@ class OpenAIGateway:
 
         if lease_id and self.leases is not None:
             lease = self.leases.get(lease_id)
-            if lease is not None and lease.state == "active":
+            # Pin while ACTIVE or inside the expiry grace window — _lease_gate
+            # still serves an in-grace holder on its own unit, so auto-placing
+            # it elsewhere would hand it a lease_wrong_unit 409 (the exact
+            # renew-slipped-behind-a-long-generation case grace exists for).
+            in_grace = (lease is not None and lease.state in ("active", "expired")
+                        and lease.in_grace(time.monotonic(), self.s.lease_expiry_grace_s))
+            if lease is not None and (lease.state == "active" or in_grace):
                 lane = self.lane(lease.unit)
                 reject = self._lease_gate(lane.cfg.id, lease_id, model)
                 if reject is not None:
@@ -496,6 +505,9 @@ class OpenAIGateway:
             if cur.state == "failed":
                 return False, cur.error or cur.message or "load failed"
             await asyncio.sleep(1.0)
+        cur = self.jobs.get(job_id)   # one last read — the job may have flipped
+        if cur is not None and cur.state == "succeeded":   # during the final sleep
+            return True, ""
         return False, f"load did not finish within {int(timeout)}s"
 
     def _reroute(self, lane: "Unit", server: str, model: str, default: str):
@@ -696,6 +708,12 @@ class OpenAIGateway:
         if decision.outcome not in ("place", "pin"):
             return None
         lane = self.lane(decision.unit_id)
+        # The gate must run here too: a sole-candidate PIN bypasses rank()'s
+        # lease_refused predicate by design, so without this an excluded retry
+        # could forward onto a non-preemptibly held unit with no 409.
+        lease_id = (request.headers.get("x-llm-lease") or "").strip()
+        if self._lease_gate(lane.cfg.id, lease_id, model) is not None:
+            return None   # fall through to the original 503
         status = await lane.status()
         server, load_arg = decision.server, decision.load_arg
         backend = self._route(lane, server, model, status,

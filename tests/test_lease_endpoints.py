@@ -31,7 +31,7 @@ def client(monkeypatch, tmp_path):
     )
     monkeypatch.setattr(main_mod, "get_settings", lambda: s)
 
-    async def fake_query_gpu(set_=None, uuid=None):  # keep unit.status() off nvidia-smi
+    async def fake_query_gpu(set_=None, uuid=None, **kw):  # keep unit.status() off nvidia-smi
         return GpuInfo(found=True, uuid=uuid or "GPU-x", total_mb=24576,
                        used_mb=400, free_mb=24176)
 

@@ -47,6 +47,8 @@ from typing import TYPE_CHECKING, Optional
 
 import yaml
 
+from .fsio import atomic_write_text
+
 from .config import REPO_ROOT, Settings
 from .schemas import Job, LoadRequest, UnloadRequest
 
@@ -110,11 +112,9 @@ class Cookbook:
 
     def save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
-            yaml.safe_dump({"default": self._default, "states": self._states},
-                           sort_keys=False, allow_unicode=True),
-            encoding="utf-8",
-        )
+        atomic_write_text(self.path, yaml.safe_dump(
+            {"default": self._default, "states": self._states},
+            sort_keys=False, allow_unicode=True))
 
     # ------------------------------------------------------------------ #
     # Queries

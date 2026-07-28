@@ -180,8 +180,11 @@ class Lane:
 
     async def _load_ollama(self, job: Job, req: LoadRequest) -> dict:
         # Fast path: already loaded, nothing else on the GPU, not forced.
+        # SOLE resident, not membership: a direct-to-Ollama client (ungated by
+        # design, invariant 12) can park a second model on the card — the fast
+        # path must not bless that state; fall through and evict instead.
         if not req.force and (await self.vllm.served()) is None:
-            if req.model in await self.ollama.loaded_names():
+            if set(await self.ollama.loaded_names()) == {req.model}:
                 self.jobs.log(job, f"{req.model} already loaded on Ollama")
                 return await self._verify_ollama(job, req, remediate=False)
 
@@ -234,6 +237,13 @@ class Lane:
         else:
             self.jobs.log(job, "WSL keepalive active (distro held open)")
 
+        # Stop any OLD vLLM before the drain wait. serve() stops internally, but
+        # that runs AFTER _wait_vram_free — on a vLLM→vLLM swap the wait would
+        # poll a card the old model still occupies, burn the full evict timeout,
+        # and then load with no confirmed drain (the one path that skipped the
+        # eviction-wait gate; found in review 2026-07-29). stop() is idempotent
+        # and lane-scoped, so this is safe when vLLM is already down.
+        await self.vllm.stop()
         self.jobs.log(job, "unloading any Ollama models…")
         names = await self.ollama.unload_all()
         if names:
@@ -294,9 +304,18 @@ class Lane:
         await self._acquire_swap_lock("unload")
         try:
             self._active_job_id = None
+            if req.model and not await self._occupied_by(req.model):
+                # Targeted unload of a model that is not resident: no-op. The
+                # reaper/sweeper name the victim they saw — a neighbour loaded
+                # between their probe and this call must survive, not be
+                # collateral (review 2026-07-29; SparkUnit already behaves so).
+                # (The finally below releases the lock.)
+                return await self.status()
             if req.server in (None, "vllm"):
-                if await self.vllm.up():
-                    await self.vllm.stop()
+                # Unconditional: gating on the 1 s relay probe skipped eviction
+                # whenever the relay was dead while vLLM still held the card.
+                # stop() is idempotent and lane-scoped.
+                await self.vllm.stop()
             if req.server in (None, "ollama"):
                 await self.ollama.unload_all()
             await self._wait_vram_free(None)
@@ -304,8 +323,25 @@ class Lane:
             self._lock.release()
         return await self.status()
 
+    async def _occupied_by(self, model: str) -> bool:
+        """Is `model` (a served name or Ollama tag) resident on this lane now?"""
+        served = await self.vllm.served()
+        if served is not None:
+            return served == model
+        return model in await self.ollama.loaded_names()
+
     async def _acquire_swap_lock(self, what: str) -> None:
-        """Acquire the unit's swap lock, or raise rather than wait forever."""
+        """Acquire the unit's swap lock, or raise rather than wait forever.
+
+        The uncontended path is a BARE acquire on purpose: `asyncio.wait_for`
+        wraps the acquire in a task and always yields at least once even when
+        the lock is free — which re-opens the check-then-act window the idle
+        reaper's and lease sweeper's final sync guard depends on closing
+        (invariant 11's reasoning). A bare acquire on a free lock completes
+        without yielding."""
+        if not self._lock.locked():
+            await self._lock.acquire()
+            return
         try:
             await asyncio.wait_for(self._lock.acquire(),
                                    timeout=self.s.swap_wait_timeout_s)
@@ -321,9 +357,9 @@ class Lane:
     # ------------------------------------------------------------------ #
     async def _evict_all(self, job: Job) -> None:
         """Clear this lane's GPU: stop vLLM, unload all Ollama models, confirm freed."""
-        if await self.vllm.up():
-            self.jobs.log(job, "stopping vLLM to free VRAM…")
-            await self.vllm.stop()
+        # Unconditional stop — see unload(): the relay probe must not gate it.
+        self.jobs.log(job, "stopping vLLM to free VRAM…")
+        await self.vllm.stop()
         names = await self.ollama.unload_all()
         if names:
             self.jobs.log(job, f"unloaded Ollama: {', '.join(names)}")
@@ -336,7 +372,9 @@ class Lane:
         """
         deadline = time.monotonic() + self.s.evict_timeout_s
         while time.monotonic() < deadline:
-            gpu = await self._gpu()
+            # No process list: this loop reads only the memory numbers, and the
+            # second nvidia-smi spawn per tick was pure waste (~44 per wait).
+            gpu = await query_gpu(self.s, uuid=self.cfg.gpu_uuid, with_processes=False)
             if not gpu.found:
                 if job:
                     self.jobs.log(job, "nvidia-smi unavailable — skipping VRAM-free wait")
@@ -369,7 +407,14 @@ class Lane:
             packed = await self._max_pack_reload(job, req, gpu)
             if packed is not None:
                 return packed
-            # fall through to report the original load
+            # Fall through to report the original load — but re-verify it first:
+            # if the max-pack path unloaded the model and its fallback restore
+            # ALSO failed, the `match` above is stale and would report success
+            # for a model that is no longer resident.
+            if not any(m.name == req.model for m in await self.ollama.loaded()):
+                raise RuntimeError(
+                    f"max-pack reload of {req.model} failed AND the auto-fit "
+                    f"restore failed — the model is no longer loaded")
 
         self.jobs.log(
             job,
