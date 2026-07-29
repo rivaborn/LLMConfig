@@ -22,7 +22,7 @@ from .config import LaneConfig, Settings
 from .gpu import GpuInfo, query_gpu
 from .jobs import JobManager
 from .registry import Registry
-from .schemas import Job, LaneStatus, LoadedModel, LoadRequest, UnloadRequest
+from .schemas import Job, LaneStatus, LoadedModel, LoadRequest, ServedModel, UnloadRequest
 from .schemas import GpuOut
 from .wsl import WslKeepalive
 
@@ -81,6 +81,18 @@ class Lane:
         """This lane's card only (by UUID) — never the other lane's."""
         return await query_gpu(self.s, uuid=self.cfg.gpu_uuid)
 
+    async def _served_info(self) -> ServedModel:
+        """The relay's view, or an empty answer on an Ollama-only lane.
+
+        Skipping the probe matters for latency, not just tidiness: a DOWN relay
+        blackholes the SYN rather than refusing it (invariant 5), so probing a
+        relay that will never exist costs `vllm_probe_timeout_s` on every
+        /api/status — which the UI polls every 2.5 s.
+        """
+        if not self.cfg.vllm_enabled:
+            return ServedModel()
+        return await self.vllm.served_info()
+
     # ------------------------------------------------------------------ #
     # Status
     # ------------------------------------------------------------------ #
@@ -89,14 +101,14 @@ class Lane:
         # lanes); fetch this lane's card only when called standalone.
         if gpu is None:
             served_info, ollama_loaded, ollama_up, gpu = await asyncio.gather(
-                self.vllm.served_info(),
+                self._served_info(),
                 self.ollama.loaded(),
                 self.ollama.up(),
                 self._gpu(),
             )
         else:
             served_info, ollama_loaded, ollama_up = await asyncio.gather(
-                self.vllm.served_info(),
+                self._served_info(),
                 self.ollama.loaded(),
                 self.ollama.up(),
             )
@@ -217,6 +229,17 @@ class Lane:
         return result
 
     async def _load_vllm(self, job: Job, req: LoadRequest) -> dict:
+        # Refuse FIRST, before the keepalive and before any eviction: this lane's
+        # vLLM half is not installed, and the old order unloaded the lane's
+        # working Ollama model and drained its VRAM before discovering that the
+        # systemd unit was missing — a request for a model that can never run
+        # destroyed the model that was running.
+        if not self.cfg.vllm_enabled:
+            raise RuntimeError(
+                f"vLLM is not available on the {self.cfg.id} lane (it has no serve "
+                f"script installed — see COMPANION_VLLM_ENABLED). Use Ollama on this "
+                f"lane, or another unit."
+            )
         alias = req.model
         entry = self.registry.get(alias)
         if entry is None:
@@ -311,10 +334,10 @@ class Lane:
                 # collateral (review 2026-07-29; SparkUnit already behaves so).
                 # (The finally below releases the lock.)
                 return await self.status()
-            if req.server in (None, "vllm"):
-                # Unconditional: gating on the 1 s relay probe skipped eviction
-                # whenever the relay was dead while vLLM still held the card.
-                # stop() is idempotent and lane-scoped.
+            if req.server in (None, "vllm") and self.cfg.vllm_enabled:
+                # Unconditional (given the lane HAS vLLM): gating on the 1 s relay
+                # probe skipped eviction whenever the relay was dead while vLLM
+                # still held the card. stop() is idempotent and lane-scoped.
                 await self.vllm.stop()
             if req.server in (None, "ollama"):
                 await self.ollama.unload_all()
@@ -358,8 +381,11 @@ class Lane:
     async def _evict_all(self, job: Job) -> None:
         """Clear this lane's GPU: stop vLLM, unload all Ollama models, confirm freed."""
         # Unconditional stop — see unload(): the relay probe must not gate it.
-        self.jobs.log(job, "stopping vLLM to free VRAM…")
-        await self.vllm.stop()
+        # (Skipped on an Ollama-only lane: two WSL round-trips for a unit that
+        # does not exist, on every load.)
+        if self.cfg.vllm_enabled:
+            self.jobs.log(job, "stopping vLLM to free VRAM…")
+            await self.vllm.stop()
         names = await self.ollama.unload_all()
         if names:
             self.jobs.log(job, f"unloaded Ollama: {', '.join(names)}")

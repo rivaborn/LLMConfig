@@ -77,6 +77,17 @@ async def _check_lane(add, settings: Settings, cfg: LaneConfig, registry: Regist
         f"status={st} (name={cfg.ollama_service_name})")
 
     # --- vLLM (per-lane serve script / unit / relay) ---
+    # An Ollama-only lane has no vLLM half to check. Report that as CONFIGURATION,
+    # not as a failure: a permanently red check is one you learn to skim past, and
+    # then it hides a real one.
+    if not cfg.vllm_enabled:
+        add(f"{p}.vllm", True,
+            f"disabled on this lane — Ollama-only (no serve script installed; "
+            f"set COMPANION_VLLM_ENABLED=true after building {cfg.vllm_serve_script})")
+        await vllm.aclose()
+        await ollama.aclose()
+        return
+
     if wsl_ok:
         r = await run_wsl(f"test -x {cfg.vllm_serve_script} && echo ok || echo missing",
                           login=False, timeout=20.0, settings=settings)

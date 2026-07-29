@@ -35,6 +35,14 @@ class LaneConfig:
     vllm_systemd_unit: str
     registry_path: Path
     enabled: bool = True
+    # Does this lane have a working vLLM half? A lane is Ollama-XOR-vLLM by
+    # design, but the vLLM side needs a serve script + systemd unit installed on
+    # the box, and the COMPANION's was specified and never built (no
+    # `serve-companion.sh` exists — not on .40, not in deploy/). False makes that
+    # explicit instead of pretending: doctor reports it as configuration rather
+    # than failure, the catalogs stop advertising models that cannot run, and a
+    # load refuses BEFORE it evicts the lane's working Ollama model.
+    vllm_enabled: bool = True
     default_server: str = ""      # "ollama" | "vllm" | "" — auto-load on startup
     default_model: str = ""       # Ollama tag or vLLM alias
     # Whether the idle reaper may unload this lane (the global idle_unload_enabled
@@ -165,6 +173,11 @@ class Settings(BaseSettings):
     companion_ollama_url: str = "http://127.0.0.1:11435"        # 2nd Ollama instance
     companion_ollama_service_name: str = "OllamaCompanion"
     companion_vllm_relay_url: str = "http://127.0.0.1:11438"    # 2nd socat relay
+    # OFF: `serve-companion.sh` has never existed — the unit file specifies it
+    # (resolve the 3070 Ti index by UUID via torch, lower --gpu-memory-utilization)
+    # but the script was never written, so the companion is an Ollama-only lane.
+    # Flip to true if you ever build it; the registry + unit are already here.
+    companion_vllm_enabled: bool = False
     companion_vllm_serve_script: str = "/home/folar/vllm/serve-companion.sh"
     companion_vllm_systemd_unit: str = "vllm-companion@"
     companion_registry_path: Path = REPO_ROOT / "data" / "vllm_models_companion.yaml"
@@ -411,6 +424,7 @@ class Settings(BaseSettings):
                     vllm_systemd_unit=self.companion_vllm_systemd_unit,
                     registry_path=self.companion_registry_path,
                     enabled=True,
+                    vllm_enabled=self.companion_vllm_enabled,
                     default_server=self.companion_default_server,
                     default_model=self.companion_default_model,
                     idle_unload_enabled=self.companion_idle_unload_enabled,

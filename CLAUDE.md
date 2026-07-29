@@ -18,6 +18,13 @@ does **not** reimplement either server (vLLM lifecycle still goes through `serve
   a Windows service; vLLM lives in **WSL2** (Ubuntu-24.04) and is driven over `wsl.exe`.
 - **Primary lane** = RTX 3090 (24 GB). **Companion lane** (optional, off by default) =
   RTX 3070 Ti (8 GB). Lanes are independent and never evict each other.
+  The companion is **Ollama-only** (`COMPANION_VLLM_ENABLED=false`): its
+  `serve-companion.sh` was specified in `deploy/vllm-companion@.service` but never
+  written, so `LaneConfig.vllm_enabled=False` makes that explicit — doctor reports
+  configuration instead of a permanent FAIL, the catalogs (`/api/models`,
+  `/v1/models`) stop advertising aliases that cannot launch, both resolvers skip
+  the lane's vLLM registry, and `_load_vllm` refuses BEFORE evicting the lane's
+  working Ollama model. Build the script and flip the flag to re-enable.
 - Canonical operational docs: the homelab wiki page
   `hosts/ollama-host/services/llmconfig` (and `hosts/ollama-host`). The repo is the
   source of truth for code; the wiki for how it's deployed on `.40`.

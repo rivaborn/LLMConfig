@@ -1,6 +1,9 @@
 """Companion-lane behavior: the two lanes are independent, the per-lane vLLM stop is
 scoped (no cross-kill), and a configured default auto-loads.
 """
+import asyncio
+import time
+
 import llmconfig.backends.vllm as vllm_mod
 import llmconfig.lane as lane_mod
 from llmconfig.backends.vllm import VllmBackend
@@ -124,6 +127,10 @@ def _make(monkeypatch, tmp_path):
         _env_file=None,
         gpu_uuid="GPU-P",
         companion_enabled=True,
+        # These tests exercise the companion's vLLM half (invariant 2: the stop is
+        # lane-scoped, no cross-kill), so they opt in explicitly — the real box
+        # ships it off because serve-companion.sh does not exist.
+        companion_vllm_enabled=True,
         companion_gpu_uuid="GPU-C",
         registry_path=tmp_path / "p.yaml",
         companion_registry_path=tmp_path / "c.yaml",
@@ -369,3 +376,104 @@ def test_garbled_models_list_is_not_a_tombstone(tmp_path):
     path.write_text("lanes:\n  primary:\n    models: [{}, 3]\n", encoding="utf-8")
     d = LaneDefaults(Settings(_env_file=None), path=path)
     assert d.entries_or_none("primary") is None
+
+
+# --------------------------------------------------------------------------- #
+# Ollama-only lane (COMPANION_VLLM_ENABLED=false)
+# --------------------------------------------------------------------------- #
+def _ollama_only_settings(tmp_path):
+    return Settings(_env_file=None, gpu_uuid="GPU-x",
+                    registry_path=tmp_path / "reg.yaml",
+                    companion_enabled=True, companion_gpu_uuid="GPU-y",
+                    companion_registry_path=tmp_path / "comp.yaml")
+
+
+def test_companion_vllm_is_off_by_default_and_primary_is_not(tmp_path):
+    """serve-companion.sh has never existed, so the honest default is off."""
+    lanes = {c.id: c for c in _ollama_only_settings(tmp_path).lanes()}
+    assert lanes["companion"].vllm_enabled is False
+    assert lanes["primary"].vllm_enabled is True
+
+
+async def test_vllm_load_on_an_ollama_only_lane_refuses_without_evicting(tmp_path, monkeypatch):
+    """The point of the flag: the OLD order held WSL open, unloaded the lane's
+    working Ollama model and drained VRAM before discovering the systemd unit was
+    missing — a request for a model that can never run killed the running one."""
+    import llmconfig.lane as lane_mod
+    from llmconfig.jobs import JobManager
+    from llmconfig.orchestrator import Orchestrator
+    from llmconfig.registry import Registry
+    from llmconfig.schemas import LoadRequest
+
+    async def fake_query_gpu(set_=None, uuid=None, **kw):
+        from llmconfig.gpu import GpuInfo
+        return GpuInfo(found=True, uuid=uuid or "GPU-y", total_mb=8192,
+                       used_mb=300, free_mb=7892)
+
+    monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)
+    s = _ollama_only_settings(tmp_path)
+    orch = Orchestrator(s, Registry(s.registry_path), JobManager())
+    lane = orch.lanes["companion"]
+
+    evicted: list[str] = []
+    stopped: list[str] = []
+
+    async def no_unload():
+        evicted.append("ollama")
+        return []
+
+    async def no_stop():
+        stopped.append("vllm")
+
+    monkeypatch.setattr(lane.ollama, "unload_all", no_unload)
+    monkeypatch.setattr(lane.vllm, "stop", no_stop)
+    monkeypatch.setattr(lane.keepalive, "ensure", lambda: True)
+
+    job = lane.load(LoadRequest(server="vllm", model="smoke", lane="companion"))
+    deadline = time.monotonic() + 10
+    while job.state in ("pending", "running") and time.monotonic() < deadline:
+        await asyncio.sleep(0.01)
+
+    assert job.state == "failed"
+    assert "not available on the companion lane" in (job.error or "")
+    assert evicted == [], "must refuse BEFORE touching the Ollama resident"
+    assert stopped == [], "and before any WSL round-trip"
+
+
+async def test_ollama_only_lane_never_probes_its_dead_relay(tmp_path, monkeypatch):
+    """A down relay blackholes the SYN (invariant 5), so probing one that will
+    never exist costs the full timeout on every /api/status."""
+    import llmconfig.lane as lane_mod
+    from llmconfig.jobs import JobManager
+    from llmconfig.orchestrator import Orchestrator
+    from llmconfig.registry import Registry
+
+    async def fake_query_gpu(set_=None, uuid=None, **kw):
+        from llmconfig.gpu import GpuInfo
+        return GpuInfo(found=True, uuid=uuid or "GPU-y", total_mb=8192,
+                       used_mb=300, free_mb=7892)
+
+    monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)
+    s = _ollama_only_settings(tmp_path)
+    orch = Orchestrator(s, Registry(s.registry_path), JobManager())
+    lane = orch.lanes["companion"]
+
+    probes: list[str] = []
+
+    async def counted_served_info():
+        probes.append("probe")
+        raise AssertionError("the relay must not be probed on an Ollama-only lane")
+
+    async def no_ollama():
+        return []
+
+    async def ollama_up():
+        return True
+
+    monkeypatch.setattr(lane.vllm, "served_info", counted_served_info)
+    monkeypatch.setattr(lane.ollama, "loaded", no_ollama)
+    monkeypatch.setattr(lane.ollama, "up", ollama_up)
+
+    st = await lane.status()
+    assert probes == []
+    assert st.owner == "free" and st.vllm_up is False

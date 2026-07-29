@@ -113,7 +113,11 @@ def _make(monkeypatch, tmp_path, *, two_lanes=False, mon=None, **overrides):
     settings = Settings(
         _env_file=None, gpu_uuid="GPU-x", registry_path=tmp_path / "reg.yaml",
         evict_timeout_s=5, poll_interval_s=0.01,
+        # companion_vllm_enabled: these tests drive the companion's vLLM half
+        # (keepalive accounting across lanes); the real box ships it off because
+        # serve-companion.sh does not exist.
         **({"companion_enabled": True, "companion_gpu_uuid": "GPU-y",
+            "companion_vllm_enabled": True,
             "companion_registry_path": tmp_path / "comp.yaml"} if two_lanes else {}),
         **overrides,
     )

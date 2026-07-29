@@ -100,8 +100,10 @@ class OpenAIGateway:
                 return ("spark", fallback, lane.cfg.api_base)
             return None
         # vLLM: match the served_name; prefer a non-blocked alias if several ever share one.
+        # Skipped entirely on an Ollama-only lane — resolving there would send the
+        # request down a load path that cannot succeed.
         match: Optional[str] = None
-        for e in lane.registry.entries():
+        for e in (lane.registry.entries() if lane.cfg.vllm_enabled else []):
             if (e.served_name or e.alias) == model:
                 if e.status != "blocked":
                     return ("vllm", e.alias, lane.cfg.vllm_relay_url)
@@ -859,8 +861,9 @@ class OpenAIGateway:
                 for se in lane.registry.entries():
                     tagged.append((se.served_name or se.alias, f"Spark {lane.cfg.name}"))
             else:
-                for e in lane.registry.entries():
-                    tagged.append((e.served_name or e.alias, "vLLM"))
+                if lane.cfg.vllm_enabled:      # Ollama-only lanes list no aliases
+                    for e in lane.registry.entries():
+                        tagged.append((e.served_name or e.alias, "vLLM"))
                 try:
                     for m in await lane.ollama.list_models():
                         if m.name:

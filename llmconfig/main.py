@@ -220,10 +220,15 @@ def create_app() -> FastAPI:
             resp.ollama = await ln.ollama.list_models()
         except Exception as e:
             resp.ollama_error = f"{type(e).__name__}: {e}"
-        try:
-            resp.vllm = await ln.vllm.list_aliases()
-        except Exception as e:
-            resp.vllm_error = f"{type(e).__name__}: {e}"
+        if ln.cfg.vllm_enabled:
+            try:
+                resp.vllm = await ln.vllm.list_aliases()
+            except Exception as e:
+                resp.vllm_error = f"{type(e).__name__}: {e}"
+        else:
+            # Ollama-only lane: advertising aliases that cannot launch invites a
+            # request that would evict the working Ollama model and then fail.
+            resp.vllm_error = "vLLM is not available on this lane (Ollama-only)"
         return resp
 
     @app.get("/api/gpu", response_model=GpuOut)

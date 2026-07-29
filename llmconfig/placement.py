@@ -549,7 +549,8 @@ class Placer:
                 if hit(e):
                     return ("spark", e.alias, e)
             return None
-        for e in unit.registry.entries():
+        # Ollama-only lane: its vLLM catalog is not a candidate source at all.
+        for e in (unit.registry.entries() if unit.cfg.vllm_enabled else []):
             if hit(e):
                 return ("vllm", e.alias, None)
         if ":" in model:

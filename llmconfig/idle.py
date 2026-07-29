@@ -227,7 +227,9 @@ class IdleReaper:
             return
         lanes = list(self.orch.lanes.values())
         for lane in lanes:
-            if await lane.vllm.up():
+            # An Ollama-only lane can never be serving vLLM, and probing its dead
+            # relay costs a blackholed SYN (invariant 5) on every reaper tick.
+            if lane.cfg.vllm_enabled and await lane.vllm.up():
                 return
         if any(lane._lock.locked() for lane in lanes):
             return

@@ -577,7 +577,8 @@ class FakeLane:
     """Duck-typed GPU lane: no declared_budgets, registry + ollama only."""
 
     def __init__(self, uid, tags=(), fail=False):
-        self.cfg = SimpleNamespace(id=uid, gpu_uuid=f"GPU-{uid}", enabled=True)
+        self.cfg = SimpleNamespace(id=uid, gpu_uuid=f"GPU-{uid}", enabled=True,
+                                   vllm_enabled=True)
         self.registry = SimpleNamespace(entries=lambda: [])
         self.calls = {"n": 0}
         self._tags, self._fail = list(tags), fail
