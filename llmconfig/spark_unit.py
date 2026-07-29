@@ -318,6 +318,33 @@ class SparkUnit:
                 await self.spark.stop()
                 slots, resident = {}, {}
 
+        # `needs_empty_node`: this recipe must be the ONLY thing launching on the
+        # node. Budgets cannot express why — the danger is at LAUNCH time and is
+        # driver-level, not arithmetic: the reranker's fastsafetensors path kills
+        # co-residents outright, and gemma's quantize-at-load transient (~74 GB)
+        # trips Ray's 95% ceiling and takes neighbours with it. Enforced HERE, in
+        # the one place every load path funnels through (boot autoload, /api/load,
+        # the gateway, placement) — the cookbook's apply already frees the node
+        # first, but nothing else did, so a boot autoload happily launched the
+        # reranker beside a resident gemma and destroyed it (live, 2026-07-28:
+        # spark1 lost gemma AND the reranker then failed on negative KV).
+        if entry.needs_empty_node and slots:
+            others = ", ".join(sorted(sm.name for sm in slots.values() if sm.name))
+            if not req.force:
+                raise RuntimeError(
+                    f"'{entry.alias}' must launch on an empty node (needs_empty_node) "
+                    f"but {self.cfg.name} still holds {others}. Launching it beside a "
+                    f"resident kills the resident at driver level — free the node "
+                    f"first (POST /api/unload with no model), or apply a cookbook "
+                    f"state, which rebuilds the node in a safe order. "
+                    f"force=true overrides at that risk."
+                )
+            self.jobs.log(
+                job,
+                f"WARNING: force=true — launching {entry.alias} beside {others}; "
+                f"this recipe is documented to kill co-residents at driver level",
+            )
+
         await self._admit(entry, slots)
         port = self._free_slot(slots)
         if port is None:

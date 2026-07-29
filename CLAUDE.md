@@ -313,6 +313,18 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    catalog entries budgeted or they silently monopolise a node. The UI's gray-out
    (`SparkModel.addable`) is computed in `SparkBackend.list_models` beside this same
    arithmetic (`declared_budgets`) — never re-implement it client-side.
+   **`needs_empty_node` is the second half of admission and is NOT arithmetic.**
+   Some recipes are lethal to co-residents at LAUNCH regardless of budgets: the
+   reranker's fastsafetensors path kills them at driver level, gemma's
+   quantize-at-load transient (~74 GB) trips Ray's 95% ceiling. `SparkUnit._load`
+   refuses such a load while anything is resident (after victims/reload-stop/tp>1
+   sweep, before `_admit`); `force=true` overrides with a loud job-log warning.
+   It lives in `_load` because EVERY path funnels there — the cookbook's apply
+   frees the node first, but the boot autoload did not, and on 2026-07-28 it
+   launched the reranker beside a resident gemma and destroyed it (0.35 + 0.40
+   fits, which is exactly why budgets can't catch this). `placement.py` mirrors it
+   by treating `needs_empty_node` as a `whole_node` claim so ranking stops
+   proposing populated nodes.
 17. **Nothing may wait on WSL without a bound, and the boot restore is gated.**
     Windows Update auto-restarted the box at 00:29 on 2026-07-28 (its permitted
     window is 00:00-06:00; no AU policy is set, so this recurs). The box was back in

@@ -677,6 +677,60 @@ async def test_loading_a_second_model_does_not_stop_the_first(cfg, monkeypatch):
 
 
 @respx.mock
+async def test_needs_empty_node_model_is_refused_beside_a_resident(cfg, monkeypatch):
+    """Budgets cannot express this: the danger is at LAUNCH and driver-level.
+    Live on 2026-07-28 the boot autoload launched the reranker beside a resident
+    gemma (0.35 + 0.40 fits!) and destroyed it — spark1 lost gemma and the
+    reranker then failed on negative KV."""
+    reg = SparkRegistry(cfg.registry_path)
+    reg.upsert(SparkModelEntry(alias="m1", recipe="recipe-1", served_name="served-1",
+                               load_timeout_s=5, mem_fraction=0.4))
+    reg.upsert(SparkModelEntry(alias="solo", recipe="recipe-solo", served_name="served-solo",
+                               load_timeout_s=5, mem_fraction=0.35, needs_empty_node=True))
+    unit = SparkUnit(Settings(_env_file=None), cfg, reg, JobManager())
+    state, calls = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="solo", lane="spark1")))
+
+    assert job.state == "failed"
+    assert "empty node" in (job.error or "") and "served-1" in (job.error or "")
+    assert not any("sparkrun run" in c for c in calls), "must refuse BEFORE launching"
+    assert state == {8000: "served-1"}, "the resident is untouched"
+
+
+@respx.mock
+async def test_needs_empty_node_model_loads_on_an_empty_node(cfg, monkeypatch):
+    reg = SparkRegistry(cfg.registry_path)
+    reg.upsert(SparkModelEntry(alias="solo", recipe="recipe-solo", served_name="served-solo",
+                               load_timeout_s=5, mem_fraction=0.35, needs_empty_node=True))
+    unit = SparkUnit(Settings(_env_file=None), cfg, reg, JobManager())
+    state, calls = stateful_node(monkeypatch, cfg, {})
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="solo", lane="spark1")))
+
+    assert job.state == "succeeded", job.error
+    assert state == {8000: "served-solo"}
+
+
+@respx.mock
+async def test_needs_empty_node_force_overrides_with_a_loud_warning(cfg, monkeypatch):
+    reg = SparkRegistry(cfg.registry_path)
+    reg.upsert(SparkModelEntry(alias="m1", recipe="recipe-1", served_name="served-1",
+                               load_timeout_s=5, mem_fraction=0.4))
+    reg.upsert(SparkModelEntry(alias="solo", recipe="recipe-solo", served_name="served-solo",
+                               load_timeout_s=5, mem_fraction=0.35, needs_empty_node=True))
+    unit = SparkUnit(Settings(_env_file=None), cfg, reg, JobManager())
+    state, calls = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+
+    job = await wait_job(unit.load(
+        LoadRequest(server="spark", model="solo", lane="spark1", force=True)))
+
+    assert job.state == "succeeded", job.error
+    assert any("WARNING" in str(l) and "kill co-residents" in str(l) for l in job.log), \
+        "an override this dangerous must say so in the job log"
+
+
+@respx.mock
 async def test_second_model_is_refused_when_the_budget_will_not_fit(cfg, monkeypatch):
     """Admission control is the only thing between co-residency and an OOM at
     load: a Spark has no eviction-wait gate to observe memory beforehand."""

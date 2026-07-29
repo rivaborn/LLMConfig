@@ -646,7 +646,13 @@ class Placer:
                 ))
         committed = sum(r.budget for r in residents) + self._inflight_budget(unit, st)
         want = entry.mem_fraction if entry is not None else 0.0
-        whole_node = bool(entry is not None and (entry.tp > 1 or want <= 0.0)) if is_spark else False
+        # `needs_empty_node` gets the same PLACEMENT semantics as a whole-node
+        # claim — only an empty node (or one whose residents are all evictable)
+        # qualifies. Without this, placement would keep choosing a populated node
+        # that `_load` is now guaranteed to refuse, burning the single re-place.
+        whole_node = bool(entry is not None
+                          and (entry.tp > 1 or want <= 0.0
+                               or getattr(entry, "needs_empty_node", False))) if is_spark else False
         free_slot = (len(st.loaded_models) < getattr(unit.cfg, "max_models", 1)) if is_spark else True
         proven, fail_blocked, fail_count, est_s = self._gate_facts(
             unit, server, load_arg, is_spark, spark_resident, residents)

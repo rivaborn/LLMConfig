@@ -318,6 +318,27 @@ async def test_placer_server_constraint_filters_candidates():
     assert d.outcome == "not_found", "the /api/load server kind constrains candidates"
 
 
+async def test_placer_treats_needs_empty_node_like_a_whole_node_claim():
+    """`_load` now REFUSES a needs_empty_node model beside a resident, so
+    placement must stop choosing populated nodes for one — otherwise every such
+    request burns its single re-place on a guaranteed refusal."""
+    solo = entry("solo", frac=0.35)
+    solo.needs_empty_node = True
+    busy = FakeSparkUnit("s1", [solo, entry("other")], served=["other"])
+    empty = FakeSparkUnit("s2", [solo], served=[])
+    d = await make_placer([busy, empty]).place("solo")
+    assert d.outcome == "place" and d.unit_id == "s2", "the populated node is skipped"
+
+    only_busy = FakeSparkUnit("s1", [solo, entry("other")], served=["other"])
+    other_busy = FakeSparkUnit("s2", [solo, entry("other")], served=["other"])
+    d2 = await make_placer([only_busy, other_busy]).place("solo")
+    # Both populated: the idle resident is an eligible victim, so tier 4 offers
+    # eviction of EVERY resident — which is exactly what an empty node means.
+    assert d2.outcome in ("place", "no_capacity")
+    if d2.outcome == "place":
+        assert d2.victims, "it may only proceed by emptying the node first"
+
+
 async def test_placer_resolves_by_alias_when_served_name_differs():
     """/api/load {lane: auto} passes ALIASES; served-name-only matching 404'd
     them (review find, 2026-07-28)."""
