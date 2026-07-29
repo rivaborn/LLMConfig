@@ -1,0 +1,84 @@
+# Curated MULTI-NODE sparkrun recipes — models that span 2-4 DGX Spark nodes as
+# one tensor-parallel job over the 200G fabric.
+#
+# Seeded into ../../data/spark_cluster_models.yaml on first run, then editable.
+#
+# These entries live ONLY here, never in a per-node catalog (and single-node
+# recipes never live here). That disjointness is load-bearing: it is what makes a
+# multi-node model resolve only on SparkGroup units and a single-node model only
+# on individual nodes, so placement needs no group-vs-member tie-breaking.
+#
+# min_nodes/max_nodes = the recipe's supported node range (sparkrun `show` reports
+# it as `Nodes: 2 - unlimited`; the `sparkrun list` Nodes column is UNRELIABLE —
+# it prints 1 for these. Trust `show`). A launch on K selected nodes passes
+# `--tp K`; capacity, not declaration, is the real ceiling (~121 GiB usable per
+# node).
+#
+# mem_fraction is deliberately unset (0.0 = whole-node claim) on every entry: a
+# tp job claims each member node entirely in v1 — cross-node co-residency
+# arithmetic for a sharded model is not modeled.
+#
+# status: "unverified" until launched and recall-tested on THIS cluster. Decode
+# figures in the notes are Spark Arena community numbers (pulled 2026-07-23), not
+# local measurements. NOTHING here can launch until the 200G switch is installed
+# and SPARK_FABRIC_ENABLED=true.
+models:
+  # The cluster's intended big-model daily driver (wiki runbook: best
+  # speed-to-capability in the 4-node set; community 39.9 t/s @2 nodes,
+  # 50.2 @4 — one of the few models that genuinely gains from 4 nodes, +26%).
+  # Long-context specialist: 43 layers x 1 KV head x 512 head_dim = 44,032
+  # B/token, 2.9x cheaper KV than MiniMax.
+  - alias: deepseek-v4-flash
+    recipe: "@eugr/deepseek-v4-flash"
+    served_name: deepseek-v4-flash
+    tp: 2                 # default topology; the launch overrides with --tp K
+    min_nodes: 2
+    max_nodes: 4
+    status: unverified
+    extra_args: ["--max-model-len", "262144"]
+    notes: >-
+      deepseek-ai/DeepSeek-V4-Flash FP8, 284B MoE / 13B active, 148.7 GB weights
+      (94.8 GB/GPU at tp2). MTP speculative decoding; tool parser deepseek_v4.
+      Weights staged in the HF cache on all four nodes 2026-07-29. START CONTEXT
+      AT 262144, NOT the recipe's 500k default: the recipe's estimator reports KV
+      as bf16 while the command passes --kv-cache-dtype fp8, and its
+      VLLM_ALLOW_LONG_MAX_MODEL_LEN=1 exists to bypass vLLM's own sanity check.
+      Also note the recipe ships max_num_seqs 4 — a single-stream posture at odds
+      with this hardware's concurrency strength — and reasoning_effort=high adds
+      thinking tokens to every request. See runbooks/local-llm-server-dgx-spark.
+    load_timeout_s: 3600
+
+  # The NVFP4/FP8 Spark-tuned variant — the fastest DS4 build in the community
+  # 4-node set (49.6 t/s @2 nodes, 57.1 @4).
+  - alias: deepseek-v4-flash-dspark
+    recipe: "@eugr/deepseek-v4-flash-dspark"
+    served_name: deepseek-v4-flash-dspark
+    tp: 2
+    min_nodes: 2
+    max_nodes: 4
+    status: unverified
+    extra_args: ["--max-model-len", "262144"]
+    notes: >-
+      deepseek-ai/DeepSeek-V4-Flash-DSpark (NVFP4/FP8 Spark build), ~155 GB on
+      disk; staged on all four nodes 2026-07-29. RECIPE ID UNVERIFIED — confirm
+      with `sparkrun search deepseek` before the first launch and correct it
+      here. Same context/KV caveats as deepseek-v4-flash.
+    load_timeout_s: 3600
+
+  # The runbook's default two-node pick: roomiest of the 2-node set (118.4 GB,
+  # 71.2 GB/GPU at tp2 — headroom for concurrency), NEXTN speculative decoding,
+  # same parser family as the rest of the lab's coder fleet.
+  - alias: qwen35-122b-fp8
+    recipe: "@sparkrun-transitional/qwen3.5-122b-a10b-fp8-sglang"
+    served_name: qwen35-122b-fp8
+    tp: 2
+    min_nodes: 2
+    max_nodes: 2
+    status: unverified
+    notes: >-
+      Qwen3.5-122B-A10B FP8 via SGLang, 118.4 GB weights, ~10B active. NEXTN
+      speculative; tool parser qwen3_coder. The INT4 build of this model runs on
+      ONE node (per-node catalogs) — this FP8 build is a quality upgrade that
+      needs two, not a speed upgrade ("fewest nodes that fit" still favors the
+      INT4 single-node build for throughput).
+    load_timeout_s: 3600

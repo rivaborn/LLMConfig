@@ -151,7 +151,7 @@ class SparkBackend:
         r = await self._ssh("true", timeout=10.0)
         return r.rc == 0
 
-    async def list_models(self) -> list[SparkModel]:
+    async def list_models(self, claim=None) -> list[SparkModel]:
         """Catalog with residency AND addability.
 
         `addable`/`add_note` are computed here, beside the same declared-budget
@@ -159,6 +159,12 @@ class SparkBackend:
         reason a load would be refused — computed in one place, never
         re-implemented client-side (invariant 14). Notes deliberately mirror
         `_admit`'s error messages.
+
+        `claim` (a GroupClaim, passed by the REST layer from the unit's shared
+        group state) grays EVERYTHING: a node in a live multi-node deployment
+        refuses every load in `_admit`, and on a worker rank the slot probe alone
+        cannot see why — the job's containers are here but only the group's head
+        answers HTTP.
         """
         slots = await self.served_slots()
         by_name = {sm.name: port for port, sm in slots.items() if sm.name}
@@ -175,15 +181,27 @@ class SparkBackend:
             port = by_name.get(pub.served_name)
             pub.loaded = port is not None
             pub.port = port or 0
-            if pub.loaded:
+            if claim is not None:
+                pub.addable = False
+                pub.add_note = (f"node claimed by the multi-node deployment "
+                                f"{claim.group_id} ({claim.model}) — free it via "
+                                f"the Cluster tab first")
+            elif entry.tp > 1 or entry.min_nodes > 1:
+                # A multi-node recipe does not belong in a per-node catalog (the
+                # cluster catalog is where those live — the disjointness is what
+                # keeps placement's group/single partition honest). The old rung
+                # here said "frees the whole node first" and would have launched
+                # a tp-K job confined to ONE host.
+                pub.addable = False
+                pub.add_note = ("multi-node recipe — move it to the cluster catalog "
+                                "and launch from the Cluster tab")
+            elif pub.loaded:
                 # A reload frees its own slot first — never grayed.
                 pub.addable, pub.add_note = True, "loaded — reload replaces in place"
             elif not by_name:
                 pub.addable = True
                 if entry.needs_empty_node:
                     pub.add_note = "must be the FIRST model on a node (it is)"
-            elif entry.tp > 1:
-                pub.addable, pub.add_note = True, f"{entry.tp}-node recipe — frees the whole node first"
             elif entry.needs_empty_node:
                 pub.addable = False
                 pub.add_note = "must launch on an EMPTY node (load-order landmine — see runbook)"
@@ -225,7 +243,8 @@ class SparkBackend:
 
     async def run_recipe(self, recipe: str, tp: int = 1, extra: list[str] | None = None,
                          served: str = "", port: Optional[int] = None,
-                         mem_fraction: float = 0.0, timeout: Optional[float] = None):
+                         mem_fraction: float = 0.0, timeout: Optional[float] = None,
+                         hosts: list[str] | None = None):
         """Launch a workload on this node. Returns the raw CmdResult.
 
         `served` pins `--served-model-name`, so the node reports exactly the name
@@ -236,18 +255,34 @@ class SparkBackend:
         only ever be the node's single occupant. `mem_fraction`, when set, becomes
         `--gpu-mem` — the declared budget that lets models coexist, since vLLM
         preallocates and a recipe's own default is typically 0.7-0.85 of the pool.
+
+        `hosts` switches to the MULTI-NODE template (`spark_run_multi_cmd`): one
+        tensor-parallel job across every listed address (head — this backend's
+        node — first), `--tp` = the node count. Only `SparkGroup` passes it; a
+        single-node load keeps the verified single-host template untouched.
         """
         args = list(extra or [])
         if mem_fraction:
             args += ["--gpu-mem", str(mem_fraction)]
-        cmd = self._fmt(
-            self.s.spark_run_cmd,
-            recipe=shlex.quote(recipe),
-            tp=int(tp or 1),
-            served=shlex.quote(served or recipe),
-            extra=" ".join(args),
-            **({"port": int(port)} if port else {}),
-        )
+        if hosts:
+            cmd = self._fmt(
+                self.s.spark_run_multi_cmd,
+                recipe=shlex.quote(recipe),
+                hosts=",".join(hosts),
+                tp=int(tp or len(hosts)),
+                served=shlex.quote(served or recipe),
+                extra=" ".join(args),
+                **({"port": int(port)} if port else {}),
+            )
+        else:
+            cmd = self._fmt(
+                self.s.spark_run_cmd,
+                recipe=shlex.quote(recipe),
+                tp=int(tp or 1),
+                served=shlex.quote(served or recipe),
+                extra=" ".join(args),
+                **({"port": int(port)} if port else {}),
+            )
         # Generous timeout: sparkrun pulls — or on some recipes BUILDS — the
         # Docker image before the container starts, and the per-recipe budget
         # knows that cost better than the node default (gemma declares 3600 s,
@@ -258,7 +293,8 @@ class SparkBackend:
 
     _JOB_RE = re.compile(r"^Job:\s+(\S+)\s+\(tp=\d+\)\s+\[([0-9a-f]+)\]")
 
-    async def _job_id_for(self, recipe: str) -> Optional[str]:
+    async def _job_id_for(self, recipe: str,
+                          any_host_of: set[str] | None = None) -> Optional[str]:
         """The sparkrun job id running `recipe` on THIS host, from `sparkrun status`.
 
         Needed because `sparkrun stop <recipe> --hosts` claims success and stops
@@ -267,7 +303,13 @@ class SparkBackend:
 
             Job: @official/… (tp=1) [03d5c9f36a39] (1 container(s))
               solo       192.168.1.53   Up 9 hours   sparkrun-eugr-vllm-tf5
+
+        `any_host_of` widens the host match for a MULTI-NODE job: its containers
+        are listed on several hosts under one Job header, and it counts as "ours"
+        if ANY member address appears — matching only this backend's host would
+        miss a job whose listing happens to order another member first.
         """
+        hosts = any_host_of or {self.cfg.host}
         r = await run_wsl(self._fmt(self.s.spark_status_cmd), login=True,
                           timeout=60.0, settings=self.s)
         current: Optional[tuple[str, str]] = None       # (recipe, job_id)
@@ -276,20 +318,27 @@ class SparkBackend:
             if m:
                 current = (m.group(1), m.group(2))
                 continue
-            if current and self.cfg.host in line.split() and current[0] == recipe:
+            # Exact TOKEN match, not substring: `192.168.1.5` would otherwise
+            # match a line listing `192.168.1.50`.
+            if current and current[0] == recipe and any(h in line.split() for h in hosts):
                 return current[1]
         return None
 
-    async def stop(self, recipe: Optional[str] = None):
+    async def stop(self, recipe: Optional[str] = None,
+                   any_host_of: set[str] | None = None):
         """Stop workloads on this node.
 
         With `recipe`, resolves it to the sparkrun JOB ID first and stops that —
         leaving co-residents running. Without it, `--all` frees the entire node.
         `sparkrun stop` swallows SSH failures into rc=0, so callers verify via
         the slot probe (the unload path re-probes status), never the exit code.
+
+        `any_host_of` (multi-node jobs) widens the job lookup to any member host —
+        `spark_stop_job_cmd` is already cluster-wide, so stopping by id tears down
+        every rank's container regardless of which backend issued it.
         """
         if recipe:
-            job = await self._job_id_for(recipe)
+            job = await self._job_id_for(recipe, any_host_of=any_host_of)
             if job is None:
                 # Nothing tracked for this recipe here — already gone, or an
                 # orphan sparkrun can't see either. The caller's re-probe decides.

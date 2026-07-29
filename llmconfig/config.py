@@ -107,6 +107,64 @@ class SparkConfig:
         return f"spark:{self.id}"
 
 
+@dataclass(frozen=True)
+class SparkGroupConfig:
+    """A SET of Spark nodes serving ONE tensor-parallel model over the 200G fabric.
+
+    Synthetic and UI-invisible: a `SparkGroup` built from this lives in
+    `orch.units` (so placement, leases, and the /v1 gateway treat it like any
+    unit) but is never emitted by `settings.units()` — the UI's tab/card source —
+    and is filtered out of `/api/status` lanes. The members' own cards carry the
+    residency (`LoadedModel.group`).
+
+    The id is the sorted member ids joined with "_" (`spark1_spark2`): URL-safe
+    ("+" would decode to a space in query strings), collision-free with node ids
+    and the reserved "auto". The HEAD is the first member in settings order — a
+    tp job serves /v1 from one rank, and that is the endpoint `status()` probes
+    and the gateway routes to.
+    """
+
+    id: str                        # "spark1_spark2"
+    name: str                      # display label, e.g. "Sparks 1+2"
+    member_ids: tuple[str, ...]    # sorted member unit ids
+    head_host: str                 # the head member's LAN address
+    api_port: int                  # the head's base port — the group's serve port
+    enabled: bool = True
+    max_models: int = 1            # a tp job claims every member whole
+    # A group has no Ollama/vLLM halves. Declared explicitly (rather than left
+    # absent) so any code path that reaches for the lane shape degrades to
+    # "not available" instead of raising AttributeError.
+    vllm_enabled: bool = False
+    default_model: str = ""        # groups are never auto-loaded at startup
+    # Groups are never idle-reaped in v1 (same rationale as single Sparks, ×K:
+    # reloading costs minutes per node and idle nodes draw ~25 W).
+    idle_unload_enabled: bool = False
+    # Multi-node cold starts move hundreds of GB and synchronize K ranks; give
+    # them far more rope than a single node's default.
+    load_timeout_s: int = 3600
+    kind: str = "spark_group"
+
+    def api_base_for(self, port: int) -> str:
+        """The endpoint the group's model is reachable at — always on the HEAD.
+        Signature-compatible with SparkConfig so the gateway's `_route` needs no
+        special case."""
+        return f"http://{self.head_host}:{port}"
+
+    @property
+    def api_base(self) -> str:
+        return self.api_base_for(self.api_port)
+
+    @property
+    def gpu_uuid(self) -> str:
+        """Synthetic telemetry key, mirroring SparkConfig's convention."""
+        return f"sparkgroup:{self.id}"
+
+
+def group_id_for(member_ids: list[str] | tuple[str, ...]) -> str:
+    """The canonical group id for a node set: sorted, joined with '_'."""
+    return "_".join(sorted(member_ids))
+
+
 def _parse_spark_nodes(spec: str) -> list[tuple[str, str, str]]:
     """Parse `SPARK_NODES` → [(id, host, name)].
 
@@ -277,6 +335,33 @@ class Settings(BaseSettings):
     spark_stop_one_cmd: str = "sparkrun stop {recipe} --cluster {cluster} --hosts {host}"  # broken; kept for reference
     spark_stop_job_cmd: str = "sparkrun stop {job} --cluster {cluster}"
     spark_status_cmd: str = "sparkrun status --cluster {cluster}"
+    # --- multi-node (SparkGroup) launches over the 200G fabric ---
+    # Master gate. False (the default) makes the whole multi-node feature inert:
+    # no SparkGroup units exist, placement behaves byte-for-byte as before, and
+    # POST /api/cluster/load refuses — the Cluster tab still renders as a planner.
+    # Flip to true once the 200G switch is installed and `sparkrun setup cx7` has
+    # brought the fabric up.
+    spark_fabric_enabled: bool = False
+    # The multi-host launch template. {hosts} = comma-joined member addresses in
+    # member order (head first); {tp} = the member count K. Mirrors spark_run_cmd
+    # otherwise — same load-bearing flags, same reasons.
+    # ⚠ UNVERIFIED against a live multi-node sparkrun (the fabric isn't up to
+    # --dry-run against): comma-joined --hosts is the documented form, but re-verify
+    # with `sparkrun run <recipe> --dry-run --cluster sparks --hosts h1,h2 --tp 2`
+    # before the first real launch, and correct THIS SETTING in .env if it moved.
+    spark_run_multi_cmd: str = (
+        "sparkrun run {recipe} --cluster {cluster} --hosts {hosts} --tp {tp} "
+        "--port {port} --served-model-name {served} --no-follow {extra}"
+    )
+    # The cluster-wide catalog of multi-node recipes (min_nodes > 1). Deliberately
+    # SEPARATE from the per-node catalogs: a multi-node model must resolve only on
+    # SparkGroup units and a single-node model only on individual nodes — keeping
+    # the two lists disjoint is what makes that partition hold with no ranking
+    # special-cases.
+    spark_cluster_registry_path: Path = REPO_ROOT / "data" / "spark_cluster_models.yaml"
+    # Where successful (model, node-set) placements are recorded — the memory
+    # behind "loaded once ⇒ listed on those cards and available to auto-placement".
+    spark_group_state_path: Path = REPO_ROOT / "data" / "spark_group_state.yaml"
     # Remote telemetry: plain SSH to the node (the control node's WSL already has
     # passwordless key auth to every Spark).
     spark_ssh_cmd: str = "ssh -o BatchMode=yes -o ConnectTimeout=5 {user}@{host} {command}"
@@ -464,9 +549,41 @@ class Settings(BaseSettings):
         """Every LLM unit in display order: local GPU lanes first, then Sparks.
 
         This is the list the UI turns into tabs and dashboard cards; `lanes()` and
-        `sparks()` remain available for code that needs only one kind.
+        `sparks()` remain available for code that needs only one kind. SparkGroups
+        are deliberately ABSENT — they are synthetic orchestrator-level units with
+        no tab or card of their own (see SparkGroupConfig).
         """
         return [*self.lanes(), *self.sparks()]
+
+    def spark_group_config(self, member_ids: list[str] | tuple[str, ...]) -> SparkGroupConfig:
+        """Build the config for a group over `member_ids` (order-insensitive).
+
+        Raises ValueError on an unknown/disabled member or a set of fewer than two
+        nodes — the callers (orchestrator startup + POST /api/cluster/load) surface
+        that as a 4xx rather than half-creating a unit.
+        """
+        ids = sorted(set(member_ids))
+        if len(ids) < 2:
+            raise ValueError(f"a spark group needs at least 2 members, got {ids}")
+        by_id = {c.id: c for c in self.sparks()}
+        missing = [i for i in ids if i not in by_id]
+        if missing:
+            raise ValueError(
+                f"unknown spark node(s) {missing} (have: {', '.join(by_id) or 'none — SPARK_ENABLED off?'})"
+            )
+        head = by_id[ids[0]]
+        ordinals = [
+            "".join(ch for ch in i if ch.isdigit()) or i
+            for i in ids
+        ]
+        return SparkGroupConfig(
+            id=group_id_for(ids),
+            name=f"Sparks {'+'.join(ordinals)}",
+            member_ids=tuple(ids),
+            head_host=head.host,
+            api_port=head.api_port,
+            load_timeout_s=max(3600, self.spark_load_timeout_s),
+        )
 
 
 @lru_cache

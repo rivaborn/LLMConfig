@@ -1,13 +1,18 @@
 """Coordinator over every LLM unit.
 
-Two kinds of unit exist and the orchestrator is what makes them interchangeable:
+Three kinds of unit exist and the orchestrator is what makes them interchangeable:
 
 * a **`Lane`** (`lane.py`) — one local card arbitrated Ollama-XOR-vLLM, with the
   eviction-wait gate. The RTX 3090 (`primary`) and RTX 3070 Ti (`companion`).
 * a **`SparkUnit`** (`spark_unit.py`) — one remote DGX Spark node driven by
   `sparkrun`. The node is the unit; no local GPU, no keepalive.
+* a **`SparkGroup`** (`spark_group.py`) — a SET of Spark nodes serving one
+  tensor-parallel model over the 200G fabric. SYNTHETIC: it participates in
+  placement/leases/the gateway like any unit but has no UI tab or card
+  (`settings.units()` never emits it) and is filtered out of `/api/status`
+  lanes. Exists only when `SPARK_FABRIC_ENABLED` is on.
 
-Both satisfy the same duck-typed contract (see `UNIT_METHODS`), so routing,
+All satisfy the same duck-typed contract (see `UNIT_METHODS`), so routing,
 status aggregation, defaults, and autoload are written once against `self.units`.
 `self.lanes` still exposes only the GPU lanes, because the WSL keepalive and the
 Ollama/vLLM back-compat shims are meaningless for a remote node.
@@ -20,16 +25,19 @@ from typing import Optional, Union
 from .backends.ollama import OllamaBackend
 from .backends.vllm import VllmBackend
 from .config import Settings, SparkConfig
+from .group_state import GroupPlacements, GroupState
 from .jobs import JobManager
 from .gpu import GpuInfo, query_all_gpus
 from .lane import Lane
 from .lane_state import LaneDefaults
-from .registry import DEFAULT_COMPANION_REGISTRY, Registry, SparkRegistry
+from .registry import (DEFAULT_COMPANION_REGISTRY, DEFAULT_SPARK_CLUSTER_REGISTRY,
+                       Registry, SparkRegistry)
 from .schemas import Job, LaneStatus, LoadRequest, StatusResponse, UnloadRequest
+from .spark_group import SparkGroup
 from .spark_unit import SparkUnit
 from .wsl import WslKeepalive
 
-Unit = Union[Lane, SparkUnit]
+Unit = Union[Lane, SparkUnit, SparkGroup]
 
 # The duck-typed surface every unit must provide. Kept here as documentation and
 # as the assertion target in tests — there is no ABC, because `Lane` predates the
@@ -57,6 +65,32 @@ class Orchestrator:
         for scfg in settings.sparks():
             self.units[scfg.id] = SparkUnit(settings, scfg, SparkRegistry(scfg.registry_path), jobs)
 
+        # Multi-node (SparkGroup) plumbing. The shared claim table and the
+        # placement memory exist regardless of the fabric flag — the Cluster tab's
+        # planner reads placements even while launches are gated — but GROUP UNITS
+        # exist only when the fabric is up: with the flag off, orch.units is
+        # byte-for-byte what it always was, so placement/status cannot change.
+        self.group_state = GroupState()
+        self.group_placements = GroupPlacements(settings.spark_group_state_path)
+        self.cluster_registry = SparkRegistry(
+            settings.spark_cluster_registry_path,
+            default_path=DEFAULT_SPARK_CLUSTER_REGISTRY,
+        ) if settings.spark_enabled else None
+        for u in self.units.values():
+            if isinstance(u, SparkUnit):
+                u.group_state = self.group_state
+        if settings.spark_enabled and settings.spark_fabric_enabled:
+            # Re-instantiate a group per RECORDED node set, so a model that has
+            # loaded on that set before is a standing auto-placement candidate
+            # after a restart without anyone re-launching by hand first.
+            for member_ids in self.group_placements.node_sets():
+                try:
+                    self.get_or_create_group(list(member_ids))
+                except ValueError:
+                    # A recorded set naming a node that is no longer configured —
+                    # stale memory must not stop the app from starting.
+                    continue
+
     # ---- unit access ----
     def unit(self, unit_id: str) -> Unit:
         u = self.units.get(unit_id)
@@ -76,6 +110,45 @@ class Orchestrator:
     @property
     def sparks(self) -> dict[str, SparkUnit]:
         return {k: v for k, v in self.units.items() if isinstance(v, SparkUnit)}
+
+    @property
+    def groups(self) -> dict[str, SparkGroup]:
+        return {k: v for k, v in self.units.items() if isinstance(v, SparkGroup)}
+
+    def get_or_create_group(self, member_ids: list[str]) -> SparkGroup:
+        """The SparkGroup over `member_ids`, creating it on first use.
+
+        Creation validates through `settings.spark_group_config` (raises
+        ValueError on unknown/disabled members or fewer than two). Members are
+        passed IN `orch.units` ORDER — that list is the lock-acquisition order
+        every group load shares, which is what keeps overlapping group loads
+        (spark1+spark2 vs spark2+spark3) from deadlocking.
+
+        Requires the fabric flag: without it no group unit may exist, so the
+        placer's candidate set stays byte-for-byte pre-multi-node.
+        """
+        if not self.s.spark_fabric_enabled:
+            raise ValueError(
+                "multi-node groups are disabled (SPARK_FABRIC_ENABLED=false)"
+            )
+        cfg = self.s.spark_group_config(member_ids)
+        existing = self.units.get(cfg.id)
+        if existing is not None:
+            if not isinstance(existing, SparkGroup):  # id collision — impossible
+                raise ValueError(f"'{cfg.id}' names a non-group unit")   # pragma: no cover
+            return existing
+        assert self.cluster_registry is not None  # spark_enabled implied by member validation
+        members = [u for u in self.units.values()
+                   if isinstance(u, SparkUnit) and u.cfg.id in cfg.member_ids]
+        group = SparkGroup(self.s, cfg, members, self.cluster_registry,
+                           self.group_state, self.group_placements, self.jobs)
+        # Late joiners get the same attachments create_app fanned out at startup.
+        if members and members[0].leases is not None:
+            group.leases = members[0].leases
+        if members and members[0].load_times is not None:
+            group.load_times = members[0].load_times
+        self.units[cfg.id] = group
+        return group
 
     @property
     def primary(self) -> Lane:
@@ -103,8 +176,13 @@ class Orchestrator:
                 return await u.status(gpu=gpu)
             return await u.status()
 
+        # SparkGroups are deliberately EXCLUDED from /api/status: off-box consumers
+        # switch on this payload (invariant 8) and the UI has no card for a group —
+        # the members' own rows carry the residency (LoadedModel.group). The placer
+        # is unaffected: it calls each unit's status() directly, never this.
         statuses: list[LaneStatus] = list(
-            await asyncio.gather(*(_unit_status(u) for u in self.units.values()))
+            await asyncio.gather(*(_unit_status(u) for u in self.units.values()
+                                   if not isinstance(u, SparkGroup)))
         )
         primary = next((s for s in statuses if s.id == "primary"), statuses[0])
         return StatusResponse(

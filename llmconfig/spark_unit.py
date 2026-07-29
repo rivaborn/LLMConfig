@@ -48,6 +48,12 @@ class SparkUnit:
         self.leases = None
         # Set by Orchestrator.attach_load_times(); None = don't record.
         self.load_times = None
+        # Shared multi-node claim table, set by the Orchestrator when SparkGroups
+        # exist. A live claim covering this node means a tensor-parallel job's
+        # containers are HERE even though only the group's head answers HTTP —
+        # status() reports it and _admit()/unload() refuse to touch the node.
+        # None (tests, fabric off) = no multi-node awareness, behavior unchanged.
+        self.group_state = None
         self.spark = SparkBackend(settings, cfg, registry)
         self._lock = asyncio.Lock()
         self._active_job_id: Optional[str] = None
@@ -202,6 +208,28 @@ class SparkUnit:
             resident = {self.canonical_model(m.model) for m in loaded_models}
             for gone in [k for k in self.model_activity if k not in resident]:
                 self.model_activity.pop(gone, None)
+        # A live multi-node claim covering this node: its containers are here even
+        # when this node's own slots read empty (only the group's HEAD answers
+        # HTTP). Tag the discovered row when the head IS this node, else append a
+        # synthetic one — that is how the model gets "listed in the cards it was
+        # loaded on", and how placement sees the node as occupied by an
+        # unbudgeted (whole-node) resident without any new ranking logic.
+        claim = self.group_state.claim_for(self.cfg.id) if self.group_state else None
+        if claim is not None:
+            tagged = False
+            for lm in loaded_models:
+                if lm.model == claim.model:
+                    lm.group = claim.group_id
+                    tagged = True
+            if not tagged:
+                loaded_models.append(LoadedModel(
+                    server="spark",
+                    model=claim.model,
+                    gpu_vram_pct=remote_gpu.vram_pct,
+                    fully_on_gpu=True,
+                    port=0,                      # a worker rank serves no HTTP here
+                    group=claim.group_id,
+                ))
         # `loaded` stays the primary occupant for every existing consumer; the list
         # is the additive surface (invariant 8/12).
         loaded: Optional[LoadedModel] = loaded_models[0] if loaded_models else None
@@ -462,6 +490,16 @@ class SparkUnit:
         await self._acquire_swap_lock("unload")
         try:
             self._active_job_id = None
+            # A node in a live multi-node deployment cannot be freed on its own:
+            # `stop --all --hosts <this>` would kill ONE rank of a tp job and
+            # wedge the others. Teardown is a group operation.
+            claim = self.group_state.claim_for(self.cfg.id) if self.group_state else None
+            if claim is not None:
+                raise RuntimeError(
+                    f"{self.cfg.name} is one rank of the multi-node deployment "
+                    f"{claim.group_id} ({claim.model}) — unload it via "
+                    f"/api/cluster/unload, which stops every rank by job id."
+                )
             recipe = None
             if req.model:
                 entry = self.registry.get(req.model) or self.registry.find_by_served_name(req.model)
@@ -581,6 +619,15 @@ class SparkUnit:
            the status path, so invariant 9 is untouched — catches that drift.
            An unreachable probe degrades to the declared-only check.
         """
+        # A multi-node claim owns the WHOLE node — and on a worker rank the slot
+        # probe reads empty, so this must precede the empty-`names` early return.
+        claim = self.group_state.claim_for(self.cfg.id) if self.group_state else None
+        if claim is not None:
+            raise RuntimeError(
+                f"{self.cfg.name} is claimed by the multi-node deployment "
+                f"{claim.group_id} ({claim.model}) — unload it from the Cluster "
+                f"tab (/api/cluster/unload) before loading here."
+            )
         want = entry.mem_fraction
         names = [sm.name for sm in slots.values() if sm.name]
         if not names:

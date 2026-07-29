@@ -10,10 +10,14 @@ Owner = Literal["free", "ollama", "vllm", "spark", "unknown"]
 JobState = Literal["pending", "running", "succeeded", "failed"]
 # free = nothing loaded; idle = model resident but unused; active = model in use
 LaneUsage = Literal["free", "idle", "active"]
-# "gpu"   = a local card arbitrated Ollama-XOR-vLLM (the 3090 / 3070 Ti lanes)
-# "spark" = a remote DGX Spark node driven by sparkrun; the node IS the unit, so
-#           there is no intra-unit arbitration and no local nvidia-smi.
-UnitKind = Literal["gpu", "spark"]
+# "gpu"         = a local card arbitrated Ollama-XOR-vLLM (the 3090 / 3070 Ti lanes)
+# "spark"       = a remote DGX Spark node driven by sparkrun; the node IS the unit, so
+#                 there is no intra-unit arbitration and no local nvidia-smi.
+# "spark_group" = a SET of Spark nodes serving ONE tensor-parallel model over the
+#                 200G fabric. Synthetic: lives in orch.units for placement/leases/
+#                 gateway but is filtered out of /api/status lanes and never gets a
+#                 UI tab — the members' cards carry the residency (LoadedModel.group).
+UnitKind = Literal["gpu", "spark", "spark_group"]
 # The set of owners that mean "something we manage holds this unit".
 MANAGED_OWNERS: tuple[str, ...] = ("ollama", "vllm", "spark")
 # Lease lifecycle. `released` = the holder handed it back; `revoked` = someone took
@@ -94,6 +98,11 @@ class SparkModel(BaseModel):
     recipe: str = ""         # the sparkrun recipe id actually launched
     served_name: str = ""    # what the node's /v1/models reports once up
     tp: int = 1              # node count; 1 until the 200G switch lands
+    # Supported node RANGE for multi-node (cluster-catalog) recipes: the model may
+    # launch on any K with min_nodes <= K <= max_nodes, and the launch passes
+    # `--tp K`. Both default 1, so every per-node catalog entry is unaffected.
+    min_nodes: int = 1
+    max_nodes: int = 1
     status: str = "ok"       # "ok" | "blocked" | "unverified"
     notes: str = ""
     loaded: bool = False
@@ -120,6 +129,13 @@ class SparkModelEntry(BaseModel):
     recipe: str = ""
     served_name: str = ""
     tp: int = 1
+    # Node range for CLUSTER-catalog entries (see SparkModel). Multi-node models
+    # (min_nodes > 1) live ONLY in data/spark_cluster_models.yaml — never in a
+    # per-node catalog — so placement's model↔candidate partition holds: a
+    # multi-node model resolves only on SparkGroup units, a single-node model
+    # only on individual nodes. Per-node entries keep the 1/1 defaults.
+    min_nodes: int = 1
+    max_nodes: int = 1
     status: str = "ok"
     notes: str = ""
     extra_args: list[str] = Field(default_factory=list)
@@ -145,6 +161,8 @@ class SparkModelEntry(BaseModel):
             recipe=self.recipe or self.alias,
             served_name=self.served_name or self.alias,
             tp=self.tp,
+            min_nodes=self.min_nodes,
+            max_nodes=self.max_nodes,
             status=self.status,
             notes=self.notes,
             load_timeout_s=self.load_timeout_s,
@@ -231,6 +249,12 @@ class LoadedModel(BaseModel):
     # it is DISCOVERED by probing, never persisted, so it survives a restart. 0 on
     # a GPU lane, whose single occupant is always reached via the lane's own URL.
     port: int = 0
+    # Set when this residency is one node's share of a MULTI-NODE (tensor-parallel)
+    # deployment: the SparkGroup's id, e.g. "spark1_spark2". Drives the span badge
+    # on the member's Home card, and tells clients the row is a claim, not an
+    # independently unloadable model — teardown goes through /api/cluster/unload.
+    # "" (the default) = a normal single-unit residency. Additive on the API.
+    group: str = ""
 
 
 class LaneStatus(BaseModel):
@@ -340,6 +364,44 @@ class UnloadRequest(BaseModel):
     # a no-op. None (the default) keeps the original meaning — free the whole unit —
     # which is what the idle reaper and a lease's `free_on_preempt` still want.
     model: Optional[str] = None
+
+
+class ClusterLoadRequest(BaseModel):
+    """Launch one multi-node model across a set of Spark nodes (the Cluster tab).
+
+    `nodes` is any combination of enabled spark unit ids; K = len(nodes) becomes the
+    launch's `--tp K` and must satisfy the model's min_nodes <= K <= max_nodes. The
+    node set maps to a SparkGroup unit (created on demand, id = sorted ids joined
+    with "_"), whose load path holds every member's lock — this request never
+    touches a member's own load path.
+    """
+
+    model: str                     # cluster-catalog alias
+    nodes: list[str]               # member unit ids, e.g. ["spark1", "spark2"]
+    force: bool = False            # reload even if already serving; bypass "blocked"
+    # Placement-chosen victims (canonical aliases) to displace across the members,
+    # re-validated under each member's lock exactly like LoadRequest.evict.
+    evict: list[str] = Field(default_factory=list)
+
+
+class ClusterUnloadRequest(BaseModel):
+    """Tear down a multi-node deployment. Address it by group id OR node set."""
+
+    group: str = ""                            # e.g. "spark1_spark2"; wins when set
+    nodes: list[str] = Field(default_factory=list)
+
+
+class GroupPlacementOut(BaseModel):
+    """One recorded (model, node-set) placement — requirement: a model loaded once
+    on a node set is remembered, listed on those cards, and available to
+    auto-placement thereafter."""
+
+    alias: str
+    members: list[str]
+    group: str                     # the group id the members map to
+    last_loaded: float = 0.0       # unix ts of the most recent successful load
+    loads: int = 0                 # how many times it has launched on this set
+    live: bool = False             # a claim is currently active on this set
 
 
 # --------------------------------------------------------------------------- #

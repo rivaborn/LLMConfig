@@ -38,6 +38,18 @@ if TYPE_CHECKING:
     from .placement import Placer
 
 
+def _spark_shaped(lane) -> bool:
+    """True for a single Spark node AND for a multi-node `SparkGroup`.
+
+    Everything this gateway needs from "a Spark" — a curated catalog to resolve
+    against, per-model port routing, `cfg.api_base`, a minutes-long load timeout,
+    and NO ollama/vllm halves — is equally true of a group, which serves its
+    tensor-parallel model from the head's port. Using `isinstance(SparkUnit)`
+    alone sent groups down the LANE branch, where `cfg.vllm_relay_url` does not
+    exist — an AttributeError on /v1/models the moment a group unit exists."""
+    return isinstance(lane, SparkUnit) or getattr(lane, "kind", "") == "spark_group"
+
+
 class OpenAIGateway:
     """Holds the long-lived forwarding client + the resolve/load/forward logic."""
 
@@ -89,7 +101,7 @@ class OpenAIGateway:
         if not model:
             return None
         # A Spark's catalog is the only thing to match; the port comes later.
-        if isinstance(lane, SparkUnit):
+        if _spark_shaped(lane):
             fallback: Optional[str] = None
             for e in lane.registry.entries():
                 if (e.served_name or e.alias) == model:
@@ -396,6 +408,11 @@ class OpenAIGateway:
             active = self.jobs.get(status.active_job_id)
             if active and active.kind == target_kind and active.state in ("pending", "running"):
                 return active, False  # identical target already loading → attach
+            # Deliberately `isinstance`, NOT `_spark_shaped`: a SparkGroup gets the
+            # LANE treatment here. Co-residency is what makes another Spark load
+            # irrelevant, and a group has none — its load claims every member for
+            # many minutes, so a non-stream client is better off failing fast than
+            # queueing behind it.
             if not stream and not isinstance(lane, SparkUnit):
                 return None, True     # different model loading + non-stream → bail fast
             # stream, or a Spark (co-residency makes the other load irrelevant):
@@ -639,7 +656,7 @@ class OpenAIGateway:
 
         if stream:
             reroute = (self._reroute(lane, server, model, backend)
-                       if isinstance(lane, SparkUnit) else None)
+                       if _spark_shaped(lane) else None)
             return StreamingResponse(
                 self._stream_load_then_forward(job.id if job else None, backend, sub_path, body,
                                                model, request.headers, is_chat, lane=lane,
@@ -674,7 +691,7 @@ class OpenAIGateway:
                 content={"error": {"message": f"failed to load '{model}': {err}",
                                     "type": "server_error", "code": "model_load_failed"}},
             )
-        if isinstance(lane, SparkUnit):
+        if _spark_shaped(lane):
             # The cold load may have landed on any free slot; the `backend`
             # computed before it is slot 0. Re-route from fresh residency, or the
             # forward goes to whichever model already lives there.
@@ -719,7 +736,7 @@ class OpenAIGateway:
         status = await lane.status()
         server, load_arg = decision.server, decision.load_arg
         backend = self._route(lane, server, model, status,
-                              lane.cfg.api_base if isinstance(lane, SparkUnit)
+                              lane.cfg.api_base if _spark_shaped(lane)
                               else (lane.cfg.vllm_relay_url if server == "vllm"
                                     else lane.cfg.ollama_url))
         lane.touch(model=model)
@@ -731,7 +748,7 @@ class OpenAIGateway:
                 return None
             entry = lane.registry.get(load_arg)
             timeout = float(getattr(entry, "load_timeout_s", 0) or lane.cfg.load_timeout_s
-                            if isinstance(lane, SparkUnit) else 600.0) + 60.0
+                            if _spark_shaped(lane) else 600.0) + 60.0
             ok, _err2 = await self._wait_job(job.id, timeout)
             if not ok:
                 return None
@@ -834,7 +851,7 @@ class OpenAIGateway:
                 content={"error": {"message": f"failed to load '{model}': {err}",
                                     "type": "server_error", "code": "model_load_failed"}},
             )
-        if isinstance(lane, SparkUnit):
+        if _spark_shaped(lane):
             # Same slot re-route as the chat path — an embedding answered by the
             # wrong slot's model would not even error, just embed wrongly.
             backend = self._route(lane, server, model, await lane.status(), backend)
@@ -857,7 +874,9 @@ class OpenAIGateway:
         # the display `name` is tagged from that — not guessed from the id convention.
         tagged: list[tuple[str, str]] = []  # (id, backend label)
         for lane in lanes:
-            if isinstance(lane, SparkUnit):
+            if _spark_shaped(lane):
+                # A group lists its CLUSTER catalog, so a client can name the
+                # multi-node model and have auto-placement route or cold-start it.
                 for se in lane.registry.entries():
                     tagged.append((se.served_name or se.alias, f"Spark {lane.cfg.name}"))
             else:

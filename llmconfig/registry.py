@@ -19,6 +19,9 @@ from .schemas import SparkModelEntry, VllmAliasEntry
 DEFAULT_REGISTRY = PACKAGE_DIR / "data" / "vllm_models.default.yaml"
 DEFAULT_COMPANION_REGISTRY = PACKAGE_DIR / "data" / "vllm_models_companion.default.yaml"
 DEFAULT_SPARK_REGISTRY = PACKAGE_DIR / "data" / "spark_models.default.yaml"
+# Multi-node (SparkGroup) recipes — min_nodes > 1, disjoint from the per-node
+# catalogs on purpose (see the file's header for why that partition is load-bearing).
+DEFAULT_SPARK_CLUSTER_REGISTRY = PACKAGE_DIR / "data" / "spark_cluster_models.default.yaml"
 
 
 class Registry:

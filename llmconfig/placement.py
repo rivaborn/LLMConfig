@@ -233,6 +233,14 @@ class CandidateFacts:
     fail_blocked: bool = False             # consecutive-failure blocklist tripped
     fail_count: int = 0                    # for the tier-5 reason text
     est_s: Optional[float] = None          # measured load estimate (tier-3 tie-break)
+    # Nodes this candidate spans: 1 for every lane/Spark, K for a SparkGroup.
+    # Sorted ascending in tiers 3/4 — "run each model on the fewest nodes it
+    # fits in" (the cluster's operating rule 1): extra nodes buy capacity, not
+    # speed, and the fabric pays a cross-node tax per rank. Groups of different
+    # sizes are the ONLY candidates that ever differ here (a model resolves
+    # either on groups or on single units, never both), so single-unit ranking
+    # is untouched.
+    member_count: int = 1
 
 
 @dataclass
@@ -388,19 +396,26 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
             return (c.committed if c.kind == "spark"
                     else (c.status.gpu.vram_pct if c.status.gpu else 0.0))
 
+        # `member_count` leads every branch: "run each model on the fewest nodes
+        # it fits in" is a hardware fact (extra ranks buy capacity, not speed,
+        # and each one pays the fabric tax), so it outranks even a faster
+        # measured load. It is 1 for every lane/Spark, so single-unit ordering is
+        # byte-for-byte what it was — only differently-sized GROUPS ever differ.
         if workload is not None and workload.cls == "batch":
             # Capacity tier first even if the lane loads faster — bulk work
             # belongs on the Sparks, and nobody is watching a batch job's TTFB.
-            fits.sort(key=lambda c: (c.status.swap_in_progress, c.kind != "spark",
+            fits.sort(key=lambda c: (c.status.swap_in_progress, c.member_count,
+                                     c.kind != "spark",
                                      est_bucket(c), emptiness(c), c.order))
         elif workload is not None:   # interactive
             # Load time dominates (a human is blocked on the cold load); the
             # speed tier breaks est-bucket ties.
-            fits.sort(key=lambda c: (c.status.swap_in_progress, est_bucket(c),
+            fits.sort(key=lambda c: (c.status.swap_in_progress, c.member_count,
+                                     est_bucket(c),
                                      c.kind != "gpu", emptiness(c), c.order))
         else:
-            fits.sort(key=lambda c: (c.status.swap_in_progress, est_bucket(c),
-                                     emptiness(c), c.order))
+            fits.sort(key=lambda c: (c.status.swap_in_progress, c.member_count,
+                                     est_bucket(c), emptiness(c), c.order))
         c = fits[0]
         return Decision(outcome="place", unit_id=c.unit_id, server=c.server,
                         load_arg=c.load_arg, tier="fits")
@@ -417,7 +432,10 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
         elif _lane_evictable(c, window):
             displaceable.append((c, []))   # Lane.load evicts on its own
     if displaceable:
-        displaceable.sort(key=lambda cv: (len(cv[1]),
+        # Fewest nodes leads (see CandidateFacts.member_count — only groups
+        # differ), then fewest victims, then stalest.
+        displaceable.sort(key=lambda cv: (cv[0].member_count,
+                                          len(cv[1]),
                                           -(cv[1][0].idle_s if cv[1] else 1e18),
                                           *order_key(cv[0])))
         c, victims = displaceable[0]
@@ -544,9 +562,17 @@ class Placer:
             return (e.alias == model or (e.served_name or e.alias) == model) \
                 and e.status != "blocked"
 
-        if hasattr(unit, "declared_budgets"):          # SparkUnit
+        if hasattr(unit, "declared_budgets"):          # SparkUnit or SparkGroup
+            # A group's registry is the CLUSTER catalog and a node's is its own —
+            # the lists are disjoint, so a model resolves on groups XOR single
+            # units and rank() never has to arbitrate between the two. A group
+            # additionally must SIZE-match: a 4-node group is no candidate for a
+            # recipe capped at 2.
+            k = len(getattr(unit.cfg, "member_ids", ())) or 1
             for e in unit.registry.entries():
                 if hit(e):
+                    if k > 1 and not (e.min_nodes <= k <= e.max_nodes):
+                        return None
                     return ("spark", e.alias, e)
             return None
         # Ollama-only lane: its vLLM catalog is not a candidate source at all.
@@ -631,7 +657,12 @@ class Placer:
                     alias=alias,
                     budget=budgets.get(m.model, 0.0),
                     idle_s=unit.idle_for(m.model),
-                    leased=self.leases.active_for(uid, alias) is not None,
+                    # A multi-node claim (m.group) is shielded like a lease: it can
+                    # never be a single-node eviction victim — its containers span
+                    # OTHER nodes, and teardown is a group operation
+                    # (/api/cluster/unload), not a slot stop on this one.
+                    leased=(bool(m.group)
+                            or self.leases.active_for(uid, alias) is not None),
                 ))
         else:
             for m in st.loaded_models:
@@ -668,6 +699,82 @@ class Placer:
             est_s=est_s,
         )
 
+    def _group_facts(self, group: "Unit", st: LaneStatus, server: str, load_arg: str,
+                     entry, order: int, model: str,
+                     statuses: dict[str, LaneStatus]) -> Optional[CandidateFacts]:
+        """CandidateFacts for a SparkGroup: the residents are the UNION of the
+        members' residents — a tp launch claims every member whole, so tier 3
+        needs all of them empty and tier 4 needs every one of them evictable
+        (exactly the whole_node semantics rank() already enforces). Victim
+        eligibility (idle/leased) is judged against the OWNING member, which is
+        where the clocks and leases live and where `_evict_victim` will
+        re-validate under the lock. None ⇒ a member's status is missing this
+        sweep, and a group that cannot see all its members is not a candidate.
+        """
+        residents: list[ResidentFact] = []
+        for m_unit in group.members:
+            mid = m_unit.cfg.id
+            m_st = statuses.get(mid)
+            if m_st is None or not m_unit.cfg.enabled:
+                return None
+            budgets = m_unit.declared_budgets([lm.model for lm in m_st.loaded_models])
+            for lm in m_st.loaded_models:
+                alias = m_unit.canonical_model(lm.model)
+                residents.append(ResidentFact(
+                    model=lm.model,
+                    alias=alias,
+                    budget=budgets.get(lm.model, 0.0),
+                    idle_s=m_unit.idle_for(lm.model),
+                    # Another group's claim on a member is untouchable here —
+                    # same shielding as in _facts_for.
+                    leased=(bool(lm.group)
+                            or self.leases.active_for(mid, alias) is not None),
+                ))
+        # The group's own residency (its model on the head) rides on top so
+        # tier 2 can route a request for the RESIDENT group model here.
+        for lm in st.loaded_models:
+            residents.append(ResidentFact(
+                model=lm.model,
+                alias=group.canonical_model(lm.model),
+                budget=0.0,
+                idle_s=group.idle_for(lm.model),
+                leased=self.leases.active_for(group.cfg.id) is not None,
+            ))
+        usage = classify_usage(st, self.monitor.util_for(group.cfg.gpu_uuid), self.s)
+        k = len(group.cfg.member_ids)
+        # Gate facts, group flavour. `proven` cannot come from residency here (a
+        # multi-node cold start is the expensive case the gate exists for), so the
+        # proof is the PERSISTED RECORD: this alias has launched on THIS node set
+        # before. That is exactly what makes a recorded placement an
+        # auto-placement candidate and an unrecorded node set a manual, deliberate
+        # first launch from the Cluster tab. Estimates and failure counters are
+        # keyed per node count / per group id — a 2-node launch is not a 4-node
+        # one, and a group's failures are its own.
+        proven, fail_blocked, fail_count, est_s = True, False, 0, None
+        if self.load_times is not None:
+            from .load_times import fail_key, spark_key
+            est_s = self.load_times.estimate(f"{spark_key(load_arg)}:x{k}")
+            recorded = tuple(group.cfg.member_ids) in group.placements.sets_for(load_arg)
+            proven = est_s is not None or recorded
+            fk = fail_key(group.cfg.id, "spark", load_arg)
+            fail_count, _ts = self.load_times.failures_for(fk)
+            threshold = self.s.placement_fail_block_after
+            fail_blocked = threshold > 0 and self.load_times.blocked(
+                fk, threshold=threshold,
+                cooldown_s=self.s.placement_fail_block_cooldown_s)
+        return CandidateFacts(
+            unit_id=group.cfg.id, kind="spark", status=st, usage=usage,
+            server=server, load_arg=load_arg, residents=residents,
+            committed=sum(r.budget for r in residents),
+            want=0.0, whole_node=True,
+            free_slot=not st.loaded_models,
+            lease_refused=self.leases.blocks_unleased(group.cfg.id, model) is not None,
+            order=order,
+            proven=proven, fail_blocked=fail_blocked, fail_count=fail_count,
+            est_s=est_s,
+            member_count=k,
+        )
+
     # ---- the public entry point ----
     async def place(self, model: str, *, server: Optional[str] = None,
                     exclude: frozenset[str] = frozenset(),
@@ -699,6 +806,12 @@ class Placer:
                 continue
             srv, load_arg, entry = resolved
             if server is not None and srv != server:
+                continue
+            if getattr(unit, "kind", "") == "spark_group":
+                facts = self._group_facts(unit, st, srv, load_arg, entry, order,
+                                          model, statuses)
+                if facts is not None:
+                    candidates.append(facts)
                 continue
             candidates.append(self._facts_for(unit, st, srv, load_arg, entry, order,
                                               model, spark_resident))

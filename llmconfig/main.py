@@ -17,7 +17,7 @@ from fastapi.staticfiles import StaticFiles
 
 from . import __version__
 from . import doctor as doctor_mod
-from .config import PACKAGE_DIR, get_settings
+from .config import PACKAGE_DIR, get_settings, group_id_for
 from .gpu import query_gpu
 from .idle import IdleReaper, classify_usage
 from .jobs import JobManager
@@ -30,8 +30,12 @@ from .orchestrator import Orchestrator
 from .placement import Placer
 from .registry import make_registry
 from .schemas import (
+    ClusterLoadRequest,
+    ClusterUnloadRequest,
     GpuOut,
+    GroupPlacementOut,
     Job,
+    LaneStatus,
     LaneUsageOut,
     Lease,
     LeaseBrief,
@@ -42,6 +46,7 @@ from .schemas import (
     LeaseRevokeRequest,
     LoadRequest,
     ModelsResponse,
+    SparkModel,
     SparkModelEntry,
     StatusResponse,
     UnloadRequest,
@@ -210,9 +215,18 @@ def create_app() -> FastAPI:
     async def api_models(lane: str = "primary") -> ModelsResponse:
         ln = _lane(lane)
         resp = ModelsResponse()
+        if getattr(ln, "kind", "") == "spark_group":
+            # A group id resolves here (it is a real unit), but its catalog is the
+            # cluster one and its fit depends on the node set — that lives at
+            # /api/cluster/models, where the arithmetic is (invariant 14).
+            resp.spark = [e.to_public() for e in ln.registry.entries()]
+            return resp
         if isinstance(ln, SparkUnit):
             try:
-                resp.spark = await ln.spark.list_models()
+                # The live multi-node claim (if any) grays the whole catalog —
+                # keeps the UI's gray-out agreeing with _admit (invariant 14).
+                claim = ln.group_state.claim_for(ln.cfg.id) if ln.group_state else None
+                resp.spark = await ln.spark.list_models(claim=claim)
             except Exception as e:
                 resp.spark_error = f"{type(e).__name__}: {e}"
             return resp
@@ -234,6 +248,10 @@ def create_app() -> FastAPI:
     @app.get("/api/gpu", response_model=GpuOut)
     async def api_gpu(lane: str = "primary") -> GpuOut:
         ln = _lane(lane)
+        if getattr(ln, "kind", "") == "spark_group":
+            # No card of its own — report the head node's, which is where the
+            # group's own status() takes its telemetry from too.
+            return GpuOut.from_info(await ln.head.spark.gpu())
         if isinstance(ln, SparkUnit):  # remote node — its own nvidia-smi over SSH
             return GpuOut.from_info(await ln.spark.gpu())
         return GpuOut.from_info(await query_gpu(settings, uuid=ln.cfg.gpu_uuid))
@@ -571,6 +589,114 @@ def create_app() -> FastAPI:
         if not _spark(lane).registry.remove(alias):
             raise HTTPException(status_code=404, detail="model not found")
         return {"deleted": alias}
+
+    # ---- multi-node (SparkGroup) launches — the Cluster tab's API ----
+    def _cluster_nodes(nodes: list[str]) -> list[SparkUnit]:
+        """Validate a node set: every id an enabled SparkUnit, at least two."""
+        if len(set(nodes)) < 2:
+            raise HTTPException(status_code=400,
+                                detail="a multi-node launch needs at least 2 nodes")
+        out: list[SparkUnit] = []
+        for nid in sorted(set(nodes)):
+            unit = orch.units.get(nid)
+            if not isinstance(unit, SparkUnit) or not unit.cfg.enabled:
+                raise HTTPException(status_code=400,
+                                    detail=f"'{nid}' is not an enabled Spark node")
+            out.append(unit)
+        return out
+
+    @app.get("/api/cluster/models", response_model=list[SparkModel])
+    async def api_cluster_models(nodes: str) -> list[SparkModel]:
+        """Cluster-catalog models that fit the selected node set.
+
+        `nodes` is comma-separated unit ids; K = the count. Only entries whose
+        min_nodes ≤ K ≤ max_nodes are returned, each with `addable`/`add_note`
+        computed HERE, beside the same state the load path checks (fabric flag,
+        member claims, member locks) — the UI never re-derives fit client-side
+        (invariant 14). K=1 is not served here: the UI uses the existing
+        /api/models?lane= for a single node.
+        """
+        members = _cluster_nodes([n for n in nodes.split(",") if n.strip()])
+        if orch.cluster_registry is None:
+            raise HTTPException(status_code=400, detail="Sparks are disabled (SPARK_ENABLED=false)")
+        k = len(members)
+        gid = group_id_for([m.cfg.id for m in members])
+        live = orch.group_state.get(gid)
+        claims = {m.cfg.id: orch.group_state.claim_for(m.cfg.id) for m in members}
+        foreign = sorted({c.group_id for m, c in claims.items()
+                          if c is not None and c.group_id != gid})
+        busy = sorted(m.cfg.id for m in members
+                      if m._lock.locked() or m._active_job_id)
+
+        out: list[SparkModel] = []
+        for entry in orch.cluster_registry.entries():
+            if not (entry.min_nodes <= k <= entry.max_nodes):
+                continue
+            pub = entry.to_public()
+            pub.loaded = live is not None and live.alias == entry.alias
+            pub.port = members[0].cfg.api_port if pub.loaded else 0
+            if not settings.spark_fabric_enabled:
+                pub.addable = False
+                pub.add_note = ("fabric not installed (SPARK_FABRIC_ENABLED=false) — "
+                                "planner only until the 200G switch lands")
+            elif foreign:
+                pub.addable = False
+                pub.add_note = f"member(s) claimed by {', '.join(foreign)} — free that deployment first"
+            elif pub.loaded:
+                pub.addable, pub.add_note = True, "loaded — relaunch replaces it"
+            elif busy:
+                pub.addable = False
+                pub.add_note = f"swap in progress on {', '.join(busy)} — retry when it settles"
+            else:
+                pub.addable = True
+                pub.add_note = (f"launches tp={k} across {gid.replace('_', '+')} "
+                                f"(claims every node whole)")
+            out.append(pub)
+        return out
+
+    @app.post("/api/cluster/load", response_model=Job, dependencies=write)
+    async def api_cluster_load(body: ClusterLoadRequest) -> Job:
+        members = _cluster_nodes(body.nodes)
+        if not settings.spark_fabric_enabled:
+            # 409, not 400: the request is well-formed; the WORLD refuses it.
+            raise HTTPException(
+                status_code=409,
+                detail="multi-node launches are disabled: the 200G fabric is not "
+                       "installed (SPARK_FABRIC_ENABLED=false)")
+        try:
+            group = orch.get_or_create_group([m.cfg.id for m in members])
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        req = LoadRequest(server="spark", model=body.model, lane=group.cfg.id,
+                          force=body.force, evict=body.evict)
+        return group.load(req)
+
+    @app.post("/api/cluster/unload", response_model=LaneStatus, dependencies=write)
+    async def api_cluster_unload(body: ClusterUnloadRequest) -> LaneStatus:
+        gid = body.group or (group_id_for(sorted(set(body.nodes))) if body.nodes else "")
+        if not gid:
+            raise HTTPException(status_code=400, detail="name a group or a node set")
+        unit = orch.units.get(gid)
+        if unit is None or not hasattr(unit, "member_hosts"):
+            raise HTTPException(status_code=404, detail=f"no multi-node group '{gid}'")
+        return await unit.unload(UnloadRequest(server="spark", lane=gid))
+
+    @app.get("/api/cluster/placements", response_model=list[GroupPlacementOut])
+    async def api_cluster_placements() -> list[GroupPlacementOut]:
+        """Recorded (model, node-set) placements + whether each is live right now —
+        the Cluster tab's re-launch list, and the record behind requirement 3."""
+        out: list[GroupPlacementOut] = []
+        for alias, rows in orch.group_placements.all().items():
+            for r in rows:
+                gid = group_id_for(r["members"])
+                live = orch.group_state.get(gid)
+                out.append(GroupPlacementOut(
+                    alias=alias, members=r["members"], group=gid,
+                    last_loaded=r["last_loaded"], loads=r["loads"],
+                    live=live is not None and live.alias == alias,
+                ))
+        out.sort(key=lambda p: -p.last_loaded)
+        return out
 
     @app.post("/api/vllm/download", response_model=Job, dependencies=write)
     async def api_vllm_download(body: dict) -> Job:

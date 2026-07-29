@@ -166,6 +166,13 @@ class Cookbook:
         for unit in self.orch.units.values():
             if not unit.cfg.enabled:
                 continue
+            # v1: SparkGroups are outside the cookbook. A state naming a model on
+            # spark1 AND a multi-node model spanning spark1 would be internally
+            # contradictory, and _apply_unit runs units in parallel with no
+            # cross-unit ordering — sequencing "free the members, then load the
+            # group" is real follow-up work, not a snapshot detail.
+            if getattr(unit, "kind", "") == "spark_group":
+                continue
             if unit._lock.locked() or unit._active_job_id:
                 raise RuntimeError(
                     f"unit '{unit.cfg.id}' has a swap in progress — snapshot would "
