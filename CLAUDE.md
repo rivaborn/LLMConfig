@@ -215,6 +215,13 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 5. **Reach the relay at `127.0.0.1:11437`, never `localhost`.** Under WSL2
    localhost-forwarding, `localhost` triggers IPv4/IPv6 happy-eyeballs delays; a *down*
    relay blackholes the SYN (no RST) and hangs ~2.4 s — hence `vllm_probe_timeout_s`.
+   Corollary: **never probe a relay that cannot exist.** Every vLLM probe on an
+   Ollama-only lane (`cfg.vllm_enabled=False`) pays that full hang for an answer
+   that is always "nothing" — guard each one, as `_served_info`, `_load_ollama`'s
+   fast path, `_occupied_by`, `_evict_all` and the reaper's keepalive check all
+   now do. The Spark equivalent is the per-node probe breaker
+   (`_served_fails`): a SparkGroup rides its HEAD member's breaker rather than
+   keeping a second one, because the group's port is one of that member's slots.
 6. **Ollama context is baked into the Modelfile (`num_ctx`), not a load param.**
    `/api/load` and the `/v1` gateway set only `keep_alive` and optional `num_gpu`. To
    change context, bake a new tag (`ollama create <m>-64k -f Modelfile`) — do **not**
@@ -418,6 +425,20 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
     whole feature is inert while `SPARK_FABRIC_ENABLED` is false (no group
     units exist — don't create one anywhere else). `GroupState` reads are sync
     on purpose (invariant 11 applies to it too).
+
+    **A group-claimed row on a member is not that member's model to touch.**
+    `LoadedModel.group` marks it, and three places must skip it — every one of
+    them was a real bug (review 2026-07-29): the idle reaper (it has no
+    per-model clock on the member, so it reads as the STALEST occupant and
+    would be chosen every tick, only for `unload()` to refuse it and for the
+    genuinely reapable neighbour to be shadowed), the cookbook snapshot (the
+    model lives in the cluster catalog, so a state recording it under a member
+    id can never be applied), and single-node placement's victim selection
+    (already handled: the row reports `leased=True`). Anything new that
+    enumerates `st.loaded_models` and then acts on a row needs the same check.
+    Symmetrically, anything that asks "does this unit take `server='spark'`?"
+    must accept a group too — `/api/load`'s `isinstance(SparkUnit)` check 400'd
+    placement's own group decision.
 
     Two integration points that are easy to get wrong:
     - **A group's `proven` (invariant 15's gate) comes from the PERSISTED
