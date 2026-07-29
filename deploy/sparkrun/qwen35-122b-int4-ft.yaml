@@ -1,0 +1,77 @@
+# Recipe: Qwen3.5-122B-A10B-INT4-Autoround  +  froggeric fixed chat template
+#
+# EXPERIMENT VARIANT. A verbatim fork of
+#   ~/.cache/sparkrun/registries/eugr/recipes/qwen3.5-122b-int4-autoround.yaml
+# with exactly TWO deliberate differences:
+#
+#   1. `mods:` points at the local froggeric chat-template mod instead of
+#      eugr's `fix-qwen3.5-chat-template`.
+#   2. `env: VLLM_MARLIN_USE_ATOMIC_ADD` is 0, not 1 — belt-and-braces. The
+#      catalog also passes `-o env.VLLM_MARLIN_USE_ATOMIC_ADD=0`, so the
+#      effective value is 0 either way, but a fork that shipped the upstream
+#      `1` would be one forgotten override away from being unlaunchable
+#      (CUDA illegal instruction during CUDA-graph capture — LLMConfig ae5983c).
+#
+# EVERYTHING ELSE MUST STAY BYTE-IDENTICAL to the upstream recipe — including
+# `--tool-call-parser qwen3_xml`, which the froggeric README suggests changing
+# to `qwen3_coder`. That is a SECOND variable and is deliberately NOT changed
+# here: this run isolates the template so a score delta is attributable. Only
+# switch the parser if tool calls fail to parse at all, and then say so.
+#
+# Why a fork exists at all: the recipe hardcodes `--chat-template` and
+# `--tool-call-parser` in the command template with no {placeholder}, and
+# sparkrun 0.2.40's EXTRA_ARGS is a declared-but-never-read click argument
+# (cli/_run.py:92), so neither flag is reachable from the catalog. See
+# HomelabDocumentation/drafts/sparkrun-flag-traps.md.
+#
+# Mods resolve adjacent to this file (`mods/<name>` relative to its directory,
+# sparkrun/core/mods.py search order 2), with fallback to the eugr registry for
+# anything not overridden here.
+
+recipe_version: "1"
+name: Qwen3.5-122B-INT4-Autoround-Froggeric
+description: vLLM serving Qwen3.5-122B-INT4-Autoround with the froggeric v21.3 chat template
+
+# HuggingFace model to download (optional, for --download-model)
+model: Intel/Qwen3.5-122B-A10B-int4-AutoRound
+
+#solo_only: true
+
+# Container image to use
+container: vllm-node
+
+# Local chat-template mod — THE variable under test
+mods:
+  # - mods/fix-qwen3.5-autoround
+  - mods/fix-qwen3.5-chat-template-froggeric
+
+# Default settings (can be overridden via CLI)
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  max_num_batched_tokens: 8192
+
+# Environment variables
+env:
+  VLLM_MARLIN_USE_ATOMIC_ADD: 0
+
+# The vLLM serve command template
+command: |
+  vllm serve Intel/Qwen3.5-122B-A10B-int4-AutoRound \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --load-format fastsafetensors \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    --chat-template unsloth.jinja \
+    -tp {tensor_parallel} \
+    --distributed-executor-backend ray
