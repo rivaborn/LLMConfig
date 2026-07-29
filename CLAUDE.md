@@ -31,11 +31,20 @@ does **not** reimplement either server (vLLM lifecycle still goes through `serve
 
 ## The mental model (read once, it explains everything)
 
-There are two kinds of **unit**, and the UI/API treat them identically (Home tab =
-one box per unit; one control tab per unit; Monitor covers all of them):
+There are three kinds of **unit**. The first two are UI-visible and treated
+identically (Home tab = one box per unit; one control tab per unit; Monitor
+covers all of them):
 
 - a **`Lane`** — one local GPU arbitrated Ollama-XOR-vLLM (3090 / 3070 Ti);
-- a **`SparkUnit`** — one remote DGX Spark node driven by `sparkrun`.
+- a **`SparkUnit`** — one remote DGX Spark node driven by `sparkrun`;
+- a **`SparkGroup`** — a SET of Spark nodes serving ONE tensor-parallel model
+  over the 200G fabric. **Synthetic**: it lives in `orch.units` (so placement,
+  leases, and the /v1 gateway treat it like any unit) but `settings.units()`
+  never emits it — no tab, no Home card — and it is filtered out of
+  `/api/status` lanes. The members' own cards carry the residency
+  (`LoadedModel.group`, the "×2 · spark1+spark2" badge). Groups exist only when
+  **`SPARK_FABRIC_ENABLED`** is on (default off — the switch is on order); off,
+  `orch.units` is byte-for-byte pre-multi-node and the Cluster tab is a planner.
 
 `settings.units()` = `lanes()` + `sparks()`; the orchestrator keys everything off
 `self.units`, while `self.lanes` stays GPU-only (the WSL keepalive and the vLLM
@@ -92,6 +101,14 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
   `query_all_gpus`), owns the **shared** `WslKeepalive` and `LaneDefaults`.
 - `lane.py` — `Lane`: the per-GPU arbitration state machine (eviction-wait gate,
   `_load_ollama`/`_load_vllm`, `unload`, `_max_pack_reload`). **The heart of the app.**
+- `spark_group.py` — `SparkGroup`: a **set of Spark nodes** serving one
+  tensor-parallel model (see the mental model). Load = ordered bounded member
+  locks → whole-node eviction per member → ONE `sparkrun run --hosts h1,h2 --tp K`
+  on the head → wait-ready on the head port → claim + placement record.
+- `group_state.py` — `GroupState` (live claims, all-sync — members read it in
+  `status()`/`_admit`) + `GroupPlacements` (persisted (model, node-set) history,
+  `data/spark_group_state.yaml` — feeds startup group re-instantiation and
+  auto-placement).
 - `spark_unit.py` — `SparkUnit`: one **remote DGX Spark node** as a unit. Same
   duck-typed surface as `Lane` (`status`/`load`/`unload`/`touch`/`aclose`, own
   `asyncio.Lock`, Job pattern) but no eviction gate and no local card. It holds
@@ -383,6 +400,24 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
     utility VM — attempted, never trusted**) → restart `WslService`, the only
     effective step (~16 stop-poll cycles, hence the timeout arg on
     `winsvc.restart_service`).
+
+18. **A multi-node (SparkGroup) load holds EVERY member's lock, acquired in
+    `orch.units` order, bounded, all-or-nothing** — the one global order is what
+    keeps overlapping group loads (spark1+spark2 vs spark2+spark3) queueing
+    instead of deadlocking; a failed acquire releases the prefix. Under those
+    locks the load re-validates member claims and eviction victims (the
+    `placement_conflict:` protocol), frees each member WHOLE (v1: no cross-node
+    co-residency arithmetic), then launches ONCE via the head with
+    `--hosts <all members>`. Corollaries: **members refuse their own loads and
+    unloads while group-claimed** (`_admit`/`unload` — a `stop --all` on one
+    rank wedges the others; teardown stops the sparkrun JOB ID, which is
+    cluster-wide, then re-probes); **multi-node recipes live ONLY in the
+    cluster catalog** (`data/spark_cluster_models.yaml`), never per-node — the
+    disjointness is what makes a model resolve on groups XOR single units so
+    `rank()` never arbitrates between a group and its own members; and the
+    whole feature is inert while `SPARK_FABRIC_ENABLED` is false (no group
+    units exist — don't create one anywhere else). `GroupState` reads are sync
+    on purpose (invariant 11 applies to it too).
 
 
 ## Build / run / test
