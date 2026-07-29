@@ -202,6 +202,16 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    `/api/load` and the `/v1` gateway set only `keep_alive` and optional `num_gpu`. To
    change context, bake a new tag (`ollama create <m>-64k -f Modelfile`) — do **not**
    add a context arg to the load path.
+   The effective window is `baked num_ctx, else OLLAMA_CONTEXT_LENGTH` (**32768** in both
+   NSSM services' `AppEnvironmentExtra`); an *absent* variable silently falls back to
+   Ollama's built-in 4096, which is what once made the companion relay serve 4 k.
+   **When reading a window, `/api/ps` `context_length` is the runtime truth and
+   `/api/show` `parameters.num_ctx` is the configured bake — never
+   `/api/show` `model_info.*context_length*`,** which is the *architectural* maximum and
+   is wildly larger (`qwen3.6:27B` reports 262144, `devstral-small-2` 393216 — both
+   actually serve 32768). Sizing anything off that field produces limits up to 8× the real
+   window that look correct and 400 on a long prompt. `schemas.py` and
+   `backends/ollama.py` already say this; the trap is re-derived from scratch every time.
 7. **Write endpoints are gated by `X-API-Key` only when `LLMCONFIG_API_KEY` is set**
    (`require_key` dependency). Read/inference endpoints are open (LAN perimeter). Keep
    new mutating endpoints on the `write` dependency list.
@@ -236,7 +246,20 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    `SparkBackend.stop(recipe=…)` therefore resolves the recipe to this host's job
    id via `sparkrun status` and stops by id (`SPARK_STOP_JOB_CMD`); `SPARK_STOP_CMD`'s
    `--all` sweeps the node for "free the whole unit". `SPARK_STOP_ONE_CMD` is a
-   documented tombstone. Recipe names are **namespaced** (`@eugr/…`, `@official/…`)
+   documented tombstone.
+   **A catalog entry's `extra_args` (→ `{extra}`) is load-bearing, including
+   `-o env.KEY=VAL`.** Two things ride there and neither is cosmetic: the
+   `--max-model-len` cap (upstream recipes are sized for TWO nodes, so a one-node
+   launch must cap down — see `ContextUpdate.md` for the per-recipe table) and recipe
+   **env overrides**. `qwen35-122b-int4` carries
+   `["-o", "env.VLLM_MARLIN_USE_ATOMIC_ADD=0"]` because the `@eugr` recipe ships that
+   env as `1` and on GB10 the marlin split-K path dies during CUDA-graph capture
+   (capture 23 of 51, *"illegal instruction"*). That model was blamed on context for
+   days — it booted at 94.8 % pool and died on its FIRST token, so 262144 was cut to
+   65536 twice before the env was found to be the real cause (weights 62.87 GiB, KV
+   31.2 GiB free the whole time; it now serves the full 262144). **Before shrinking a
+   Spark model's window, check whether a recipe env default is killing it.**
+   Recipe names are **namespaced** (`@eugr/…`, `@official/…`)
    — find them with `sparkrun search`.
    `tests/test_spark.py::test_launch_command_matches_verified_sparkrun_flags` and
    `::test_targeted_stop_resolves_the_job_id_on_this_host` pin this.
@@ -411,6 +434,20 @@ pytest                                        # unit tests (no GPU needed; httpx
 - Match the surrounding style: dense module docstrings that explain *why*, type hints,
   `from __future__ import annotations`. New env-configurable values go in `config.py`
   **and** `.env.example`.
+- **Changing a served context is a cross-repo change.** `rivaborn/opencode-config`'s
+  `opencode.json` pins `limit.context + limit.output == served ceiling` per model, because
+  opencode uses `output` as a fixed `max_tokens` and caps the prompt at `context` with no
+  reservation — so a ceiling change silently makes it either wasteful (short) or 400-prone
+  (long). Any edit to a `serve.sh` `--max-model-len`, a Spark `extra_args` cap, a baked
+  Ollama `num_ctx`, or `OLLAMA_CONTEXT_LENGTH` obliges a re-sync there. `ContextUpdate.md`
+  holds the current per-tier tables; audit with
+  `curl -s :11430/v1/models | jq -r '.data[].id'` (no lane header lists the whole fleet).
+  Model **ids** matter as much as limits: they match by exact string, so a renamed
+  `served_name` is a silent 404 at `/model` time, not a config error.
+- Pooling/OCR models (`qwen3-embed`, `surya-ocr-2`, `qwen3-vl-embedding-8b`,
+  `qwen3-vl-reranker-8b`) are deliberately **absent** from `opencode.json` — they serve
+  `/v1/embeddings`, `/v1/rerank` and `/v1/score`, not chat. `/v1/models` lists them, so
+  that id diff is expected; don't "fix" it.
 
 ## Don't
 

@@ -1,5 +1,22 @@
 # opencodeUpdate — `/v1` auto-loading gateway for opencode `/model`
 
+> ## ✅ IMPLEMENTED — this is now a historical spec, not a work item
+>
+> Shipped as **`llmconfig/openai_gateway.py`** (~48 KB), `include_router`-ed into `main:app` exactly
+> as the layout suggestion below proposed. Every endpoint and edge case in this document is live.
+> **Read the code, not this file, for current behaviour** — the implementation has since grown well
+> past the spec:
+>
+> | Beyond the spec                | What shipped                                                                                  |
+> | ------------------------------ | --------------------------------------------------------------------------------------------- |
+> | **More lanes**                 | the spec knew `primary` + `companion`; there are now also `spark1`–`spark4` (remote DGX nodes) |
+> | **`X-LLM-Lane: auto`**         | `placement.py` picks the unit — resident → free capacity → evict idle+unleased. `auto` is a reserved id. Advisory by design (hard invariant 15) |
+> | **`X-LLM-Hold`**               | the gateway claims/renews a **preemptible** lease per request so a static config can protect its model without a lease id (hard invariant 16) |
+> | **`X-LLM-Workload`**           | interactive-vs-batch tiering — 3090 = speed tier, Sparks = capacity tier (hard invariant 15)   |
+> | **Pooling endpoints**          | `POST /v1/embeddings`, `/v1/rerank`, `/v1/score` — not in this spec at all                     |
+>
+> The verification checklist at the bottom was executed and passed; the `/model`-picker goal is met.
+
 **Goal:** let opencode users switch models with just `/model <provider>/<name>` — no manual `/swap`.
 opencode's `/model` picker has **no selection-time hook**, so the load must happen on the **inference
 path**: opencode's first request for the picked model triggers the load. Build an **OpenAI-compatible
@@ -70,8 +87,31 @@ opencode sets each provider's `baseURL` to `http://192.168.1.40:11430/v1`.
 
 ## opencode side (done separately in `rivaborn/opencode-config` — the compatibility contract)
 - providers `ollama` / `vllm` / `companion` set `baseURL=http://192.168.1.40:11430/v1`; the
-  `companion` provider adds `customHeaders: {"X-LLM-Lane":"companion"}`. Model ids are unchanged
+  `companion` provider adds the `X-LLM-Lane: companion` header. Model ids are unchanged
   (vLLM served_names, Ollama tags). The gateway must accept those ids + the `X-LLM-Lane` header.
+
+> ❌ **This spec originally said `customHeaders` — that key does not exist and fails SILENTLY.**
+> Corrected 2026-07-29. opencode's config schema has no `customHeaders`; it is dropped with no
+> warning and no validation error, so the request arrives with **no** `X-LLM-Lane`, the gateway falls
+> back to the default lane, and you get `model 'X' not found on lane 'primary'` — which reads like a
+> server bug rather than a config typo. The correct key is **`options.headers`**:
+>
+> ```json
+> "options": { "baseURL": "http://192.168.1.40:11430/v1",
+>              "headers": { "X-LLM-Lane": "companion" } }
+> ```
+>
+> Verified 2026-07-24 with `opencode run --model spark1/gemma-4-26b-fp8`. Worse, `companion` carried
+> the typo and *appeared* to work — both Ollama instances share one model store, so an un-laned
+> `companion/qwen2.5:1.5b` silently resolved on the **3090** instead of the 3070 Ti. Wrong GPU, never
+> an error. When adding a lane-selecting provider, test it with a model that exists on **only** that
+> unit, or the mistake stays invisible.
+
+- **Context limits are part of this contract.** Each model needs `limit.context + limit.output ==`
+  its served ceiling (`--max-model-len` for vLLM/Spark, baked `num_ctx` or `OLLAMA_CONTEXT_LENGTH`
+  for Ollama) — opencode uses `output` as a fixed `max_tokens` and caps the prompt at `context` with
+  no reservation. See `ContextUpdate.md`, which carries the current per-tier tables and the
+  `/api/show` trap. Re-synced 2026-07-29: 66 entries, all exact.
 
 ## Verify (curl the gateway directly)
 1. 3090 `free`; stream a chat request `model=qwen3-coder-30b` → SSE shows loading progress then a real
@@ -83,5 +123,7 @@ opencode sets each provider's `baseURL` to `http://192.168.1.40:11430/v1`.
 6. Non-stream request during a cold load → returns quickly, no hang.
 
 ---
-*Authored by the opencode-config session as a handoff spec; implement in the LLMConfig repo. The
-opencode.json provider rewire + wiki docs are handled on the opencode-config side once `/v1` is live.*
+*Authored by the opencode-config session as a handoff spec; implemented in the LLMConfig repo as
+`llmconfig/openai_gateway.py`. The `opencode.json` provider rewire is done (all 8 providers point at
+`/v1`); the wiki half is still pending — `docs-vm` has been unreachable since 2026-07-28 21:45 EDT,
+so those edits are queued in `V:\Coding\ClaudeMemory\DeferedWikiUpdates.md`.*

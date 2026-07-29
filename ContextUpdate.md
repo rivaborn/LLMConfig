@@ -16,6 +16,11 @@ This is the **box-side half**. The opencode side is already done: `opencode.json
 commit `5f343df`). When you raise a `--max-model-len`, tell the opencode-config session and they
 re-sync.
 
+> **Scope note (2026-07-29).** This doc was written when the lab had two context tiers, vLLM and
+> Ollama. There are now **three** — the four DGX Sparks are a tier of their own, ceilinged per
+> recipe in the catalog rather than in `serve.sh`. Sections added below. All three were re-audited
+> against the live box on 2026-07-29 and `opencode.json` re-synced to match (66 entries).
+
 ## Served contexts — ✅ essentially DONE (audited against live serve.sh 2026-07-24)
 
 Read from the running `/home/folar/vllm/serve.sh`, not from memory. Almost everything this
@@ -62,6 +67,52 @@ Nothing on the vLLM side. The one real gap found in this audit was not a context
 the live `qwen3-embed` case had never been committed to `deploy/serve.sh`, so a redeploy would
 have silently dropped the embeddings server (hard invariant 13). Now committed.
 
+**Re-audited 2026-07-29 against `deploy/serve.sh`: all 15 values above are unchanged.** The vLLM
+tier is stable; every entry in `opencode.json`'s `vllm` provider already summed exactly to its
+ceiling and needed no edit.
+
+## Spark served contexts — the third tier (added 2026-07-29)
+
+A Spark's ceiling is **not** in `serve.sh`. It is the `--max-model-len` pinned in each recipe's
+`extra_args` in `llmconfig/data/spark_models.default.yaml`, because the upstream recipes are sized
+for two nodes and must be capped down for one. **They are not one flat number** — the assumption
+that every recipe served 65536 was true only at first:
+
+| served_name             | max-model-len | mem_fraction | status                | note                                          |
+| ----------------------- | ------------: | -----------: | --------------------- | --------------------------------------------- |
+| `gemma-4-26b-fp8`       |     **65536** |         0.40 | ok (verified 07-24)   | `needs_empty_node` — ~74 GB load transient    |
+| `gpt-oss-120b`          |     **65536** |     *(unset)* | unverified            | no budget = whole-node claim                  |
+| `qwen35-35b-a3b`        |     **65536** |         0.50 | unverified            | SGLang                                        |
+| `qwen3-coder-next`      |    **262144** |         0.60 | unverified            | KV only 12 GB at full window                  |
+| `qwen36-35b-a3b`        |    **262144** |         0.52 | unverified            | +MTP speculative decoding                     |
+| `qwen36-27b`            |    **262144** |         0.68 | unverified            | dense 27B, 32 GB KV                           |
+| `qwen35-122b-int4`      |    **262144** |         0.80 | **ok (verified 07-29)** | needs the marlin env override — see below   |
+| `qwen3-vl-embedding-8b` |         32768 |         0.33 | unverified            | pooling runner → `/v1/embeddings`             |
+| `qwen3-vl-reranker-8b`  |         32768 |         0.35 | unverified            | pooling → `/v1/rerank`, `needs_empty_node`    |
+
+### The 122B serves 262144, and the window was never the problem
+
+Earlier notes in this repo and in `opencode-config` recorded it at 64K, then 131072. Both are
+superseded. Verified 2026-07-29 straight off the node — `spark1:8000/v1/models` reports
+`max_model_len: 262144` — and it is the model currently resident there.
+
+The failure that produced the 64K figure (booted at 94.8 % pool, died on its **first token**,
+RayWorker killed with `NVRM NV_ERR_NO_MEMORY`) was fixed by an **env override, not a smaller
+window**:
+
+```yaml
+extra_args: ["--max-model-len", "262144", "-o", "env.VLLM_MARLIN_USE_ATOMIC_ADD=0"]
+```
+
+The `@eugr` recipe ships that env set to `1`; on GB10 the marlin split-K path dies during
+CUDA-graph capture (capture 23 of 51, *"CUDA error: an illegal instruction was encountered"*).
+Weights and KV were never the constraint — 62.87 GiB weights, 31.2 GiB KV free, and the measured
+KV pool is 1,121,010 tokens, so the 256K cap costs no memory at all.
+
+**Generalise from this:** `-o env.KEY=VAL` in `extra_args` (substituted into `SPARK_RUN_CMD`'s
+`{extra}`) is load-bearing, not decoration. Before concluding a Spark model needs a smaller context,
+check whether a recipe env default is what is actually killing it.
+
 ## How (your existing recipe — per-alias in serve.sh)
 Mirror what `coder30-awq` already does:
 - **`--kv-cache-dtype fp8`** — halves KV/token; this is what bought coder30-awq 65536.
@@ -99,11 +150,56 @@ the architectural maximum that `/api/show` reports.
 > unaffected: the Modelfile wins over the service default, and baking a tag remains the way to
 > exceed it (hard invariant 6 — never add a context arg to the load path).
 
+### Per-tag effective windows (measured 2026-07-29 via `/api/show`)
+
+`served = baked num_ctx, else OLLAMA_CONTEXT_LENGTH (32768)`. Only five tags carry a bake:
+
+| tag                       | baked `num_ctx` |    served | note                                     |
+| ------------------------- | --------------: | --------: | ---------------------------------------- |
+| `qwen2.5-coder:32b-8k`    |            8192 |      8192 | bake                                     |
+| `qwen2.5-coder:32b-12k`   |           12288 |     12288 | bake                                     |
+| `qwen3.6:27b-64k`         |           65536 |     65536 | bake                                     |
+| `qwen3.6:27b-96k`         |           98304 |     98304 | bake — full-GPU                          |
+| `qwen3.6:27b-128k`        |          131072 |    131072 | bake — ~16 tok/s, CPU spill              |
+| *all other tags*          |        *(none)* | **32768** | service default truncates                |
+
+"All other tags" is `qwen3-coder:30b`, `qwen2.5-coder:32b`, `qwen2.5-coder:14b`, `qwen2.5:1.5b`,
+`devstral-small-2:latest`, `qwen3:32b`, `qwen3.6:35b-a3b`, `qwen3.6:27B`, `Qwen3.5:27B`,
+`qwen2.5vl:32b`, `qwen2.5vl:7b`, `gemma4:26b`.
+
+> ⚠️ **The `/api/show` trap.** Read `num_ctx` out of the **`parameters`** block. Do *not* read
+> `model_info.*context_length*` — that is the **architectural** maximum and is wildly larger:
+> `qwen3.6:27B` reports 262144, `devstral-small-2` 393216, `qwen2.5vl:7b` 128000. Sizing
+> `opencode.json` from those would set limits up to 8× the real window, and the model would 400 on
+> any long prompt while looking perfectly configured. A tag with no `num_ctx` in `parameters` serves
+> 32768 no matter what `model_info` claims.
+
 ## opencode.json contract (already in place)
 - `context = served − output`, because opencode uses `output` as a fixed `max_tokens` and caps the
   prompt at `context` with **no** reservation. Keep that invariant.
+- It is **equality, not `<=`**. Anything below the ceiling is window you paid VRAM for and cannot
+  use; anything above it is a 400 mid-session.
 - After each `--max-model-len` bump: send the opencode-config session the new served value; they set
   `context = served − output` and drop the "(4K ctx)" labels.
+- **This now covers three tiers, not two** — a Spark `extra_args` change or an Ollama re-bake
+  obliges the same re-sync as a `serve.sh` edit.
+- **Pooling and OCR models are deliberately excluded** from `opencode.json`: `qwen3-embed`,
+  `surya-ocr-2`, `qwen3-vl-embedding-8b`, `qwen3-vl-reranker-8b`. They serve `/v1/embeddings`,
+  `/v1/rerank` and `/v1/score`, not chat, so they would be dead entries in the `/model` picker.
+  `/v1/models` lists them — expect that diff when auditing ids, and don't "fix" it.
+
+### Re-sync 2026-07-29 (state after)
+
+Audited every id against the live gateway and every limit against its ceiling: **66 entries across
+8 providers, all satisfying `context + output == served`, zero stale ids.** What was wrong:
+
+| Provider    | Fixed                                                                                   |
+| ----------- | --------------------------------------------------------------------------------------- |
+| `auto`      | 122B `65536` → **262144** (4× understated — the single biggest miss)                    |
+| `sparkN` ×4 | flat `57344 + 8192` replaced by real per-recipe ceilings; **added** `qwen36-35b-a3b` and `qwen35-122b-int4` (5 → 7 models each) |
+| `ollama`    | **added** `qwen3.6:27b-64k` (missing entirely); explicit limits on **11** tags that had none and were relying on opencode's own default; `32b-8k`/`32b-12k` corrected |
+| `companion` | added `30720 + 2048` (its service default was once unset → Ollama's 4096)                |
+| `vllm`      | nothing — already exact                                                                  |
 
 ## Verify
 Per raised alias: `serve.sh <alias>` → `/api/status` shows it loaded → a canary recall test near the
