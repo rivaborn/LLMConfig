@@ -185,27 +185,35 @@ models:
   # FASTER than the 2-node FP8 build, not slower -- two nodes buy quality and KV
   # headroom here, not speed.
   #
-  # 131072 rather than the recipe's 262144: sparkrun estimates KV at 24 GB for the
-  # full window, which on top of 71.46 GB of weights leaves ~1.3 GB of margin against
-  # the ~96.8 GB usable at util 0.8 -- too close to launch confidently.
+  # 262144 = the model's native window (config.json max_position_embeddings, no rope
+  # scaling). This entry ran at 65536 first, because sparkrun estimates KV at 24 GB
+  # for the full window, which on top of 71.46 GB of weights would leave ~1.3 GB of
+  # margin against the ~96.8 GB usable at util 0.8. THAT ESTIMATE IS ~4x TOO HIGH,
+  # and it is now measured rather than argued.
   #
-  # BUT that estimate is probably ~4x too high. config.json shows a HYBRID stack:
+  # config.json shows a HYBRID stack:
   #   layer_types = 36 x linear_attention + 12 x full_attention  (48 layers total)
   # Only the 12 full-attention layers keep a KV cache that grows with context; the
   # linear-attention layers hold a fixed-size recurrent state. sparkrun's estimator
   # appears to charge all 48 (2*48*2 kv_heads*256 head_dim*2 B = 98304 B/token gives
-  # exactly its 24 GB figure). Counting only the 12 gives ~6.4 GB at 262144, i.e.
-  # ~78 GB total -- comfortable on one node.
+  # exactly its 24 GB figure). Counting only the 12 predicted ~6.4 GB at 262144.
+  # The live load reported a 31.2 GiB pool holding 1,121,010 tokens, i.e. 262144
+  # tokens ~= 7.3 GiB. Prediction confirmed; treat sparkrun's KV number as an UPPER
+  # BOUND on any hybrid model, never as a measurement.
+  #
+  # WHY RAISING IT IS FREE: `max_model_len` does NOT size the KV pool. vLLM v1
+  # allocates the whole leftover budget as KV blocks regardless, and max_model_len
+  # only caps how long ONE request may be. Going 65536 -> 262144 therefore costs
+  # zero memory; the only thing that changes is the worst-case line vLLM prints,
+  # "Maximum concurrency for N tokens per request", 17.11x -> 4.28x. That figure is
+  # pool_tokens/max_model_len, not a scheduler limit — short requests are scheduled
+  # by blocks actually used and are completely unaffected. Do not read it as a
+  # throughput regression.
   #
   # THE RECIPE'S OWN ENV IS A LANDMINE — see the -o override below. This entry is
   # VERIFIED as of 2026-07-29: it loads in ~5 min and serves batched inference.
   #
-  # ONE THING LEFT TO TEST (fails fast, costs minutes):
-  #   Raise to --max-model-len 262144. If the hybrid-KV reading is right it fits
-  #   with ~19 GB spare; if vLLM really does allocate for all 48 layers it OOMs
-  #   at load and we stay here. Treat sparkrun's KV number as an UPPER bound on
-  #   any hybrid model, not a measurement.
-  # Also untested: --tool-call-parser qwen3_coder instead of the recipe's qwen3_xml.
+  # Still untested: --tool-call-parser qwen3_coder instead of the recipe's qwen3_xml.
   # The NVIDIA forum recipe thread reports qwen3_coder is the one that works with
   # opencode, this lab's primary client -- but the parser is baked into the recipe's
   # command template with no placeholder, so changing it needs a recipe fork, not a
@@ -219,7 +227,11 @@ models:
     # NOT 0.85: at 0.85/131072 the 122B BOOTED (94.8% pool) then died on its FIRST
     # token — RayWorker killed, NVRM NV_ERR_NO_MEMORY. The first forward pass needs
     # Triton-JIT + cudagraph-capture + activation workspace OUTSIDE the vLLM budget,
-    # and ~6 GB of node headroom was not enough. 0.80 + 65536 leaves ~17 GB.
+    # and ~6 GB of node headroom was not enough. 0.80 leaves ~17 GB.
+    # Note the two knobs spend DIFFERENT pools and must not be confused: context
+    # length spends the KV pool INSIDE the budget, mem_fraction spends the node
+    # headroom OUTSIDE it. That is why 65536 -> 262144 is free while 0.80 -> 0.85
+    # was fatal, and why raising the context did not re-open that failure.
     mem_fraction: 0.8
     # `-o env.VLLM_MARLIN_USE_ATOMIC_ADD=0` IS LOAD-BEARING — without it this model
     # cannot start at all. The @eugr recipe ships `env: VLLM_MARLIN_USE_ATOMIC_ADD: 1`,
@@ -239,7 +251,7 @@ models:
     # NEVER READS IT (cli/_run.py:92 -- dead click argument), so anything passed
     # after `--` is silently dropped. What DOES reach the server is:
     #   * a real sparkrun option (--max-model-len, --gpu-mem, --port, ...) — which
-    #     is the only reason "--max-model-len 65536" below works; and
+    #     is the only reason "--max-model-len 262144" below works; and
     #   * `-o key=value`, which overrides a recipe `defaults:` key, and the special
     #     `-o env.NAME=VALUE`, which writes straight into recipe.env (cli/_common.py
     #     "Apply env.* overrides to recipe.env directly").
@@ -248,10 +260,12 @@ models:
     # only lands if the recipe's command template has a matching {placeholder}, which
     # this one does not. Changing anything else about the launch means forking the
     # recipe yaml into a local registry.
-    extra_args: ["--max-model-len", "65536", "-o", "env.VLLM_MARLIN_USE_ATOMIC_ADD=0"]
+    extra_args: ["--max-model-len", "262144", "-o", "env.VLLM_MARLIN_USE_ATOMIC_ADD=0"]
     notes: >-
-      Intel/Qwen3.5-122B-A10B-int4-AutoRound on ONE node. 71.46 GB weights. 65536 ctx
-      (131072 at 0.85 died on its first token — see the mem_fraction note). Tool calls via qwen3_xml + reasoning parser qwen3, prefix caching.
+      Intel/Qwen3.5-122B-A10B-int4-AutoRound on ONE node. 71.46 GB weights. 262144 ctx
+      — the native window, and free: the measured KV pool is 1,121,010 tokens, so
+      262144 is 23% of it and raising the cap costs no memory (see the comment above).
+      Tool calls via qwen3_xml + reasoning parser qwen3, prefix caching.
       The only single-node 122B; the FP8 build needs 2 nodes.
       Needs -o env.VLLM_MARLIN_USE_ATOMIC_ADD=0 or CUDA-graph capture dies on GB10.
     load_timeout_s: 1800
