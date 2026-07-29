@@ -84,6 +84,7 @@ function showView(name) {
   // the hooks are always registered by the time a tab can be clicked.
   const hooks = window.MonitorHooks;
   if (hooks) (name === "monitor" ? hooks.start : hooks.stop)();
+  if (name === "cluster") clusterEnter();
 }
 
 function buildTabs() {
@@ -104,6 +105,9 @@ function buildTabs() {
   mk("home", "Home", "All units at a glance");
   UNITS.forEach((u) =>
     mk(u.id, u.name || u.id, u.kind === "spark" ? `DGX Spark · ${u.host}` : "Local GPU lane"));
+  // Multi-node loading needs at least two Sparks to combine.
+  if (UNITS.filter((u) => u.kind === "spark").length >= 2)
+    mk("cluster", "Cluster", "Load one model across several Spark nodes");
   mk("monitor", "Monitor", "Telemetry for every unit");
 }
 
@@ -318,6 +322,26 @@ function renderResident(host, l) {
     label.className = "uc-model-name";
     label.textContent = describeLoaded(m) + (ctx ? `  ·  ${ctx}` : "");
     row.appendChild(label);
+    // A multi-node residency: this row is one rank of a deployment spanning
+    // `m.group`'s members. Badge the span; teardown is a group operation, so
+    // the row gets its own Stop that goes through /api/cluster/unload.
+    if (m.group) {
+      const members = m.group.split("_");
+      const badge = document.createElement("span");
+      badge.className = "uc-group-badge";
+      badge.textContent = `×${members.length} · ${members.join("+")}`;
+      badge.title = `One tensor-parallel job across ${members.join(", ")} — manage it from the Cluster tab`;
+      row.appendChild(badge);
+      const x = document.createElement("button");
+      x.className = "btn btn-warn uc-model-unload";
+      x.textContent = "×";
+      x.title = `Stop ${m.model} on ALL of ${members.join(", ")}`;
+      x.disabled = isBusy(l.id, m.model);
+      x.onclick = () => clusterUnload(members);
+      row.appendChild(x);
+      host.appendChild(row);
+      return;
+    }
     // Only worth offering per-model when there IS a neighbour to spare; with one
     // occupant the unit-level "Free all" already says it better.
     if (models.length > 1) {
@@ -701,6 +725,166 @@ async function cbDelete() {
   await cbRefresh();
 }
 
+// ---- Cluster tab: multi-node (tensor-parallel) launches -------------------
+// One node = the normal single-node load path; two or more = one sparkrun job
+// spanning them (POST /api/cluster/load). Fit and addability are computed
+// SERVER-side (/api/cluster/models — invariant 14); this only renders them.
+const CLUSTER = { nodes: new Set() };
+
+function clusterSelected() {
+  // In UNITS order, which is the members' lock order server-side too.
+  return UNITS.filter((u) => u.kind === "spark" && CLUSTER.nodes.has(u.id)).map((u) => u.id);
+}
+
+function clusterBuildPicker() {
+  const seg = $("cluster-nodes");
+  if (!seg) return;
+  seg.innerHTML = "";
+  UNITS.filter((u) => u.kind === "spark").forEach((u) => {
+    const b = document.createElement("button");
+    b.className = "seg-btn" + (CLUSTER.nodes.has(u.id) ? " active" : "");
+    b.textContent = u.name || u.id;
+    b.title = u.host;
+    b.onclick = () => {
+      if (CLUSTER.nodes.has(u.id)) CLUSTER.nodes.delete(u.id); else CLUSTER.nodes.add(u.id);
+      b.classList.toggle("active", CLUSTER.nodes.has(u.id));
+      clusterRefreshModels();
+    };
+    seg.appendChild(b);
+  });
+}
+
+async function clusterRefreshModels() {
+  const sel = $("cluster-model");
+  const note = $("cluster-note");
+  if (!sel) return;
+  const picked = clusterSelected();
+  const k = picked.length;
+  if (k === 0) {
+    fillSelect(sel, []);
+    note.textContent = "pick at least one node";
+    $("cluster-launch").disabled = true;
+    $("cluster-stop").disabled = true;
+    return;
+  }
+  $("cluster-stop").disabled = false;
+  let opts = [];
+  try {
+    if (k === 1) {
+      // Single node — the existing per-unit list, exactly as the Home card shows it.
+      const d = await api("/api/models?lane=" + encodeURIComponent(picked[0]));
+      const unit = UNITS.find((u) => u.id === picked[0]);
+      opts = (d.spark || []).map((m) => {
+        const est = estFor(unit, "spark", m.alias);
+        const bits = [est ? est.text : "no load data yet"];
+        if (m.add_note) bits.push(m.add_note);
+        return { value: m.alias, label: `${m.alias}  ·  1 node`,
+                 disabled: !m.addable && !m.loaded, title: bits.join(" — ") };
+      });
+      note.textContent = "single node — loads through the normal per-node path";
+    } else {
+      const d = await api("/api/cluster/models?nodes=" + encodeURIComponent(picked.join(",")));
+      opts = d.map((m) => {
+        const rec = LOAD_TIMES[`spark:${m.alias}:x${k}`];
+        const bits = [rec ? `${fmtDur(rec.est_s)} load (median of ${rec.n})` : "no load data yet"];
+        if (m.add_note) bits.push(m.add_note);
+        return { value: m.alias,
+                 label: `${m.alias}  ·  ${m.min_nodes}-${m.max_nodes} nodes  ·  tp${k}`,
+                 disabled: !m.addable && !m.loaded, title: bits.join(" — ") };
+      });
+      note.textContent = d.length
+        ? (d[0].add_note && !d.some((m) => m.addable) ? d[0].add_note : `tp=${k} across ${picked.join(" + ")}`)
+        : `no cluster-catalog model fits ${k} nodes`;
+    }
+  } catch (e) {
+    fillSelect(sel, []);
+    note.textContent = "error: " + e.message;
+    $("cluster-launch").disabled = true;
+    return;
+  }
+  fillSelect(sel, opts, "");
+  const chosen = sel.selectedOptions[0];
+  $("cluster-launch").disabled = !opts.length || (chosen && chosen.disabled);
+}
+
+async function clusterLaunch() {
+  const picked = clusterSelected();
+  const model = $("cluster-model").value;
+  if (!picked.length || !model) return;
+  if (picked.length === 1) return doLoad(picked[0], "spark", model);
+  log(`launching ${model} across ${picked.join(" + ")} (tp=${picked.length})…`);
+  picked.forEach((uid) => markBusy(uid, true));
+  try {
+    const job = await api("/api/cluster/load", {
+      method: "POST", body: JSON.stringify({ model, nodes: picked }),
+    });
+    await pollJob(job.id);
+  } catch (e) { log("error: " + e.message, true); }
+  picked.forEach((uid) => markBusy(uid, false));
+  await refreshAll();
+  await clusterRefreshModels();
+  await clusterRefreshPlacements();
+}
+
+async function clusterUnload(nodes) {
+  const picked = nodes || clusterSelected();
+  if (!picked.length) return;
+  if (picked.length === 1) return doUnload(picked[0]);
+  log(`stopping the deployment on ${picked.join(" + ")}…`);
+  picked.forEach((uid) => markBusy(uid, true));
+  try {
+    await api("/api/cluster/unload", {
+      method: "POST", body: JSON.stringify({ nodes: picked }),
+    });
+    log("deployment stopped", true);
+  } catch (e) { log("error: " + e.message, true); }
+  picked.forEach((uid) => markBusy(uid, false));
+  await refreshAll();
+  await clusterRefreshModels();
+  await clusterRefreshPlacements();
+}
+
+async function clusterRefreshPlacements() {
+  const host = $("cluster-placements");
+  if (!host) return;
+  let rows = [];
+  try { rows = await api("/api/cluster/placements"); } catch (e) { return; }
+  host.innerHTML = "";
+  if (!rows.length) {
+    host.textContent = "none yet — the first successful multi-node launch is recorded here";
+    return;
+  }
+  rows.forEach((p) => {
+    const card = document.createElement("div");
+    card.className = "card" + (p.live ? " loaded-card" : "");
+    const left = document.createElement("div");
+    left.innerHTML = `<div class="name">${esc(p.alias)}` +
+      (p.live ? ` <span class="tag ok">live</span>` : "") +
+      `</div><div class="meta">${esc(p.members.join(" + "))} · ${p.loads} load${p.loads === 1 ? "" : "s"}</div>`;
+    const actions = document.createElement("div");
+    actions.className = "actions";
+    const use = document.createElement("button");
+    use.className = "btn";
+    use.textContent = "Select";
+    use.title = "Set the node picker to this set";
+    use.onclick = () => {
+      CLUSTER.nodes = new Set(p.members);
+      clusterBuildPicker();
+      clusterRefreshModels();
+    };
+    actions.appendChild(use);
+    card.appendChild(left);
+    card.appendChild(actions);
+    host.appendChild(card);
+  });
+}
+
+function clusterEnter() {
+  clusterBuildPicker();
+  clusterRefreshModels();
+  clusterRefreshPlacements();
+}
+
 // ---- boot ----------------------------------------------------------------
 async function refreshAll() { await refreshStatus(); await refreshModels(); }
 
@@ -719,10 +903,21 @@ async function boot() {
     const p = buildPanel(u); panels[u.id] = p; views.appendChild(p.el);
   });
 
-  // Deep-link support: #<unitId> / #monitor / #home. Unknown hashes fall back Home.
+  // Deep-link support: #<unitId> / #cluster / #monitor / #home. Unknown hashes
+  // fall back Home.
   const want = (location.hash || "#home").slice(1);
-  const known = ["home", "monitor", ...UNITS.map((u) => u.id)];
+  const known = ["home", "cluster", "monitor", ...UNITS.map((u) => u.id)];
   showView(known.includes(want) ? want : "home");
+
+  const cl = $("cluster-launch");
+  if (cl) cl.onclick = () => clusterLaunch();
+  const cs = $("cluster-stop");
+  if (cs) cs.onclick = () => clusterUnload();
+  const cm = $("cluster-model");
+  if (cm) cm.addEventListener("change", () => {
+    const chosen = cm.selectedOptions[0];
+    if (cl) cl.disabled = !cm.value || (chosen && chosen.disabled);
+  });
 
   await refreshAll();
 }

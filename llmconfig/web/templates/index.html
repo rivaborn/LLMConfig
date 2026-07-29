@@ -38,6 +38,25 @@
   <!-- Per-unit views are injected here by app.js (id="view-<unitId>"). -->
   <div id="unit-views"></div>
 
+  <!-- Cluster: launch ONE model across several Spark nodes (tensor-parallel over
+       the 200G fabric). A planner until SPARK_FABRIC_ENABLED is on. -->
+  <section id="view-cluster" class="view" role="tabpanel" hidden>
+    <p class="hint">Pick Spark nodes, then a model that fits that many. One node uses the
+      normal single-node load; two or more launch a single tensor-parallel job spanning them
+      (each node claimed whole). Multi-node models live in the cluster catalog only.</p>
+    <div class="cluster-bar">
+      <div class="seg" id="cluster-nodes" role="group" aria-label="Spark nodes"></div>
+      <select id="cluster-model" class="uc-select" aria-label="Model"></select>
+      <button class="btn" id="cluster-launch">Launch</button>
+      <button class="btn btn-warn" id="cluster-stop" title="Stop the deployment on the selected node set">Stop</button>
+      <span class="cb-note" id="cluster-note"></span>
+    </div>
+    <h3 class="cluster-h">Recorded placements</h3>
+    <p class="hint">Every (model, node set) that has launched successfully — these survive restarts
+      and are what auto-placement may cold-start.</p>
+    <div id="cluster-placements" class="list"></div>
+  </section>
+
   <section id="view-monitor" class="view" role="tabpanel" hidden>
     <div id="offload-banner" class="offload-banner" hidden></div>
 
