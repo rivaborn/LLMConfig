@@ -477,3 +477,56 @@ async def test_ollama_only_lane_never_probes_its_dead_relay(tmp_path, monkeypatc
     st = await lane.status()
     assert probes == []
     assert st.owner == "free" and st.vllm_up is False
+
+
+async def test_ollama_only_lane_load_and_unload_never_probe_the_relay(tmp_path, monkeypatch):
+    """`_load_ollama`'s fast path and `_occupied_by` both asked vLLM what it was
+    serving — on an Ollama-only lane that's a blackholed SYN (invariant 5), a
+    ~1 s tax on EVERY companion load and targeted unload, for a relay that can
+    never exist."""
+    import llmconfig.lane as lane_mod
+    from llmconfig.gpu import GpuInfo
+    from llmconfig.jobs import JobManager
+    from llmconfig.orchestrator import Orchestrator
+    from llmconfig.registry import Registry
+
+    async def fake_query_gpu(set_=None, uuid=None, **kw):
+        return GpuInfo(found=True, uuid=uuid or "GPU-y", total_mb=8192,
+                       used_mb=3000, free_mb=5192)
+
+    monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)
+    s = _ollama_only_settings(tmp_path)
+    jobs = JobManager()
+    orch = Orchestrator(s, Registry(s.registry_path), jobs)
+    lane = orch.lanes["companion"]
+
+    async def boom(*a, **k):
+        raise AssertionError("the relay must not be probed on an Ollama-only lane")
+
+    monkeypatch.setattr(lane.vllm, "served", boom)
+    monkeypatch.setattr(lane.vllm, "served_info", boom)
+
+    resident = OllamaModel(name="m:1", size_bytes=GiB, loaded=True,
+                           size_vram_bytes=GiB)
+
+    async def loaded():
+        return [resident]
+
+    async def loaded_names():
+        return ["m:1"]
+
+    async def ollama_up():
+        return True
+
+    monkeypatch.setattr(lane.ollama, "loaded", loaded)
+    monkeypatch.setattr(lane.ollama, "loaded_names", loaded_names)
+    monkeypatch.setattr(lane.ollama, "up", ollama_up)
+
+    # Fast path (already the sole resident) — used to pay the probe up front.
+    job = lane.load(LoadRequest(server="ollama", model="m:1", lane="companion"))
+    await jobs._tasks[job.id]
+    assert job.state == "succeeded", job.error
+
+    # Targeted unload of a non-resident — _occupied_by used to probe too.
+    st = await lane.unload(UnloadRequest(server=None, lane="companion", model="ghost:1"))
+    assert st.owner == "ollama"

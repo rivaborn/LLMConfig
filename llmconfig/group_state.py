@@ -26,6 +26,7 @@ from pathlib import Path
 import yaml
 
 from .config import group_id_for
+from .fsio import atomic_write_text
 
 
 @dataclass(frozen=True)
@@ -132,10 +133,12 @@ class GroupPlacements:
                 self._data[str(alias)] = out
 
     def save(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(
+        # Atomic like every other data/ writer (fsio): a power cut mid-write must
+        # not tear the file — the tolerant loader would read that as "no
+        # placements", silently dropping every recorded node set.
+        atomic_write_text(
+            self.path,
             yaml.safe_dump({"placements": self._data}, sort_keys=False, allow_unicode=True),
-            encoding="utf-8",
         )
 
     # ---- reads ----

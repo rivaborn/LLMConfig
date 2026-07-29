@@ -37,7 +37,7 @@ from .group_state import GroupPlacements, GroupState
 from .jobs import JobManager
 from .registry import SparkRegistry
 from .schemas import (GpuOut, Job, LaneStatus, LoadedModel, LoadRequest,
-                      UnloadRequest)
+                      ServedModel, UnloadRequest)
 from .spark_unit import SparkUnit
 
 
@@ -109,7 +109,16 @@ class SparkGroup:
     # Status — HTTP probe of the head's group port ONLY (invariant 9)
     # ------------------------------------------------------------------ #
     async def status(self, gpu: GpuInfo | None = None) -> LaneStatus:
-        served = await self.head.spark.served_info(self.cfg.api_port)
+        # Ride the HEAD member's probe breaker instead of keeping a second one:
+        # the group's port IS one of the head's slot ports, so "the head's slots
+        # all timed out recently" is exactly the evidence that this probe would
+        # burn its timeout too. Without this, a powered-off head cost the full
+        # connect timeout on every placer sweep even while the member's own
+        # status had already backed off (invariant 9's reasoning).
+        head_down = (self.head._served_fails >= self.head._fails_before_backoff
+                     and time.time() - self.head._served_ts < self.head._probe_backoff_s)
+        served = (ServedModel() if head_down
+                  else await self.head.spark.served_info(self.cfg.api_port))
         entry = (self.registry.find_by_served_name(served.name)
                  if served.name else None)
 
@@ -260,13 +269,16 @@ class SparkGroup:
                     )
             own_claim = self.group_state.get(self.cfg.id)
 
-            # Reloading this group's own model: tear the old job down first.
+            # Reloading this group's own model: tear the old job down first —
+            # VERIFIED gone, because relaunching over a lying stop would let
+            # wait_ready see the OLD ranks and report a reload that never
+            # happened (the same trap SparkUnit's reload path guards against).
             if own_claim is not None:
                 if own_claim.model == target and not req.force:
                     self.jobs.log(job, f"{self.cfg.name} already serving {target}")
                     return self._result(target, self.cfg.api_port)
                 self.jobs.log(job, f"stopping {own_claim.model} to reload…")
-                await self._stop_current(job, own_claim.alias)
+                await self._stop_current(job, own_claim.alias, verify_gone=True)
 
             # Whole-node semantics across every member: everything resident must
             # go, and every eviction is re-validated under the member's lock
@@ -406,10 +418,18 @@ class SparkGroup:
             self._lock.release()
         return await self.status()
 
-    async def _stop_current(self, job: Optional[Job], alias: Optional[str]) -> None:
+    async def _stop_current(self, job: Optional[Job], alias: Optional[str],
+                            verify_gone: bool = False) -> None:
         """Stop the group's job by sparkrun JOB ID (cluster-wide — one id tears
         down every rank), release the claim, then RE-PROBE the head: `sparkrun
-        stop` swallows SSH failures into rc=0, so the probe is the only proof."""
+        stop` swallows SSH failures into rc=0, so the probe is the only proof.
+
+        `verify_gone` (the RELOAD path) polls the head until the old server
+        actually stops answering and RAISES if it never does — launching over a
+        surviving job would let wait_ready see the old ranks and report a reload
+        that never happened. A plain unload keeps the single-probe warning:
+        status() shows the truth and there is nothing about to be launched over
+        it (parity with SparkUnit.unload)."""
         entry = self.registry.get(alias) if alias else None
         recipe = (entry.recipe or entry.alias) if entry else None
         if recipe:
@@ -418,6 +438,16 @@ class SparkGroup:
             if job is not None and not r.ok and r.rc not in (0, 1):
                 self.jobs.log(job, f"stop reported rc={r.rc}: {r.text()[:200]}")
         self.group_state.release(self.cfg.id)
+        if verify_gone:
+            for _ in range(15):
+                if not (await self.head.spark.served_info(self.cfg.api_port)).name:
+                    return
+                await asyncio.sleep(1.0)
+            raise RuntimeError(
+                f"the previous deployment is still serving on "
+                f"{self.cfg.api_base_for(self.cfg.api_port)} 15s after the stop — "
+                f"sparkrun stop silently failed; not relaunching over it"
+            )
         still = (await self.head.spark.served_info(self.cfg.api_port)).name
         if still and job is not None:
             self.jobs.log(job, f"⚠ head still serving {still} after stop — "

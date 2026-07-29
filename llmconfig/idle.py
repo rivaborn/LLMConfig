@@ -190,6 +190,14 @@ class IdleReaper:
         idle_of = getattr(lane, "idle_for", None)
         stale: list[tuple[LoadedModel, float]] = []
         for m in st.loaded_models:
+            # A multi-node residency (m.group) is one rank of a deployment
+            # spanning OTHER nodes — this unit's unload() refuses it outright
+            # (a stop on one rank wedges the rest), so choosing it as the
+            # victim would just raise on every tick AND shadow a genuinely
+            # reapable neighbour (the claimed row has no clock of its own here,
+            # so it reads as the stalest). Teardown is /api/cluster/unload only.
+            if getattr(m, "group", ""):
+                continue
             idle = idle_of(m.model) if idle_of else (time.time() - lane.last_activity)
             if idle >= self.timeout_s and self.leases.blocks_idle_unload(lane.cfg.id, m.model) is None:
                 stale.append((m, idle))

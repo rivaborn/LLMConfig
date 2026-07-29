@@ -431,6 +431,107 @@ async def test_group_status_reclaims_after_restart(tmp_path, calls, state):
     assert gs.claim_for("spark2").model == "ds4-served"
 
 
+@respx.mock
+async def test_group_reload_verifies_the_stop(tmp_path, calls, state, monkeypatch):
+    """Relaunching over a lying `sparkrun stop` would let wait_ready see the OLD
+    ranks — the reload path must poll the head until the old server is gone and
+    refuse if it never is (parity with SparkUnit's reload guard)."""
+    group, *_ = make_group(tmp_path, ["spark1", "spark2"])
+    _routes(state, ["spark1", "spark2"])
+    await wait_job(group.load(LoadRequest(server="spark", model="ds4",
+                                          lane=group.cfg.id)))
+
+    # An HONEST stop: force-reload tears down, verifies gone, relaunches.
+    j = group.load(LoadRequest(server="spark", model="ds4", lane=group.cfg.id,
+                               force=True))
+    await wait_job(j)
+    assert j.state == "succeeded", j.error
+    assert sum(1 for c in calls if "sparkrun run" in c) == 2
+
+    # A LYING stop: rc=0, nothing actually stopped → the reload must refuse.
+    async def lying_stop(recipe=None, any_host_of=None):
+        return CmdResult(0, "Workload stopped", "")
+    monkeypatch.setattr(group.head.spark, "stop", lying_stop)
+    fast = asyncio.sleep
+    monkeypatch.setattr("llmconfig.spark_group.asyncio.sleep",
+                        lambda _s: fast(0))          # 15×1s poll → instant
+    j2 = group.load(LoadRequest(server="spark", model="ds4", lane=group.cfg.id,
+                                force=True))
+    await wait_job(j2)
+    assert j2.state == "failed"
+    assert "not relaunching over it" in j2.error
+    assert sum(1 for c in calls if "sparkrun run" in c) == 2, "must not relaunch"
+
+
+@respx.mock
+async def test_reaper_never_picks_a_group_claimed_resident(tmp_path, calls, state):
+    """The claimed row is one rank of a multi-node job — unload() refuses it, so
+    a reaper that chose it would raise on every tick AND shadow real victims."""
+    from dataclasses import replace
+    from llmconfig.idle import IdleReaper
+    group, members, gs, _ = make_group(tmp_path, ["spark1", "spark2"])
+    _routes(state, ["spark1", "spark2"])
+    await wait_job(group.load(LoadRequest(server="spark", model="ds4",
+                                          lane=group.cfg.id)))
+
+    worker = members[1]
+    worker.cfg = replace(worker.cfg, idle_unload_enabled=True)
+    worker.last_activity = time.time() - 7200        # far past any timeout
+    worker.model_activity.clear()
+    unloads: list = []
+
+    async def recording_unload(req):
+        unloads.append(req)
+        raise AssertionError("a group-claimed resident must never be reaped")
+    worker.unload = recording_unload
+
+    s_on = Settings(_env_file=None, idle_unload_enabled=True,
+                    idle_unload_after_min=1.0)
+    reaper = IdleReaper(
+        s_on,
+        SimpleNamespace(units={m.cfg.id: m for m in members}, lanes={},
+                        keepalive=None),
+        SimpleNamespace(last_util_activity=lambda *a, **k: None),
+        SimpleNamespace(blocks_idle_unload=lambda *a, **k: None),
+    )
+    assert await reaper._check_lane(worker) is False
+    assert unloads == []
+
+
+@respx.mock
+async def test_snapshot_skips_group_claimed_rows(tmp_path, calls, state):
+    """A cookbook state recording the group's model under a MEMBER id could never
+    be applied (the model lives in the cluster catalog, not the node's)."""
+    from llmconfig.cookbook import Cookbook
+    group, members, gs, _ = make_group(tmp_path, ["spark1", "spark2"])
+    _routes(state, ["spark1", "spark2"])
+    await wait_job(group.load(LoadRequest(server="spark", model="ds4",
+                                          lane=group.cfg.id)))
+
+    orch = SimpleNamespace(units={m.cfg.id: m for m in members}
+                           | {group.cfg.id: group})
+    cb = Cookbook(S, orch, JobManager(),
+                  SimpleNamespace(active_for=lambda *a, **k: None),
+                  path=tmp_path / "cb.yaml")
+    st = await cb.snapshot("mid-deployment")
+    assert st["units"] == {"spark1": [], "spark2": []}, \
+        "claimed rows and the group itself must both stay out of the state"
+
+
+@respx.mock
+async def test_group_status_rides_the_heads_probe_breaker(tmp_path, calls, state):
+    """A powered-off head must not cost the connect timeout on every placer
+    sweep: when the head member's breaker is open, the group presumes down
+    instead of probing (respx has NO route here — a probe would blow up)."""
+    group, members, *_ = make_group(tmp_path, ["spark1", "spark2"])
+    head = members[0]
+    head._served_fails = head._fails_before_backoff
+    head._served_ts = time.time()                    # breaker freshly open
+    st = await group.status()
+    assert st.loaded is None
+    assert st.kind == "spark_group"
+
+
 # --------------------------------------------------------------------------- #
 # Placement — ranking + facts
 # --------------------------------------------------------------------------- #
@@ -546,3 +647,43 @@ async def test_placer_resolves_multinode_model_only_on_sized_groups(tmp_path, ca
     # catalogs never contain it — so nothing resolves it.
     d = await placer.place("ds4-served")
     assert d.outcome == "not_found"
+
+
+def test_api_load_accepts_a_group_lane(tmp_path, monkeypatch):
+    """/api/load's kind check treated only SparkUnit as spark-shaped, so a
+    `lane: auto` placement answering a multi-node model with a GROUP id — or an
+    explicit group lane — got 400 "takes 'ollama' or 'vllm'"."""
+    import time as _time
+    from fastapi.testclient import TestClient
+    import llmconfig.main as main_mod
+    from llmconfig.schemas import Job
+
+    # Keep the per-node registry seeds out of the repo's data/.
+    monkeypatch.setattr("llmconfig.config.REPO_ROOT", tmp_path)
+    s = Settings(
+        _env_file=None, monitor_enabled=False, idle_unload_enabled=False,
+        registry_path=tmp_path / "reg.yaml",
+        spark_enabled=True, spark_fabric_enabled=True,
+        spark_group_state_path=tmp_path / "gs.yaml",
+        spark_cluster_registry_path=tmp_path / "cluster.yaml",
+    )
+    # A recorded placement makes the group exist at startup.
+    GroupPlacements(tmp_path / "gs.yaml").record("ds4", ["spark1", "spark2"])
+    monkeypatch.setattr(main_mod, "get_settings", lambda: s)
+    app = main_mod.create_app()
+    assert "spark1_spark2" in app.state.orch.units
+
+    def fake_load(req):
+        return Job(id="fake", kind=f"load:{req.lane}:{req.server}:{req.model}",
+                   state="running", created_at=_time.time())
+
+    monkeypatch.setattr(app.state.orch, "load", fake_load)
+    with TestClient(app) as c:
+        r = c.post("/api/load", json={"server": "spark", "model": "deepseek-v4-flash",
+                                      "lane": "spark1_spark2"})
+        assert r.status_code == 200, r.text
+        # And the mismatch arm still refuses honestly.
+        r = c.post("/api/load", json={"server": "vllm", "model": "x",
+                                      "lane": "spark1_spark2"})
+        assert r.status_code == 400
+        assert "takes server 'spark'" in r.text

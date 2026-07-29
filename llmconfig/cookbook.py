@@ -183,6 +183,13 @@ class Cookbook:
                     f"unit '{unit.cfg.id}' has a swap in progress — retry when it settles")
             targets = []
             for m in st.loaded_models:
+                # A multi-node residency (m.group) is not this unit's to record:
+                # the model lives in the CLUSTER catalog, so an apply would fail
+                # "unknown Spark model" — and even resolving it here would write
+                # a state apply cannot reproduce (groups are outside the
+                # cookbook, per the exclusion above).
+                if getattr(m, "group", ""):
+                    continue
                 targets.append({"server": m.server,
                                 "model": self._canonical(unit, m.server, m.model)})
             units[unit.cfg.id] = targets      # [] recorded too: apply frees the unit

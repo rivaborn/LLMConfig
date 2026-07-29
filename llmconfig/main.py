@@ -467,8 +467,12 @@ def create_app() -> FastAPI:
         unit = _lane(req.lane)
         # Catch the kind mismatch here — otherwise server="spark" on a GPU lane
         # falls into the vLLM path and fails with a misleading "unknown alias".
-        if isinstance(unit, SparkUnit) != (req.server == "spark"):
-            want = "'spark'" if isinstance(unit, SparkUnit) else "'ollama' or 'vllm'"
+        # A SparkGroup takes server="spark" too: with `lane: auto` placement can
+        # legitimately answer a multi-node model with a group id, and an
+        # isinstance(SparkUnit) test 400'd exactly that decision.
+        takes_spark = isinstance(unit, SparkUnit) or getattr(unit, "kind", "") == "spark_group"
+        if takes_spark != (req.server == "spark"):
+            want = "'spark'" if takes_spark else "'ollama' or 'vllm'"
             raise HTTPException(status_code=400,
                                 detail=f"unit '{req.lane}' takes server {want}, not '{req.server}'")
         _require_lease_ok(req.lane, x_llm_lease, req.model)

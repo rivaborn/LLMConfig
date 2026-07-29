@@ -195,7 +195,11 @@ class Lane:
         # SOLE resident, not membership: a direct-to-Ollama client (ungated by
         # design, invariant 12) can park a second model on the card — the fast
         # path must not bless that state; fall through and evict instead.
-        if not req.force and (await self.vllm.served()) is None:
+        # The vLLM probe is skipped on an Ollama-only lane, same reasoning as
+        # `_served_info`: a relay that will never exist blackholes the SYN
+        # (invariant 5) and taxed EVERY companion load ~1 s for nothing.
+        vllm_served = (await self.vllm.served()) if self.cfg.vllm_enabled else None
+        if not req.force and vllm_served is None:
             if set(await self.ollama.loaded_names()) == {req.model}:
                 self.jobs.log(job, f"{req.model} already loaded on Ollama")
                 return await self._verify_ollama(job, req, remediate=False)
@@ -347,8 +351,11 @@ class Lane:
         return await self.status()
 
     async def _occupied_by(self, model: str) -> bool:
-        """Is `model` (a served name or Ollama tag) resident on this lane now?"""
-        served = await self.vllm.served()
+        """Is `model` (a served name or Ollama tag) resident on this lane now?
+
+        The vLLM probe is skipped on an Ollama-only lane (invariant 5's
+        blackholed-SYN tax — see `_served_info`)."""
+        served = (await self.vllm.served()) if self.cfg.vllm_enabled else None
         if served is not None:
             return served == model
         return model in await self.ollama.loaded_names()
