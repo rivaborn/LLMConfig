@@ -419,6 +419,23 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
     units exist — don't create one anywhere else). `GroupState` reads are sync
     on purpose (invariant 11 applies to it too).
 
+    Two integration points that are easy to get wrong:
+    - **A group's `proven` (invariant 15's gate) comes from the PERSISTED
+      RECORD, not residency.** `GroupPlacements` says "this alias has launched
+      on this exact node set before"; a multi-node cold start is precisely the
+      expensive thing the gate exists for, so an unrecorded node set is a
+      deliberate manual first launch from the Cluster tab. Load-time estimates
+      and failure counters are keyed per node COUNT / per group id
+      (`spark:{alias}:x{K}`, `fail_key(group_id, …)`) — a 2-node launch is not
+      a 4-node one.
+    - **In `openai_gateway.py`, a group is "spark-shaped" (`_spark_shaped`), not
+      a `SparkUnit`.** It has no `cfg.vllm_relay_url`/`ollama`, so branching on
+      `isinstance(lane, SparkUnit)` sent it down the LANE path and
+      AttributeError'd `/v1/models` as soon as a group existed. The one
+      deliberate exception is `_ensure_load_job`'s fast-bail, where a group gets
+      the LANE treatment: co-residency is what makes another Spark's in-flight
+      load irrelevant, and a group has none.
+
 
 ## Build / run / test
 
