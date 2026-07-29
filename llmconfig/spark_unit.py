@@ -403,11 +403,26 @@ class SparkUnit:
         ok = await self.spark.wait_ready(target, timeout,
                                          on_log=lambda l: self.jobs.log(job, l), port=port)
         if not ok:
-            tail = await self.spark.logs(n=25, port=port)
+            # Root-cause window first, tail only as a fallback: vLLM unwinds a
+            # startup failure through Ray → EngineCore → APIServer, so the last
+            # lines are the outermost frames and routinely say nothing but
+            # "Engine core initialization failed. See root cause above."
+            excerpt = await self.spark.error_excerpt(port, n=60)
+            body = excerpt or await self.spark.logs(n=25, port=port)
+            # Name the causes actually seen on GB10 rather than asserting one.
+            # `mem_fraction` used to be the only suggestion, and on 2026-07-29 it
+            # sent a real investigation after a number that was fine (31.2 GiB of
+            # KV headroom) while the true cause — the recipe's own
+            # VLLM_MARLIN_USE_ATOMIC_ADD=1 — sat unread further up the log.
             raise _launch_failed(
-                f"{self.cfg.name} did not serve '{target}' (see log tail below — "
-                f"'Available KV cache memory' negative means the mem_fraction is "
-                f"too small for weights + ~15 GiB GB10 overhead + KV).\n{tail}"
+                f"{self.cfg.name} did not serve '{target}'. Read the excerpt below "
+                f"before changing anything; the usual causes are (a) a bad kernel "
+                f"env in the RECIPE, e.g. a CUDA 'illegal instruction' during "
+                f"CUDA-graph capture — override it with `-o env.NAME=VALUE` in "
+                f"extra_args, (b) 'Available KV cache memory' NEGATIVE, which does "
+                f"mean mem_fraction is too small for weights + ~15 GiB GB10 "
+                f"overhead + KV, or (c) a co-resident that this recipe cannot "
+                f"launch beside (needs_empty_node).\n{body}"
             )
 
         # Success-only recording: a failed launch (dead-serve, timeout) raised

@@ -425,6 +425,50 @@ async def test_load_times_out_when_model_never_appears(cfg, calls):
     assert job.state == "failed" and "did not serve" in job.error
 
 
+def test_error_excerpt_probe_is_base64_and_scoped_to_the_slot(cfg):
+    """The excerpt probe crosses the same four quoting layers as `_serve_probe`
+    (Python → Windows argv → wsl.exe → remote sh), so it must be base64'd, and
+    it must still match only THIS slot's container."""
+    import base64 as _b64
+
+    cmd = make_unit(cfg).spark._excerpt_probe(8001, 60)
+    blob = cmd.split("echo ", 1)[1].split(" |", 1)[0]
+    script = _b64.b64decode(blob).decode()
+
+    awk = script.split('awk "', 1)[1].split('" /tmp', 1)[0]
+    assert "'" not in awk and "$" not in awk, \
+        "the awk program lives inside sh -c '…' — a quote or $ would not survive"
+    assert "grep -q port.8001" in script, "must not match a neighbour's container"
+    assert "CUDA error" in script and "Traceback" in script
+
+
+@respx.mock
+async def test_launch_failure_reports_the_root_cause_not_the_outer_frames(cfg, calls):
+    """A startup failure must print from the FIRST error line, not the tail.
+
+    vLLM unwinds through Ray → EngineCore → APIServer, so the last lines carry
+    only "Engine core initialization failed. See root cause above." Live on
+    2026-07-29 the 122B's real cause sat ~130 lines above the 25-line tail, so
+    the reported error was pure boilerplate and the hint — which asserted
+    mem_fraction — pointed at a number that was never wrong.
+    """
+    models_route(None)
+    u = make_unit(cfg)
+    u.s.poll_interval_s = 0.01
+    root_cause = "CUDA error: an illegal instruction was encountered"
+    calls.plan[u.spark._excerpt_probe(PORT, 60).split("echo ", 1)[1].split(" |", 1)[0]] = \
+        CmdResult(0, root_cause, "")
+
+    job = u.load(LoadRequest(server="spark", model="m1", lane="spark1"))
+    await wait_job(job)
+
+    assert job.state == "failed"
+    assert root_cause in job.error, "the excerpt must win over the tail"
+    # The old hint named exactly one cause and sent readers after mem_fraction.
+    assert "-o env." in job.error, "point at the recipe-env override that fixes this class"
+    assert job.error.count("mem_fraction") <= 1, "mem_fraction is one candidate, not the verdict"
+
+
 @respx.mock
 async def test_unload_stops_workload(cfg, calls):
     models_route(None)

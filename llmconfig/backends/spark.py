@@ -495,6 +495,42 @@ class SparkBackend:
             return "dead"
         return "unknown"
 
+    # A TAIL IS THE WRONG EXCERPT FOR A STARTUP FAILURE. vLLM reports the root
+    # cause once, deep in the worker, and then unwinds through Ray → EngineCore →
+    # APIServer; the last 25 lines are the OUTERMOST frames, which say only
+    # "Engine core initialization failed. See root cause above." Live on
+    # 2026-07-29 the 122B's real cause ("CUDA error: an illegal instruction was
+    # encountered", from the recipe's own VLLM_MARLIN_USE_ATOMIC_ADD=1) sat ~130
+    # lines above the tail, so the failure looked blank and the load-time hint
+    # sent the reader after mem_fraction — a number that was never the problem.
+    # Print from the FIRST error marker forward instead.
+    _ERROR_MARKERS = (
+        "CUDA error|Traceback|RuntimeError|ValueError|AssertionError|"
+        "OutOfMemoryError|No available memory for the cache blocks|"
+        "Engine core initialization failed|ERROR .*died|Worker.*exception"
+    )
+
+    def _excerpt_probe(self, port: int, n: int) -> str:
+        """Remote script: the slot's serve log from its first error line on.
+
+        Base64'd for the same four-layer quoting reason as `_serve_probe`. The
+        awk program deliberately uses no single quotes and no `$` so it survives
+        the inner `sh -c '…'` and the shell's double-quote expansion untouched.
+        """
+        awk = (f'/{self._ERROR_MARKERS}/{{f=1}} f{{print; c++}} c>={int(n)}{{exit}}')
+        script = (
+            "for c in $(docker ps -q); do "
+            f"docker exec $c sh -c 'grep -q port.{int(port)} /tmp/sparkrun_serve.sh 2>/dev/null "
+            f'&& awk "{awk}" /tmp/sparkrun_serve.log\' 2>/dev/null; done'
+        )
+        b64 = base64.b64encode(script.encode()).decode()
+        return f"echo {b64} | base64 -d | sh"
+
+    async def error_excerpt(self, port: int, n: int = 60) -> str:
+        """The root-cause window of a slot's serve log, or "" if none matched."""
+        r = await self._ssh(self._excerpt_probe(port, n), timeout=30.0)
+        return (r.out or "").strip()
+
     async def logs(self, n: int = 40, port: Optional[int] = None) -> str:
         """Best-effort diagnostics tail. With `port`, the slot's real serve log."""
         if port:
