@@ -1,0 +1,123 @@
+# Recipe: DeepSeek-V4-Flash-DSpark  (2-node tensor-parallel, local fork)
+#
+# LOCAL FORK. There is NO upstream sparkrun recipe for DSpark — `sparkrun search
+# deepseek` returns exactly one entry (`@eugr/deepseek-v4-flash`). The DSpark
+# build is documented only as a hand-written YAML for eugr's *other* project,
+# `spark-vllm-docker`'s `./run-recipe.sh`, which is a different launcher that
+# LLMConfig cannot drive. This file re-expresses that configuration as a
+# sparkrun recipe so `sparkrun run <path>` — and therefore LLMConfig's Cluster
+# tab — can launch it.
+#
+# Source of the flag set:
+#   https://forums.developer.nvidia.com/t/instructions-for-running-deepseek-v4-flash-with-dspark-using-eugrs-repo/376220
+#
+# ⚠ REQUIRES A PATCHED CONTAINER. `container:` is **vllm-node-dspark**, not
+# `vllm-node`, and that image must be built with FlashInfer PR 3817 applied:
+#     ./build-and-copy.sh --apply-flashinfer-pr 3817 -t vllm-node-dspark \
+#                         --copy-to <peer> -u <user>
+# A separate tag is deliberate: rebuilding `vllm-node` in place would swap the
+# image every other working recipe launches on. The vLLM half of DSpark support
+# is already present in the stock images (18 files reference dspark); only
+# FlashInfer needs the patch.
+#
+# ══════════════════════════════════════════════════════════════════════════
+# ⚠⚠ WHY EVERY JSON ARGUMENT USES SINGLE BRACES AND LITERAL NUMBERS
+# ══════════════════════════════════════════════════════════════════════════
+# Do NOT "fix" these to the `{{...}}` form used by the upstream
+# @eugr/deepseek-v4-flash recipe. That form is BROKEN, and it fails silently.
+#
+# sparkrun renders `command:` with vpd's `arg_substitute`, NOT Python's
+# `str.format`, so `{{` is not an escape — it is two literal braces. The regex
+# is `re.compile(r"\{(.*?)\}")` (non-greedy). Against
+#     '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'
+# the FIRST match spans from the opening `{{` all the way to the first `}` —
+# swallowing the inner placeholder as part of one match. The lookup on that
+# whole blob misses, and `_replace_match` returns the match unchanged
+# ("put back the original if we don't have a match", vpd/legacy/arguments.py:22).
+# Net effect: the doubled braces survive AND the placeholder is never
+# substituted, so vLLM is handed invalid JSON.
+#
+# Verified against sparkrun 0.2.40's own renderer, 2026-07-30:
+#   '{{"method":"dspark",...{num_speculative_tokens}}}'  -> unchanged, invalid
+#   '{"method":"dspark","num_speculative_tokens":3}'     -> unchanged, VALID
+#   '{max_model_len}'                                     -> 262144
+# A single-braced blob is also "unchanged" — but unchanged is exactly right
+# there, because it was already the JSON we wanted. `-o num_speculative_tokens=`
+# cannot rescue the broken form either; it was tested and does nothing.
+#
+# CONSEQUENCE: `num_speculative_tokens` is a LITERAL below, not a placeholder,
+# and is therefore NOT tunable from the catalog. To change the draft count,
+# edit this file. See HomelabDocumentation/drafts/sparkrun-flag-traps.md
+# (trap 3b).
+# ══════════════════════════════════════════════════════════════════════════
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-DSpark
+description: vLLM serving deepseek-ai/DeepSeek-V4-Flash-DSpark on 2 DGX Sparks
+
+model: deepseek-ai/DeepSeek-V4-Flash-DSpark
+
+# Patched image — see the FlashInfer PR 3817 note above.
+container: vllm-node-dspark
+
+# DSpark is 2-node only in this configuration.
+cluster_only: true
+
+mods: []
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.8
+  # 262144, not the 500k the base V4-Flash recipe defaults to: at 500k the
+  # estimator puts per-GPU at 94.8 GB against ~96.8 GB usable — ~2 GB of head
+  # room — and it reports KV as bf16 while the command passes fp8, so the
+  # figure it shows is not the figure you get.
+  max_model_len: 262144
+  block_size: 256
+  max_num_seqs: 4
+  # 10240, not the thread's original 8192. With 3 draft tokens this took the
+  # reported run from ~48.6 tok/s (27.65% acceptance) to ~71.6 tok/s (48.35%)
+  # at 50 concurrent. Both are the thread author's numbers on their hardware,
+  # NOT measured here — re-measure before quoting them as ours.
+  max_num_batched_tokens: 10240
+
+env:
+  DG_JIT_USE_NVRTC: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+
+# NOTE ON PREFIX CACHING: deliberately absent. The base V4-Flash recipe passes
+# --enable-prefix-caching; the DSpark thread does not, and reports an
+# `assert self.kv_block_zeroer is not None` failure when speculative decoding
+# runs with prefix caching on. If that assertion appears anyway, add
+# --no-enable-prefix-caching and --enforce-eager.
+#
+# NOTE ON LOAD FORMAT: safetensors, NOT the instanttensor the base recipe uses
+# — instanttensor crashes on this build. The trade is load time: the thread
+# reports 20+ minute loads, so expect the first launch to be slow and keep the
+# unit's load timeout generous.
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4-Flash-DSpark \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --kv-cache-dtype fp8 \
+      --block-size {block_size} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --speculative-config '{"method":"dspark","num_speculative_tokens":3}' \
+      --hf-overrides '{"dspark_noise_token_id":128799}' \
+      --tokenizer-mode deepseek_v4 \
+      --distributed-executor-backend ray \
+      --tool-call-parser deepseek_v4 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_v4 \
+      --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}' \
+      --default-chat-template-kwargs.thinking=true \
+      --default-chat-template-kwargs.reasoning_effort=high \
+      --load-format safetensors
