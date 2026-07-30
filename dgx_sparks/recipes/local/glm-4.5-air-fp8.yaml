@@ -1,0 +1,56 @@
+# Recipe: GLM-4.5-Air FP8  (2-node tensor-parallel, local)
+#
+# LOCAL RECIPE — no registry has one. After a full `sparkrun registry update`
+# (2026-07-30), `sparkrun search glm` returns only @eugr/glm-4.7-flash-awq;
+# nothing for GLM-4.5 Air in any registry. Authored here, modeled on the v2
+# schema of @official/minimax-m2.7-awq4-vllm (the official 2-node pattern).
+#
+# Model: zai-org/GLM-4.5-Air-FP8 — 106B MoE / 12B active, FP8, ~107 GB.
+# vLLM serves it with --tool-call-parser glm45 --reasoning-parser glm45
+# (vLLM blog 2025-08-19, "GLM-4.5 Meets vLLM"). tp=2 puts ~54 GB of weights
+# per node — comfortable in the 0.8 budget.
+#
+# Container: the ghcr nightly, same family as the proven qwen36/qwen3-vl
+# recipes — and the family that WORKS on spark2 (the vllm-node 0.23.1 image
+# deterministically fails there; see dgx_sparks/recipes/README.md).
+#
+# No {{...}} anywhere in the command on purpose — see the render-bug rule in
+# README.md. Everything here is a plain {placeholder} or a literal.
+#
+# status: UNVERIFIED until launched on this cluster.
+
+recipe_version: "2"
+model: zai-org/GLM-4.5-Air-FP8
+runtime: vllm
+min_nodes: 2
+container: ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest
+
+metadata:
+  description: GLM-4.5-Air FP8 (106B MoE / 12B active) across 2 DGX Sparks
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  gpu_memory_utilization: 0.8
+  # GLM-4.5 native context is 131072. No cap needed at tp=2/FP8: weights
+  # ~54 GB/node leaves ample KV headroom in the 0.8 budget.
+  max_model_len: 131072
+  load_format: fastsafetensors
+  tool_call_parser: glm45
+  reasoning_parser: glm45
+
+command: |
+  vllm serve {model} \
+    --trust-remote-code \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    -tp {tensor_parallel} \
+    -pp {pipeline_parallel} \
+    --max-model-len {max_model_len} \
+    --load-format {load_format} \
+    --enable-auto-tool-choice \
+    --tool-call-parser {tool_call_parser} \
+    --reasoning-parser {reasoning_parser} \
+    --host {host} \
+    --port {port}

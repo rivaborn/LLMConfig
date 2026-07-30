@@ -1,0 +1,67 @@
+# Recipe: GPT-OSS 120B  (2-node tensor-parallel, local)
+#
+# LOCAL RECIPE. The only registry recipe, @eugr/openai-gpt-oss-120b, is
+# `solo_only: true` and runs on `vllm-node-mxfp4` — a special image built with
+# `--exp-mxfp4` that exists on NO node here. Two changes make 2-node possible
+# without that image:
+#
+#   1. Container is the ghcr nightly (vLLM 0.26.x), which supports gpt-oss's
+#      MXFP4 checkpoint NATIVELY — no --quantization mxfp4 / --mxfp4-backend /
+#      --mxfp4-layers flags, which are custom-image flags that upstream vLLM
+#      does not accept. Quantization is auto-detected from the checkpoint.
+#   2. min_nodes: 2 with -tp {tensor_parallel}.
+#
+# Kept from the eugr recipe: the openai tool parser, openai_gptoss reasoning
+# parser, prefix caching, fastsafetensors. Dropped: VLLM_USE_FLASHINFER_MOE_*
+# env (custom-image knob), --attention-backend FLASHINFER pin (let the nightly
+# pick), --kv-cache-dtype fp8 (conservative first launch; add back after it
+# proves out).
+#
+# Weights: openai/gpt-oss-120b, ~61 GB, ALREADY STAGED on all four nodes
+# (verified 2026-07-30). tp=2 ≈ 30 GB/node — the capacity is not the point;
+# per the wiki, community numbers say 1 node is FASTER for this model
+# (~58.8 t/s solo, loses further at 4 nodes). This recipe exists because the
+# fleet plan wants every 2-node model testable on both pairs, not because 2
+# nodes is optimal for it.
+#
+# Community reference (Spark Arena, pulled 2026-07-23): ~58.8 t/s decode @1
+# node; 2-node figure exists but was recorded as slower. Re-measure locally.
+#
+# No {{...}} in the command — see the render-bug rule in README.md.
+#
+# status: UNVERIFIED until launched on this cluster.
+
+recipe_version: "2"
+model: openai/gpt-oss-120b
+runtime: vllm
+min_nodes: 2
+container: ghcr.io/spark-arena/dgx-vllm-eugr-nightly:latest
+
+metadata:
+  description: OpenAI GPT-OSS 120B (MXFP4) across 2 DGX Sparks
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  pipeline_parallel: 1
+  gpu_memory_utilization: 0.8
+  # gpt-oss-120b native context.
+  max_model_len: 131072
+  load_format: fastsafetensors
+  max_num_batched_tokens: 8192
+
+command: |
+  vllm serve {model} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    -tp {tensor_parallel} \
+    -pp {pipeline_parallel} \
+    --max-model-len {max_model_len} \
+    --load-format {load_format} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser openai \
+    --reasoning-parser openai_gptoss \
+    --host {host} \
+    --port {port}
