@@ -1,0 +1,99 @@
+# Recipe: DeepSeek-V4-Flash  +  fixed command template  ("-ft")
+#
+# LOCAL FORK. A verbatim fork of
+#   ~/.cache/sparkrun/registries/eugr/recipes/deepseek-v4-flash.yaml
+# with exactly TWO deliberate differences, both the SAME fix:
+#
+#   1. `--speculative-config` uses SINGLE braces with a literal `2`
+#      instead of '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'
+#   2. `--reasoning-config` uses SINGLE braces
+#      instead of '{{"reasoning_parser":...}}'
+#
+# EVERYTHING ELSE IS BYTE-IDENTICAL to upstream — same container (`vllm-node`,
+# unpatched is correct for this model), same `--load-format instanttensor`, same
+# `--enable-prefix-caching`, same 500000 default for max_model_len (the catalog
+# caps it to 262144 via extra_args; capping here too would be a second variable).
+#
+# ══════════════════════════════════════════════════════════════════════════
+# WHY THE UPSTREAM RECIPE CANNOT LAUNCH WITH MTP
+# ══════════════════════════════════════════════════════════════════════════
+# sparkrun renders `command:` with vpd's `arg_substitute`, NOT Python's
+# `str.format`. There is no escape syntax, so `{{` is simply two literal braces.
+# The regex is `re.compile(r"\{(.*?)\}")` — non-greedy — so against
+#
+#     '{{"method":"mtp","num_speculative_tokens":{num_speculative_tokens}}}'
+#
+# the FIRST match runs from the opening `{{` to the first `}`, swallowing the
+# inner placeholder into a single match. That whole blob misses the lookup, and
+# `_replace_match` returns it unchanged ("put back the original if we don't have
+# a match", vpd/legacy/arguments.py:22). Result: the doubled braces survive AND
+# the placeholder never substitutes, so vLLM is handed invalid JSON.
+#
+# This is NOT a --dry-run artifact: `Recipe.render_command()` is called from the
+# runtime launch modules (runtimes/vllm_ray.py:71 — the runtime THIS recipe
+# uses), so a live launch renders identically. Verified against sparkrun 0.2.40's
+# own renderer, 2026-07-30. `-o num_speculative_tokens=` does not help; it was
+# tested and does nothing, because the placeholder is never consulted.
+#
+# The bug bites even with no placeholder inside — `{{` alone is enough.
+# Ten recipes in the installed registries use this form, mostly for MTP
+# (`--speculative-config`); see HomelabDocumentation drafts, sparkrun-flag-traps
+# trap 3b.
+# ══════════════════════════════════════════════════════════════════════════
+#
+# CONSEQUENCE: `num_speculative_tokens` is a LITERAL below and is deliberately
+# REMOVED from `defaults:`. Leaving it there would advertise a knob that silently
+# does nothing — the same class of trap this fork exists to remove. To change the
+# draft count, edit the literal in the command.
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-ft
+description: vLLM serving deepseek-ai/DeepSeek-V4-Flash on a DGX Spark cluster (fixed template)
+
+model: deepseek-ai/DeepSeek-V4-Flash
+
+container: vllm-node
+
+cluster_only: true
+
+mods: []
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.8
+  max_model_len: 500000
+  block_size: 256
+  max_num_seqs: 4
+  max_num_batched_tokens: 8192
+  # num_speculative_tokens deliberately absent — see the header.
+
+env:
+  DG_JIT_USE_NVRTC: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4-Flash \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --kv-cache-dtype fp8 \
+      --block-size {block_size} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enable-prefix-caching \
+      --speculative-config '{"method":"mtp","num_speculative_tokens":2}' \
+      --tokenizer-mode deepseek_v4 \
+      --distributed-executor-backend ray \
+      --tool-call-parser deepseek_v4 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_v4 \
+      --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}' \
+      --default-chat-template-kwargs.thinking=true \
+      --default-chat-template-kwargs.reasoning_effort=high \
+      --load-format instanttensor
