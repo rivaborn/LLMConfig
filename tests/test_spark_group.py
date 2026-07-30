@@ -210,6 +210,48 @@ def test_group_config_validation():
         s.spark_group_config(["spark1", "nope"])
 
 
+def test_fabric_links_parse_and_membership():
+    """SPARK_FABRIC_LINKS describes which nodes are physically cabled."""
+    s = Settings(_env_file=None, spark_enabled=True,
+                 spark_fabric_links="spark1+spark2,spark3+spark4")
+    assert s.fabric_links() == [frozenset({"spark1", "spark2"}),
+                                frozenset({"spark3", "spark4"})]
+    assert s.fabric_link_ok(["spark1", "spark2"])
+    assert s.fabric_link_ok(["spark4", "spark3"])          # order-insensitive
+    assert not s.fabric_link_ok(["spark1", "spark3"])      # different pairs
+    assert not s.fabric_link_ok(["spark1", "spark2", "spark3"])   # spans pairs
+    assert "spark1+spark2" in s.fabric_links_describe()
+
+    # A switched fabric is ONE group naming every node, and must still admit
+    # smaller jobs — hence subset rather than equality.
+    sw = Settings(_env_file=None, spark_enabled=True,
+                  spark_fabric_links="spark1+spark2+spark3+spark4")
+    assert sw.fabric_link_ok(["spark1", "spark3"])
+    assert sw.fabric_link_ok(["spark1", "spark2", "spark3", "spark4"])
+
+    # Unset = unconstrained, i.e. exactly the pre-setting behaviour.
+    un = Settings(_env_file=None, spark_enabled=True)
+    assert un.fabric_links() == []
+    assert un.fabric_link_ok(["spark1", "spark3"])
+    # Malformed / single-member groups are dropped, never raised on.
+    junk = Settings(_env_file=None, spark_enabled=True,
+                    spark_fabric_links="spark1,,  ,spark2+spark3")
+    assert junk.fabric_links() == [frozenset({"spark2", "spark3"})]
+
+
+def test_group_config_refuses_uncabled_node_set():
+    """The topology check sits in spark_group_config — the ONE chokepoint that
+    both POST /api/cluster/load and the startup re-instantiation go through."""
+    s = Settings(_env_file=None, spark_enabled=True,
+                 spark_fabric_links="spark1+spark2,spark3+spark4")
+    assert s.spark_group_config(["spark1", "spark2"]).id == "spark1_spark2"
+    assert s.spark_group_config(["spark3", "spark4"]).id == "spark3_spark4"
+    with pytest.raises(ValueError, match="not cabled together"):
+        s.spark_group_config(["spark1", "spark3"])
+    with pytest.raises(ValueError, match="not cabled together"):
+        s.spark_group_config(["spark1", "spark2", "spark3", "spark4"])
+
+
 # --------------------------------------------------------------------------- #
 # Group load — the multi-host launch
 # --------------------------------------------------------------------------- #

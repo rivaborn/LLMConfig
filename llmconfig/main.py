@@ -643,6 +643,14 @@ def create_app() -> FastAPI:
                 pub.addable = False
                 pub.add_note = ("fabric not installed (SPARK_FABRIC_ENABLED=false) — "
                                 "planner only until the 200G switch lands")
+            elif not settings.fabric_link_ok([m.cfg.id for m in members]):
+                # Checked here as well as in spark_group_config so the UI can say
+                # WHY a legal-looking selection is refused. Without this the load
+                # only 400s after the user commits — and the failure it prevents
+                # (a tp job across un-cabled nodes) presents as a HANG, not an error.
+                pub.addable = False
+                pub.add_note = (f"{gid.replace('_', '+')} are not cabled together — "
+                                f"cabled sets: {settings.fabric_links_describe()}")
             elif foreign:
                 pub.addable = False
                 pub.add_note = f"member(s) claimed by {', '.join(foreign)} — free that deployment first"

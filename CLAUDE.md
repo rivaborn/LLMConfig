@@ -426,6 +426,27 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
     units exist — don't create one anywhere else). `GroupState` reads are sync
     on purpose (invariant 11 applies to it too).
 
+    **`SPARK_FABRIC_ENABLED` says a fabric exists; `SPARK_FABRIC_LINKS` says what
+    SHAPE it is, and a node set that is not cabled together must never become a
+    group.** As of 2026-07-30 the lab runs **two direct pairs**
+    (`spark1+spark2`, `spark3+spark4`) with no switch, so `tp=4` has no path at
+    all. This is not a cosmetic restriction: `sparkrun setup cx7` derives
+    addresses from each host's management last octet, so all four nodes land in
+    **one subnet** (`192.168.0.50-.53`) while pair A and pair B share **no wire**.
+    `spark1` → `spark3` is therefore same-subnet, unrouted, and silently
+    unreachable — a tp job spanning them **hangs** in Ray/NCCL peer discovery
+    rather than erroring. The check lives in `settings.spark_group_config()`
+    because that is the ONE chokepoint both `POST /api/cluster/load` and the
+    startup re-instantiation of recorded node sets pass through; putting it in
+    the REST layer would let a set recorded before the cabling changed come back
+    as a standing auto-placement candidate. `/api/cluster/models` repeats the
+    check purely so the UI can explain WHY a legal-looking selection is greyed
+    out. Empty (the default) = unconstrained, so deployments that never set it
+    are unaffected. Membership is **subset**, not equality — one group naming all
+    four nodes is how a switched fabric is declared, and it must still admit
+    2- and 3-node jobs. `tests/test_spark_group.py::test_fabric_links_parse_and_membership`
+    and `::test_group_config_refuses_uncabled_node_set` pin this.
+
     **A group-claimed row on a member is not that member's model to touch.**
     `LoadedModel.group` marks it, and three places must skip it — every one of
     them was a real bug (review 2026-07-29): the idle reaper (it has no

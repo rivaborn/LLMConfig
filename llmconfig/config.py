@@ -165,6 +165,32 @@ def group_id_for(member_ids: list[str] | tuple[str, ...]) -> str:
     return "_".join(sorted(member_ids))
 
 
+def _parse_fabric_links(spec: str) -> list[frozenset[str]]:
+    """Parse `SPARK_FABRIC_LINKS` → the node sets that are physically cabled.
+
+    Format: comma-separated groups, members joined with `+`, e.g.
+        spark1+spark2,spark3+spark4
+    for two directly-cabled pairs. One group naming every node
+    (`spark1+spark2+spark3+spark4`) is what a switched fabric looks like.
+
+    Empty/unset returns `[]`, which means UNCONSTRAINED — every node set is
+    allowed, exactly as before this setting existed. That is deliberate: the
+    constraint is opt-in, so an operator who has not described their cabling
+    keeps the old behaviour rather than silently losing the Cluster tab.
+
+    Malformed entries are skipped rather than raising, matching
+    `_parse_spark_nodes`: a typo in .env must not stop the app from starting.
+    Single-member groups are dropped too — a "link" of one cables nothing and
+    would only ever reject every multi-node set.
+    """
+    links: list[frozenset[str]] = []
+    for chunk in (spec or "").split(","):
+        members = {p.strip() for p in chunk.split("+") if p.strip()}
+        if len(members) >= 2:
+            links.append(frozenset(members))
+    return links
+
+
 def _parse_spark_nodes(spec: str) -> list[tuple[str, str, str]]:
     """Parse `SPARK_NODES` → [(id, host, name)].
 
@@ -342,6 +368,26 @@ class Settings(BaseSettings):
     # Flip to true once the 200G switch is installed and `sparkrun setup cx7` has
     # brought the fabric up.
     spark_fabric_enabled: bool = False
+    # WHICH nodes are actually cabled to each other. The fabric flag says a fabric
+    # exists; this says what shape it is, and the two are independent — a fabric
+    # can be up while only some nodes can reach each other.
+    #
+    # Comma-separated groups, members joined with '+':
+    #     spark1+spark2,spark3+spark4      two directly-cabled pairs
+    #     spark1+spark2+spark3+spark4      one switched fabric, any-to-any
+    #
+    # A multi-node launch is refused unless its node set fits INSIDE one group
+    # (subset, not equality — on a 4-node switched fabric a 2-node job is fine).
+    # Empty (the default) = unconstrained, i.e. byte-for-byte the behaviour from
+    # before this setting, so nothing changes for a deployment that never sets it.
+    #
+    # Why this must exist: with two direct pairs, addresses are handed out from
+    # one subnet across all four nodes, so spark1 and spark3 look same-subnet but
+    # share no wire. A tp job spanning them does not error — it HANGS, because
+    # Ray/NCCL peer discovery waits on a peer that cannot answer. Encoding the
+    # cabling here is what turns that silent hang into a 400 with a readable
+    # message. Measured 2026-07-30: within a pair, 196 Gb/s RDMA / 19.5 GB/s NCCL.
+    spark_fabric_links: str = ""
     # The multi-host launch template. {hosts} = comma-joined member addresses in
     # member order (head first); {tp} = the member count K. Mirrors spark_run_cmd
     # otherwise — same load-bearing flags, same reasons.
@@ -555,12 +601,38 @@ class Settings(BaseSettings):
         """
         return [*self.lanes(), *self.sparks()]
 
+    def fabric_links(self) -> list[frozenset[str]]:
+        """The cabled node sets from `SPARK_FABRIC_LINKS`; `[]` = unconstrained."""
+        return _parse_fabric_links(self.spark_fabric_links)
+
+    def fabric_link_ok(self, member_ids: list[str] | tuple[str, ...]) -> bool:
+        """Can these nodes actually talk to each other?
+
+        True when unconstrained, or when the set fits inside one cabled group.
+        Subset rather than equality on purpose: a switched 4-node fabric declared
+        as one group must still admit 2- and 3-node jobs.
+        """
+        links = self.fabric_links()
+        if not links:
+            return True
+        want = set(member_ids)
+        return any(want <= link for link in links)
+
+    def fabric_links_describe(self) -> str:
+        """Human-readable cabled sets, for error messages and UI notes."""
+        return " / ".join("+".join(sorted(link)) for link in self.fabric_links()) or "unconstrained"
+
     def spark_group_config(self, member_ids: list[str] | tuple[str, ...]) -> SparkGroupConfig:
         """Build the config for a group over `member_ids` (order-insensitive).
 
-        Raises ValueError on an unknown/disabled member or a set of fewer than two
-        nodes — the callers (orchestrator startup + POST /api/cluster/load) surface
-        that as a 4xx rather than half-creating a unit.
+        Raises ValueError on an unknown/disabled member, a set of fewer than two
+        nodes, or a set that is not cabled together (`SPARK_FABRIC_LINKS`) — the
+        callers (orchestrator startup + POST /api/cluster/load) surface that as a
+        4xx rather than half-creating a unit. This is the single chokepoint for
+        group creation, which is why the topology check belongs here and not in
+        the REST layer: the startup re-instantiation of recorded node sets has to
+        honour it too, or a set recorded before the cabling changed would come
+        back as a standing auto-placement candidate.
         """
         ids = sorted(set(member_ids))
         if len(ids) < 2:
@@ -570,6 +642,12 @@ class Settings(BaseSettings):
         if missing:
             raise ValueError(
                 f"unknown spark node(s) {missing} (have: {', '.join(by_id) or 'none — SPARK_ENABLED off?'})"
+            )
+        if not self.fabric_link_ok(ids):
+            raise ValueError(
+                f"{'+'.join(ids)} are not cabled together — a tensor-parallel job "
+                f"across them would hang, not fail. Cabled sets: "
+                f"{self.fabric_links_describe()}"
             )
         head = by_id[ids[0]]
         ordinals = [
