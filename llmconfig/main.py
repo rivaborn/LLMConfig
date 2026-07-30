@@ -79,6 +79,29 @@ def create_app() -> FastAPI:
 
     recovery = WslRecovery(settings)
 
+    async def _reclaim_groups() -> None:
+        """Re-establish group claims for deployments that outlived a restart.
+
+        GroupState is in-memory, but a tp job keeps serving across an app
+        restart. The reclaim lives in `SparkGroup.status()` — yet nothing called
+        it at boot: `/api/status` filters groups out of its sweep and
+        `/api/cluster/models` reads the claim table directly, so until the
+        FIRST /v1 request happened to route to the group, the Cluster tab
+        offered `addable=True` over a live deployment and the members admitted
+        conflicting loads (observed live 2026-07-30: a serving spark1+spark2
+        tp=2 job read as `live=False` with both members unclaimed).
+
+        Runs before the WSL gate on purpose: a group probe is pure HTTP
+        (invariant 9 — status never awaits SSH), so it needs nothing from WSL
+        and must land before the autoload can queue loads onto claimed members.
+        Failures are logged and swallowed — a dead head must not break boot.
+        """
+        for gid, g in list(orch.groups.items()):
+            try:
+                await g.status()
+            except Exception:  # noqa: BLE001 — reclaim is best-effort
+                log.exception("startup group reclaim failed for %s", gid)
+
     async def _gated_autoload() -> None:
         """Restore each unit's default model, but only once WSL can execute.
 
@@ -87,7 +110,12 @@ def create_app() -> FastAPI:
         on 2026-07-28 and cost a 6 h outage, so gate it — and self-heal if the
         distro is wedged rather than merely slow. Runs in the BACKGROUND so
         uvicorn binds :11430 immediately either way.
+
+        Group claims are re-established FIRST (no WSL needed), so by the time
+        the autoload runs, a member of a still-serving group refuses its
+        single-node default instead of loading over a live tp rank.
         """
+        await _reclaim_groups()
         try:
             if await wait_ready(settings=settings, on_stall=recovery.attempt):
                 orch.autoload_defaults()

@@ -691,6 +691,54 @@ async def test_placer_resolves_multinode_model_only_on_sized_groups(tmp_path, ca
     assert d.outcome == "not_found"
 
 
+@respx.mock
+def test_boot_reclaims_live_group_without_a_query(tmp_path, monkeypatch):
+    """A tp deployment that outlives a restart must be re-claimed AT BOOT.
+
+    The reclaim lives in SparkGroup.status(), but nothing routine calls that:
+    /api/status filters groups out of its sweep and /api/cluster/models reads
+    GroupState directly. Before this fix the claim only came back when the
+    first /v1 request happened to route to the group — until then the Cluster
+    tab offered addable=True over a live deployment and both members admitted
+    conflicting loads (observed live 2026-07-30). The lifespan now awaits one
+    status() per group before the autoload."""
+    import llmconfig.main as main_mod
+    from fastapi.testclient import TestClient
+
+    monkeypatch.setattr("llmconfig.config.REPO_ROOT", tmp_path)
+    s = Settings(
+        _env_file=None, monitor_enabled=False, idle_unload_enabled=False,
+        registry_path=tmp_path / "reg.yaml",
+        spark_enabled=True, spark_fabric_enabled=True,
+        spark_group_state_path=tmp_path / "gs.yaml",
+        spark_cluster_registry_path=tmp_path / "cluster.yaml",
+    )
+    GroupPlacements(tmp_path / "gs.yaml").record("deepseek-v4-flash",
+                                                 ["spark1", "spark2"])
+    monkeypatch.setattr(main_mod, "get_settings", lambda: s)
+
+    # The deployment "outlived the restart": the head answers on the group port
+    # with a CLUSTER-catalog served name; every other slot probe is empty.
+    head = s.sparks()[0].host
+    respx.get(f"http://{head}:8000/v1/models").respond(
+        200, json={"data": [{"id": "deepseek-v4-flash"}]})
+    respx.route().respond(200, json={"data": []})
+
+    app = main_mod.create_app()
+    gs = app.state.orch.group_state
+    assert gs.get("spark1_spark2") is None          # in-memory ⇒ empty pre-boot
+    with TestClient(app):                            # __enter__ runs the lifespan
+        deadline = time.time() + 5
+        while gs.get("spark1_spark2") is None and time.time() < deadline:
+            time.sleep(0.05)
+        claim = gs.get("spark1_spark2")
+        assert claim is not None, "boot did not reclaim the live group"
+        assert claim.alias == "deepseek-v4-flash"
+        # The members now refuse/report — the reverse index is what _admit reads.
+        assert gs.claim_for("spark1") is not None
+        assert gs.claim_for("spark2") is not None
+
+
 def test_api_load_accepts_a_group_lane(tmp_path, monkeypatch):
     """/api/load's kind check treated only SparkUnit as spark-shaped, so a
     `lane: auto` placement answering a multi-node model with a GROUP id — or an
