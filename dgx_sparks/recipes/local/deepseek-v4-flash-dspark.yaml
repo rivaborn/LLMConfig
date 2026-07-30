@@ -39,7 +39,7 @@
 #
 # Verified against sparkrun 0.2.40's own renderer, 2026-07-30:
 #   '{{"method":"dspark",...{num_speculative_tokens}}}'  -> unchanged, invalid
-#   '{"method":"dspark","num_speculative_tokens":3}'     -> unchanged, VALID
+#   '{"method":"dspark","num_speculative_tokens":5}'     -> unchanged, VALID
 #   '{max_model_len}'                                     -> 262144
 # A single-braced blob is also "unchanged" — but unchanged is exactly right
 # there, because it was already the JSON we wanted. `-o num_speculative_tokens=`
@@ -77,10 +77,13 @@ defaults:
   max_model_len: 262144
   block_size: 256
   max_num_seqs: 4
-  # 10240, not the thread's original 8192. With 3 draft tokens this took the
-  # reported run from ~48.6 tok/s (27.65% acceptance) to ~71.6 tok/s (48.35%)
-  # at 50 concurrent. Both are the thread author's numbers on their hardware,
-  # NOT measured here — re-measure before quoting them as ours.
+  # 10240, not the thread's original 8192 — the thread's tuned setting.
+  # NOTE the thread also tuned num_speculative_tokens down to 3, but OUR build
+  # refuses it: vLLM 0.26.1 (dspark image, built 2026-07-30) validates
+  # num_speculative_tokens >= dspark_block_size (5) and fails config parse with
+  # anything lower ("Smaller values produce incorrect output"). Verified live —
+  # the first tp=2 launch died on exactly this. So the command below uses 5;
+  # the thread's 3-draft numbers were from an older/patched build.
   max_num_batched_tokens: 10240
 
 env:
@@ -110,7 +113,7 @@ command: |
       --max-num-seqs {max_num_seqs} \
       --max-num-batched-tokens {max_num_batched_tokens} \
       --gpu-memory-utilization {gpu_memory_utilization} \
-      --speculative-config '{"method":"dspark","num_speculative_tokens":3}' \
+      --speculative-config '{"method":"dspark","num_speculative_tokens":5}' \
       --hf-overrides '{"dspark_noise_token_id":128799}' \
       --tokenizer-mode deepseek_v4 \
       --distributed-executor-backend ray \
