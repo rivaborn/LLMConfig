@@ -5,15 +5,21 @@ local forks written because the upstream recipe could not be driven from
 LLMConfig unchanged.
 
 ```
-.                                  local forks — LLMConfig points its catalog HERE
-├── qwen35-122b-int4-ft.yaml
-├── deepseek-v4-flash-ft.yaml
-├── deepseek-v4-flash-dspark.yaml
-├── mods/                          mods for the forks (must stay adjacent)
+├── local/                         our forks — LLMConfig's catalog points HERE
+│   ├── qwen35-122b-int4-ft.yaml
+│   ├── deepseek-v4-flash-ft.yaml
+│   ├── deepseek-v4-flash-dspark.yaml
+│   └── mods/                      mods for the forks (must stay adjacent)
 └── upstream/                      verbatim snapshots of registry recipes
     ├── *.yaml
     └── mods/                      mods those snapshots declare
 ```
+
+**`local/` is what runs; `upstream/` is a record.** The three files in `local/`
+are referenced by absolute path from the cluster catalog on `.40`, so editing one
+changes what launches. Nothing references `upstream/` — those are snapshots kept
+so a known-good config survives a registry refresh, and so a diff can answer "did
+upstream change under us?".
 
 ## What "successfully launched" means here
 
@@ -29,7 +35,7 @@ Load times are medians of the recorded samples, measured on GB10 nodes.
 | ----------------------- | ----------------------------------------------- | ------------------------------------------ | ----- | - | ----------- |
 | `gemma-4-26b`           | `@eugr/gemma4-26b-a4b`                          | `upstream/gemma4-26b-a4b.yaml`             | 1     | 5 | 491 s       |
 | `qwen35-122b-int4`      | `@eugr/qwen3.5-122b-int4-autoround`             | `upstream/qwen3.5-122b-int4-autoround.yaml`| 1     | 5 | 343 s       |
-| `qwen35-122b-int4-ft`   | **local fork** of the above                     | `qwen35-122b-int4-ft.yaml`                 | 1     | 1 | 341 s       |
+| `qwen35-122b-int4-ft`   | **local fork** of the above                     | `local/qwen35-122b-int4-ft.yaml`           | 1     | 1 | 341 s       |
 | `qwen36-27b`            | `@official/qwen3.6-27b-fp8-mtp-vllm`            | `upstream/qwen3.6-27b-fp8-mtp-vllm.yaml`   | 1     | 1 | 324 s       |
 | `qwen36-35b-a3b`        | `@official/qwen3.6-35b-a3b-fp8-mtp-vllm`        | `upstream/qwen3.6-35b-a3b-fp8-mtp-vllm.yaml`| 1    | 1 | 264 s       |
 | `qwen3-coder-next`      | `@official/qwen3-coder-next-int4-autoround-vllm`| `upstream/qwen3-coder-next-int4-autoround-vllm.yaml` | 1 | 1 | 184 s |
@@ -43,8 +49,8 @@ cluster yet — the CX7 fabric only came up 2026-07-30.
 
 | Recipe                                                | Why not                                                             |
 | ----------------------------------------------------- | ------------------------------------------------------------------- |
-| `deepseek-v4-flash-ft.yaml`                           | present as a **fork**, render-verified, but **never launched**      |
-| `deepseek-v4-flash-dspark.yaml`                       | same, and its `vllm-node-dspark` image did not exist when written   |
+| `local/deepseek-v4-flash-ft.yaml`                     | present as a **fork**, render-verified, but **never launched**      |
+| `local/deepseek-v4-flash-dspark.yaml`                 | same, and its `vllm-node-dspark` image did not exist when written   |
 | `@eugr/openai-gpt-oss-120b`                           | catalogued, never launched — no samples                             |
 | `@sparkrun-transitional/qwen3.5-35b-a3b-fp8-sglang`   | **failed** on spark4; appears in `failures:`, never in samples      |
 | `@sparkrun-transitional/qwen3.5-122b-a10b-fp8-sglang` | catalogued for 2 nodes, never launched; no SGLang image on any node |
@@ -65,7 +71,7 @@ normally. Only the three local forks are referenced by absolute path.
 To repoint anything at a snapshot, use the WSL path from `.40`:
 
 ```
-/mnt/c/Coding/rivaborn/LLMConfig/dgx_sparks/recipes/upstream/<file>.yaml
+/mnt/c/Coding/rivaborn/LLMConfig/dgx_sparks/recipes/{local,upstream}/<file>.yaml
 ```
 
 ⚠️ **`mods/` must stay beside its recipes.** sparkrun resolves `mods:` relative to
