@@ -14,13 +14,14 @@ aliases:
     hf_repo: datalab-to/surya-ocr-2
     served_name: surya-ocr-2
     mode: eager
-    status: unverified
+    status: ok
     notes: >-
-      Surya-2 OCR VLM (~3 GB bf16) for epubocr — needs vLLM (logprobs feed the
-      per-block confidence scores; --mm-processor-kwargs min/max_pixels).
-      Slot-mode resident beside the opencode relay. max_model_len 18000.
-      Verify on first slot launch; if the multimodal profile run OOMs, lower
-      max_pixels (6291456 -> 2359296) before touching the util split.
+      Surya-2 OCR VLM (1.37 GiB bf16 measured) for epubocr — needs vLLM
+      (logprobs feed the per-block confidence scores; --mm-processor-kwargs
+      pixel bounds). Slot-mode resident beside the opencode relay; verified
+      2026-07-31. Window 12288 / max_pixels 2359296 / util 0.54 — the 8 GB fit
+      took three profile iterations, see serve-companion.sh's case comments
+      before touching any of those numbers.
     load_timeout_s: 300
     managed_by: serve.sh
 
@@ -28,12 +29,13 @@ aliases:
     hf_repo: Qwen/Qwen2.5-1.5B-Instruct-AWQ
     served_name: qwen2.5-1.5b
     mode: eager
-    status: unverified
+    status: ok
     notes: >-
       The opencode /swap echo relay, vLLM-served (replaces the Ollama tag
       qwen2.5:1.5b — Ollama declares no budget and cannot join a budgeted
-      card). AWQ ~1.1 GB weights; --max-model-len 32768 so opencode's ~24.5k
-      baseline prompt fits. Slot-mode resident beside surya2.
+      card). Verified 2026-07-31: AWQ weights CPU-offloaded (chassis PCIe, not
+      the eGPU), fp8_e5m2 KV, util 0.30, --max-model-len 32768 so opencode's
+      ~24.5k baseline prompt fits. Slot-mode resident beside surya2.
     load_timeout_s: 180
     managed_by: serve.sh
 
