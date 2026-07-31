@@ -81,6 +81,12 @@ case "$ALIAS" in
     # card). AWQ ~1.1 GB weights; 32k window so opencode's ~24.5k baseline
     # prompt fits (bf16 1.5B + 32k KV does NOT fit beside surya2 — that is why
     # this is the AWQ build).
+    #
+    # Measured 2026-07-31 (first slot cutover): util 0.25 (2.0 GiB) reported
+    # "Available KV cache memory: -2.19 GiB" — weights 1.1 GiB + a 32k fp16 KV
+    # + the default 8192-token profile run need ~4.2 GiB. Fits at 0.35 with
+    # fp8 KV storage (Ampere-safe e5m2) and a 2048-token profile; surya2
+    # measures 4.6 GiB, so 0.35 (2.87 GiB) is what the card actually has left.
     PORT=11440
     pkill -f "vllm serve.*--port ${PORT}" 2>/dev/null || true
     exec vllm serve Qwen/Qwen2.5-1.5B-Instruct-AWQ \
@@ -88,7 +94,10 @@ case "$ALIAS" in
       --port "$PORT" \
       --served-model-name qwen2.5-1.5b \
       --max-model-len 32768 \
-      --gpu-memory-utilization 0.25 \
+      --gpu-memory-utilization 0.35 \
+      --kv-cache-dtype fp8_e5m2 \
+      --max-num-batched-tokens 2048 \
+      --max-num-seqs 4 \
       --enforce-eager \
       --enable-prefix-caching
     ;;

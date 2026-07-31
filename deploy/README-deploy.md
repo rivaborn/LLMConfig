@@ -98,19 +98,30 @@ via `127.0.0.1:11435` either way).
 .\.venv\Scripts\llmconfig doctor --local      # companion.gpu + companion.ollama.* should pass
 ```
 
-**c. (Optional) Companion vLLM (WSL side)** — only if you want vLLM (not just Ollama)
-on the 3070 Ti. Mirror the primary vLLM setup with a 3070 Ti-pinned variant:
+**c. (Optional) Companion vLLM (WSL side)** — SLOT mode: several co-resident vLLM
+processes on the 3070 Ti, one systemd instance + one socat relay per slot
+(LLMConfig drives them via `SlotLane` when `COMPANION_VLLM_SLOTS` is set):
 ```bash
 # inside WSL: wsl -d Ubuntu-24.04 -u folar
-# 1) serve-companion.sh — like serve.sh but resolves the 3070 Ti's index via torch (match
-#    "2caf7863"; vLLM 0.20.2 needs an integer index and ignores CUDA_DEVICE_ORDER) and uses a
-#    lower --gpu-memory-utilization + small (<=8 GB) models; serves on an internal port (11439).
-#    Its alias table must match llmconfig/data/vllm_models_companion.default.yaml.
-# 2) a 2nd socat relay: 127.0.0.1:11438  →  the companion vLLM internal port (11439).
-# 3) install the unit:
-cp /mnt/c/Coding/rivaborn/LLMConfig/deploy/vllm-companion@.service ~/.config/systemd/user/
+R=/mnt/c/Coding/rivaborn/LLMConfig
+# 1) the launcher — resolves the 3070 Ti's index via torch (match "2caf7863");
+#    per-alias FIXED ports + 8 GB budgets; NEVER kills other vllm processes.
+cp "$R/deploy/serve-companion.sh" ~/vllm/ && sed -i 's/\r$//' ~/vllm/serve-companion.sh && chmod +x ~/vllm/serve-companion.sh
+# 2) the templated unit:
+cp "$R/deploy/vllm-companion@.service" ~/.config/systemd/user/
+# 3) one mirror-bypass socat relay PER SLOT (copy vllm-relay.service's pattern):
+#      vllm-companion-relay-surya2:   LISTEN :11438 -> mirrored-IP :11439
+#      vllm-companion-relay-qwen25:   LISTEN :11441 -> mirrored-IP :11440
 systemctl --user daemon-reload
+systemctl --user enable --now vllm-companion-relay-surya2 vllm-companion-relay-qwen25
 ```
+Then in `.env`:
+```
+COMPANION_VLLM_ENABLED=true
+COMPANION_VLLM_SLOTS=surya2=11438:4600,qwen25-relay=11441:2100
+```
+The Windows `OllamaCompanion` service should be stopped + disabled at cutover
+(the relay model is vLLM-served now; keep the service installed as rollback).
 
 **d. Pick what runs on it.** Load on demand from the UI/CLI, or set a sticky default
 that auto-loads on startup:

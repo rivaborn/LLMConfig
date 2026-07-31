@@ -35,13 +35,13 @@ class LaneConfig:
     vllm_systemd_unit: str
     registry_path: Path
     enabled: bool = True
-    # Does this lane have a working vLLM half? A lane is Ollama-XOR-vLLM by
-    # design, but the vLLM side needs a serve script + systemd unit installed on
-    # the box, and the COMPANION's was specified and never built (no
-    # `serve-companion.sh` exists — not on .40, not in deploy/). False makes that
-    # explicit instead of pretending: doctor reports it as configuration rather
-    # than failure, the catalogs stop advertising models that cannot run, and a
-    # load refuses BEFORE it evicts the lane's working Ollama model.
+    # Does this lane have a working vLLM half? The vLLM side needs a serve
+    # script + systemd unit installed on the box (deploy/serve.sh for the
+    # primary, deploy/serve-companion.sh for the companion — the latter built
+    # 2026-07-31). False makes a missing install explicit instead of pretending:
+    # doctor reports it as configuration rather than failure, the catalogs stop
+    # advertising models that cannot run, and a load refuses BEFORE it evicts
+    # the lane's working Ollama model.
     vllm_enabled: bool = True
     default_server: str = ""      # "ollama" | "vllm" | "" — auto-load on startup
     default_model: str = ""       # Ollama tag or vLLM alias
@@ -293,10 +293,10 @@ class Settings(BaseSettings):
     companion_ollama_url: str = "http://127.0.0.1:11435"        # 2nd Ollama instance
     companion_ollama_service_name: str = "OllamaCompanion"
     companion_vllm_relay_url: str = "http://127.0.0.1:11438"    # 2nd socat relay
-    # OFF: `serve-companion.sh` has never existed — the unit file specifies it
-    # (resolve the 3070 Ti index by UUID via torch, lower --gpu-memory-utilization)
-    # but the script was never written, so the companion is an Ollama-only lane.
-    # Flip to true if you ever build it; the registry + unit are already here.
+    # Default OFF for a fresh install: the vLLM half needs deploy/serve-companion.sh
+    # + vllm-companion@.service + the slot relays installed in WSL first (built
+    # 2026-07-31 for the daily-driver slot pair; see deploy/README-deploy.md).
+    # `.40` runs it ON with COMPANION_VLLM_SLOTS (SlotLane).
     companion_vllm_enabled: bool = False
     companion_vllm_serve_script: str = "/home/folar/vllm/serve-companion.sh"
     companion_vllm_systemd_unit: str = "vllm-companion@"
