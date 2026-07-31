@@ -1,0 +1,66 @@
+# Recipe: Qwen3-VL-Reranker-8B — with the CLASSIFIER CONVERSION the upstream
+# recipe omits.
+#
+# LOCAL FORK of @official/qwen3-vl-reranker-8b-vllm (snapshot:
+# ../upstream/qwen3-vl-reranker-8b-vllm.yaml). The upstream recipe serves the
+# model as a BARE POOLING runner — no --hf-overrides, no score template — so
+# /v1/rerank returns near-constant similarity blur instead of relevance:
+# measured 2026-07-31, an exact answer scored 0.909 vs 0.893 for "bananas are
+# yellow" on the same query, which BURIED good ANN hits (ragstack golden eval
+# 2/10 with rerank vs 10/10 without).
+#
+# The model card's vLLM setup (huggingface.co/Qwen/Qwen3-VL-Reranker-8B):
+#   1. --hf-overrides converts the causal VL model into a yes/no sequence
+#      classifier (score = P("yes")): architectures
+#      Qwen3VLForSequenceClassification, classifier_from_token ["no","yes"],
+#      is_original_qwen3_reranker true.
+#   2. The score CHAT TEMPLATE ships in the model repo
+#      (template/qwen3_vl_reranker.jinja) and must be passed to the server —
+#      it wraps query/document in the Instruct/Query/Document format the
+#      classifier was trained on. Located at launch via find over the mounted
+#      HF cache (the snapshot hash is not knowable in a static recipe); the
+#      launch FAILS LOUDLY if absent rather than serving blur again.
+#   3. --dtype bfloat16 per the card.
+#
+# The --hf-overrides JSON uses single braces with literal values and no inner
+# braces — exactly the form sparkrun's renderer passes through verbatim (see
+# ../README.md's render-bug rule; arrays use brackets, so the non-greedy
+# {...} match is the whole blob, misses the lookup, and survives unchanged).
+#
+# Still fastsafetensors → still needs_empty_node (the load-order landmine:
+# launching this beside a resident killed it, 2/2, 2026-07-28-29).
+
+recipe_version: "2"
+model: Qwen/Qwen3-VL-Reranker-8B
+runtime: vllm
+max_nodes: 1
+container: ghcr.io/spark-arena/dgx-vllm-eugr-nightly-tf5:latest
+
+metadata:
+  description: Qwen3-VL-Reranker-8B as a yes/no classifier (fixed score path)
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.3
+  max_model_len: 32768
+
+command: |
+  TEMPLATE=$(find /root/.cache/huggingface /home/*/.cache/huggingface -name 'qwen3_vl_reranker.jinja' 2>/dev/null | head -1)
+  if [ -z "$TEMPLATE" ]; then
+    echo "FATAL: qwen3_vl_reranker.jinja not found in the HF cache — refusing to serve the non-discriminative pooling fallback" >&2
+    exit 1
+  fi
+  vllm serve {model} \
+    --runner pooling \
+    --hf-overrides '{"architectures": ["Qwen3VLForSequenceClassification"], "classifier_from_token": ["no", "yes"], "is_original_qwen3_reranker": true}' \
+    --chat-template "$TEMPLATE" \
+    --dtype bfloat16 \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    -tp {tensor_parallel} \
+    --host {host} \
+    --port {port} \
+    --max-model-len {max_model_len} \
+    --load-format fastsafetensors \
+    --trust-remote-code
