@@ -14,12 +14,14 @@
 #      classifier (score = P("yes")): architectures
 #      Qwen3VLForSequenceClassification, classifier_from_token ["no","yes"],
 #      is_original_qwen3_reranker true.
-#   2. The score CHAT TEMPLATE ships in the model repo
-#      (template/qwen3_vl_reranker.jinja) and must be passed to the server —
-#      it wraps query/document in the Instruct/Query/Document format the
-#      classifier was trained on. Located at launch via find over the mounted
-#      HF cache (the snapshot hash is not knowable in a static recipe); the
-#      launch FAILS LOUDLY if absent rather than serving blur again.
+#   2. The score CHAT TEMPLATE ships in the model repo — in the cached
+#      revision it is `additional_chat_templates/reranker.jinja` (the model
+#      card says `template/qwen3_vl_reranker.jinja`; the repo layout moved).
+#      It wraps query/document in the format the classifier was trained on.
+#      Located at launch via find over the mounted HF cache, which sparkrun
+#      mounts at /cache/huggingface inside the container (verified via
+#      docker inspect — NOT /root/.cache). The launch FAILS LOUDLY if the
+#      template is absent rather than serving blur again.
 #   3. --dtype bfloat16 per the card.
 #
 # The --hf-overrides JSON uses single braces with literal values and no inner
@@ -47,11 +49,12 @@ defaults:
   max_model_len: 32768
 
 command: |
-  TEMPLATE=$(find /root/.cache/huggingface /home/*/.cache/huggingface -name 'qwen3_vl_reranker.jinja' 2>/dev/null | head -1)
+  TEMPLATE=$(find /cache/huggingface /root/.cache/huggingface /home/*/.cache/huggingface -path '*Qwen3-VL-Reranker*' \( -name 'reranker.jinja' -o -name 'qwen3_vl_reranker.jinja' \) 2>/dev/null | head -1)
   if [ -z "$TEMPLATE" ]; then
-    echo "FATAL: qwen3_vl_reranker.jinja not found in the HF cache — refusing to serve the non-discriminative pooling fallback" >&2
+    echo "FATAL: reranker score template not found in the HF cache — refusing to serve the non-discriminative pooling fallback" >&2
     exit 1
   fi
+  echo "reranker score template: $TEMPLATE"
   vllm serve {model} \
     --runner pooling \
     --hf-overrides '{"architectures": ["Qwen3VLForSequenceClassification"], "classifier_from_token": ["no", "yes"], "is_original_qwen3_reranker": true}' \
