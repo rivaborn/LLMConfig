@@ -11,9 +11,9 @@
 #      slot down on every launch. systemd owns lifecycle (vllm-companion@<alias>);
 #      the only defensive kill below is scoped to THIS alias's own port.
 #   3. Budgets are per-alias --gpu-memory-utilization fractions of the 8 GB
-#      TOTAL. Measured fit 2026-07-31: surya2 0.55 lands at 4.6 GiB actual,
-#      leaving 2.95 GiB after the ~600 MiB driver baseline — the relay's 0.35
-#      (2.87 GiB) is exactly that remainder. Anything more OOMs at profile.
+#      TOTAL. Measured 2026-07-31: WSL charges ~1.5 GiB of non-torch CUDA
+#      context PER PROCESS, so small models are overhead-dominated here.
+#      Fit: surya2 0.50 + relay 0.40 (the relay profiled -0.46 GiB at 0.35).
 set -euo pipefail
 
 ALIAS="${1:-}"
@@ -71,7 +71,7 @@ case "$ALIAS" in
       --served-model-name surya-ocr-2 \
       --max-model-len 18000 \
       --dtype bfloat16 \
-      --gpu-memory-utilization 0.55 \
+      --gpu-memory-utilization 0.50 \
       --enforce-eager \
       --mm-processor-kwargs '{"min_pixels":3136,"max_pixels":6291456}' \
       --enable-prefix-caching
@@ -83,11 +83,10 @@ case "$ALIAS" in
     # prompt fits (bf16 1.5B + 32k KV does NOT fit beside surya2 — that is why
     # this is the AWQ build).
     #
-    # Measured 2026-07-31 (first slot cutover): util 0.25 (2.0 GiB) reported
-    # "Available KV cache memory: -2.19 GiB" — weights 1.1 GiB + a 32k fp16 KV
-    # + the default 8192-token profile run need ~4.2 GiB. Fits at 0.35 with
-    # fp8 KV storage (Ampere-safe e5m2) and a 2048-token profile; surya2
-    # measures 4.6 GiB, so 0.35 (2.87 GiB) is what the card actually has left.
+    # Measured 2026-07-31 (slot cutover): 0.25 profiled -2.19 GiB available
+    # KV; 0.35 + fp8 KV + 2048-token profile got to -0.46. The residual is
+    # WSL's ~1.5 GiB non-torch CUDA context — hence 0.40 here with surya2
+    # dropped to 0.50. Next rung down if this OOMs: the 0.5B fallback model.
     PORT=11440
     pkill -f "vllm serve.*--port ${PORT}" 2>/dev/null || true
     exec vllm serve Qwen/Qwen2.5-1.5B-Instruct-AWQ \
@@ -95,7 +94,7 @@ case "$ALIAS" in
       --port "$PORT" \
       --served-model-name qwen2.5-1.5b \
       --max-model-len 32768 \
-      --gpu-memory-utilization 0.35 \
+      --gpu-memory-utilization 0.40 \
       --kv-cache-dtype fp8_e5m2 \
       --max-num-batched-tokens 2048 \
       --max-num-seqs 4 \
