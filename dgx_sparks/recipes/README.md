@@ -42,10 +42,12 @@ Load times are medians of the recorded samples, measured on GB10 nodes.
 | `qwen3-vl-embedding-8b` | `@official/qwen3-vl-embedding-8b-vllm`          | `upstream/qwen3-vl-embedding-8b-vllm.yaml` | 1     | 3 | 145 s       |
 | `qwen3-vl-reranker-8b`  | `@official/qwen3-vl-reranker-8b-vllm`           | `upstream/qwen3-vl-reranker-8b-vllm.yaml`  | 1     | 5 | 116 s       |
 
-**Every proven recipe is single-node.** No multi-node recipe has launched on this
-cluster yet — the CX7 fabric only came up 2026-07-30.
+**Multi-node (tp=2) launches are proven as of 2026-07-30 evening** — both local
+DeepSeek forks below launched, served, and (for `-ft`) engaged MTP across
+spark1+spark2 the same day the CX7 fabric came up. `load_times` keys them as
+`spark:<alias>:x2`.
 
-### Not included, and why
+### The rest, and their status
 
 | Recipe                                                | Why not                                                                                                      |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
