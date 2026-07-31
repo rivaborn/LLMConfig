@@ -40,7 +40,7 @@ Load times are medians of the recorded samples, measured on GB10 nodes.
 | `qwen36-35b-a3b`        | `@official/qwen3.6-35b-a3b-fp8-mtp-vllm`        | `upstream/qwen3.6-35b-a3b-fp8-mtp-vllm.yaml`| 1    | 1 | 264 s       |
 | `qwen3-coder-next`      | `@official/qwen3-coder-next-int4-autoround-vllm`| `upstream/qwen3-coder-next-int4-autoround-vllm.yaml` | 1 | 1 | 184 s |
 | `qwen3-vl-embedding-8b` | `@official/qwen3-vl-embedding-8b-vllm`          | `upstream/qwen3-vl-embedding-8b-vllm.yaml` | 1     | 3 | 145 s       |
-| `qwen3-vl-reranker-8b`  | `@official/qwen3-vl-reranker-8b-vllm`           | `upstream/qwen3-vl-reranker-8b-vllm.yaml`  | 1     | 5 | 116 s       |
+| `qwen3-vl-reranker-8b`  | **local fork** `local/qwen3-vl-reranker-8b-fixed.yaml` (2026-07-31) | `upstream/qwen3-vl-reranker-8b-vllm.yaml`  | 1     | 5 | 116 s       |
 
 **Multi-node (tp=2) launches are proven as of 2026-07-30 evening** — both local
 DeepSeek forks below launched, served, and (for `-ft`) engaged MTP across
@@ -56,6 +56,18 @@ spark1+spark2 the same day the CX7 fabric came up. `load_times` keys them as
 | `@eugr/openai-gpt-oss-120b`                           | catalogued, never launched — no samples                                                                      |
 | `@sparkrun-transitional/qwen3.5-35b-a3b-fp8-sglang`   | **failed** on spark4; appears in `failures:`, never in samples                                               |
 | `@sparkrun-transitional/qwen3.5-122b-a10b-fp8-sglang` | catalogued for 2 nodes, never launched; no SGLang image on any node                                          |
+
+**`local/qwen3-vl-reranker-8b-fixed.yaml`** (2026-07-31): the upstream recipe
+serves the reranker as a BARE pooling runner — non-discriminative blur (0.909
+for an exact answer vs 0.893 for "bananas are yellow") that buried good ANN
+hits in ragstack's golden eval (2/10). The fork adds the model card's
+classifier conversion (`Qwen3VLForSequenceClassification` hf-overrides,
+score = P("yes")) and the repo's `additional_chat_templates/reranker.jinja`
+score template — found at launch under `/cache/huggingface` (sparkrun's mount
+point inside the container, NOT `/root/.cache`), with an exit-1 guard rather
+than ever serving blur again. Verified discrimination: 0.474 vs 0.005 on the
+same probe. The `--hf-overrides` JSON is single-brace/literal-only, per the
+render rule below.
 
 `qwen3-vl-reranker-8b` also has one recorded failure (on spark1) alongside its
 five successes — its `needs_empty_node` transient is lethal to co-residents, so a
