@@ -319,3 +319,11 @@ pair A   spark1+spark2   deepseek-v4-flash  tp=2 (MTP fork)
 3090                     vl32  (pinned — reaper exempt)
 3070 Ti                  surya2 + qwen2.5-1.5b relay  (SlotLane, 97%)
 ```
+
+**2026-07-31 update:** the `deepseek-v4-flash` alias now serves the **official
+DeepSeek-V4-Flash-0731 release** (`recipes/local/deepseek-v4-flash-0731.yaml`
+— FP8 156 G, spec-decode built in, DSpark draft on both workers, "Say OK"
+5.2 s vs the preview's ~15 s; TerminalBench 82.7 vs 61.8 per the model card).
+Layout, cookbook state, and every consumer unchanged — only the recipe behind
+the alias moved. Weights staged on all four nodes; preview weights cached
+until ~2026-08-07 as rollback.

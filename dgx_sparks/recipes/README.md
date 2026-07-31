@@ -51,8 +51,9 @@ spark1+spark2 the same day the CX7 fabric came up. `load_times` keys them as
 
 | Recipe                                                | Why not                                                                                                      |
 | ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
-| `local/deepseek-v4-flash-ft.yaml`                     | ✅ **VERIFIED 2026-07-30**: tp=2 launch on spark1+spark2 (330 s), serving, MTP engaged (`DeepSeekV4MTPModel`) |
-| `local/deepseek-v4-flash-dspark.yaml`                 | ✅ **VERIFIED 2026-07-30**: tp=2 launch on spark1+spark2 (510 s), served inference; image built same day      |
+| `local/deepseek-v4-flash-0731.yaml`                   | ✅ **VERIFIED 2026-07-31**: the OFFICIAL release (FP8, 156 G, spec-decode built in) — tp=2 on spark1+2 in ~11 min, DSpark draft loaded on BOTH workers, tool-calling verified, "Say OK" 5.2 s (preview: ~15 s). **The stable `deepseek-v4-flash` catalog alias points here since 2026-07-31.** |
+| `local/deepseek-v4-flash-ft.yaml`                     | ✅ **VERIFIED 2026-07-30**: tp=2 launch on spark1+spark2 (330 s), serving, MTP engaged (`DeepSeekV4MTPModel`) — superseded by `-0731` as the daily driver |
+| `local/deepseek-v4-flash-dspark.yaml`                 | ✅ **VERIFIED 2026-07-30**: tp=2 launch on spark1+spark2 (510 s), served inference; image built same day — preview-DSpark build, superseded by `-0731`      |
 | `@eugr/openai-gpt-oss-120b`                           | catalogued, never launched — no samples                                                                      |
 | `@sparkrun-transitional/qwen3.5-35b-a3b-fp8-sglang`   | **failed** on spark4; appears in `failures:`, never in samples                                               |
 | `@sparkrun-transitional/qwen3.5-122b-a10b-fp8-sglang` | catalogued for 2 nodes, never launched; no SGLang image on any node                                          |
