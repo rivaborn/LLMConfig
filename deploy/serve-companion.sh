@@ -83,10 +83,15 @@ case "$ALIAS" in
     # prompt fits (bf16 1.5B + 32k KV does NOT fit beside surya2 — that is why
     # this is the AWQ build).
     #
-    # Measured 2026-07-31 (slot cutover): 0.25 profiled -2.19 GiB available
-    # KV; 0.35 + fp8 KV + 2048-token profile got to -0.46. The residual is
-    # WSL's ~1.5 GiB non-torch CUDA context — hence 0.40 here with surya2
-    # dropped to 0.50. Next rung down if this OOMs: the 0.5B fallback model.
+    # Measured 2026-07-31 (slot cutover, three profile runs): 0.25 → -2.19 GiB
+    # available KV; 0.35 + fp8 KV + 2048-token profile → -0.46; 0.40 → -0.04.
+    # The blocker is structural: WSL charges ~2 GiB of non-torch context +
+    # activations per process, and a 32k window needs ~450 MiB of KV in one
+    # piece — the sum exceeds what surya2 leaves free at any legal util.
+    # Fix from vl32's own playbook: OFFLOAD the weights (~1.1 GiB) to CPU.
+    # This card is chassis PCIe (not the Thunderbolt eGPU the offload warning
+    # is about) and a 1.5B relay tolerates the latency. GPU footprint becomes
+    # context + KV only, which fits at 0.35 with room to spare.
     PORT=11440
     pkill -f "vllm serve.*--port ${PORT}" 2>/dev/null || true
     exec vllm serve Qwen/Qwen2.5-1.5B-Instruct-AWQ \
@@ -94,7 +99,8 @@ case "$ALIAS" in
       --port "$PORT" \
       --served-model-name qwen2.5-1.5b \
       --max-model-len 32768 \
-      --gpu-memory-utilization 0.40 \
+      --gpu-memory-utilization 0.35 \
+      --cpu-offload-gb 1 \
       --kv-cache-dtype fp8_e5m2 \
       --max-num-batched-tokens 2048 \
       --max-num-seqs 4 \
