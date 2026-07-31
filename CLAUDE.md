@@ -144,7 +144,11 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
   util spike) so the card drops to P8, and releases the WSL keepalive when no lane
   serves vLLM. Participation is per lane (`LaneConfig.idle_unload_enabled`) — the
   companion is exempt by default (it idles in P8 anyway; `COMPANION_IDLE_UNLOAD_ENABLED`
-  opts it in). Also `classify_usage()` — the shared free/idle/active classification
+  opts it in), the primary via `PRIMARY_IDLE_UNLOAD_ENABLED`. Above both sits the
+  runtime **pin override** (`LanePins`, `data/lane_pins.yaml` — the UI checkbox on
+  the 3090's card, `PUT /api/lanes/{id}/pin`): an entry beats the static flags in
+  BOTH directions; only the global `IDLE_UNLOAD_ENABLED` master switch outranks it.
+  Also `classify_usage()` — the shared free/idle/active classification
   behind `GET /api/usage` and the `usage` field on `/api/status` lanes.
 - `leases.py` — `LeaseManager` + `LeaseSweeper`: **resource sharing between callers**.
   A lease records who holds a unit, whether their work may be interrupted, and a

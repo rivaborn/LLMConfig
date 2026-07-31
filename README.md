@@ -386,6 +386,18 @@ idle-shutdown; the next vLLM load restarts it. Set `IDLE_UNLOAD_ENABLED=false` t
 models pinned. If the lane's GPU also renders a desktop, background compositing can
 register as activity — raise `IDLE_UNLOAD_UTIL_PCT`.
 
+**The pin checkbox (the 3090's card).** Whether the primary's model stays resident is a
+day-to-day call — the 3090 is the fleet's power hog — so the Home card carries a
+**"Pin model (skip idle reaping)"** checkbox that is the RUNTIME authority: checked
+shields the resident model from the reaper even when the `.env` leaves the lane
+reapable, unchecked makes it reapable even when `PRIMARY_IDLE_UNLOAD_ENABLED=false`
+exempts it. The choice persists across restarts (`data/lane_pins.yaml`) and is
+`PUT /api/lanes/{id}/pin` (`{"pinned": true|false|null}` — `null` clears the override
+back to configured behavior); each GPU lane's **effective** pin is reported as
+`pinned` on `/api/status` → `lanes[]`. Only the global `IDLE_UNLOAD_ENABLED` master
+switch sits above it (off = the reaper loop never runs); a live lease still protects a
+model independently, exactly as below.
+
 The same activity signals back a **usage query**: `GET /api/usage` (and the `usage`
 field on each `/api/status` lane, plus `llmconfig usage`) classifies every lane as
 `free` (nothing loaded), `idle` (model loaded but unused — the name is returned), or
