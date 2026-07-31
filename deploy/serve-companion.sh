@@ -59,10 +59,11 @@ case "$ALIAS" in
   surya2)
     # Surya 2 OCR VLM for epubocr — must be vLLM (epubocr consumes logprobs for
     # per-block confidence; needs --mm-processor-kwargs pixel bounds). Copied
-    # from serve.sh's 3090 case with the 8 GB retune: utilization 0.85 -> 0.55
-    # (~4.5 GB — the 3090 figure bought ~18 GB of KV pool this model never
-    # needs). OOM fallback ladder, in order: max_pixels 6291456 -> 2359296,
-    # then utilization 0.60 with the relay dropped to a 0.5B model.
+    # from serve.sh's 3090 case with the 8 GB retune. Weights are only 1.37 GiB
+    # (measured) — the budget hog is the multimodal PROFILE run at max_pixels
+    # 6291456, which OOM'd the reload beside the resident relay (-0.45 GiB
+    # available KV at util 0.50). Ladder rung applied 2026-07-31: max_pixels
+    # 2359296 (~1536x1536 — ample for book-page OCR) + 1 image per prompt.
     PORT=11439
     pkill -f "vllm serve.*--port ${PORT}" 2>/dev/null || true
     exec vllm serve datalab-to/surya-ocr-2 \
@@ -73,7 +74,8 @@ case "$ALIAS" in
       --dtype bfloat16 \
       --gpu-memory-utilization 0.50 \
       --enforce-eager \
-      --mm-processor-kwargs '{"min_pixels":3136,"max_pixels":6291456}' \
+      --mm-processor-kwargs '{"min_pixels":3136,"max_pixels":2359296}' \
+      --limit-mm-per-prompt '{"image":1,"video":0}' \
       --enable-prefix-caching
     ;;
   qwen25-relay)
