@@ -50,7 +50,7 @@ import yaml
 from .fsio import atomic_write_text
 
 from .config import REPO_ROOT, Settings
-from .schemas import Job, LoadRequest, UnloadRequest
+from .schemas import Job, LoadRequest, UnloadRequest, boot_order_key
 
 if TYPE_CHECKING:
     from .jobs import JobManager
@@ -257,6 +257,12 @@ class Cookbook:
             if not targets:
                 self.orch.defaults.set_empty(uid)
                 continue
+            # Persist in true boot order (needs_empty_node first, biggest budget
+            # next) so the file READS as it will load. Autoload re-sorts at
+            # dispatch anyway — this is for the human reading lane_defaults.yaml.
+            reg = getattr(self.orch.units.get(uid), "registry", None)
+            targets = sorted(targets, key=lambda e: boot_order_key(
+                reg.get(e["model"]) if reg is not None else None))
             first, *rest = targets
             self.orch.defaults.set(uid, first["server"], first["model"])
             for e in rest:
@@ -446,12 +452,7 @@ class Cookbook:
             result["unloaded"].append({"unit": uid, "model": m})
 
         # ---- loads: needs_empty_node first, then biggest budget first ----
-        def order(m: str) -> tuple:
-            e = target_entries.get(m)
-            return (not (e is not None and e.needs_empty_node),
-                    -(e.mem_fraction if e is not None else 0.0))
-
-        for m in sorted(missing, key=order):
+        for m in sorted(missing, key=lambda m: boot_order_key(target_entries.get(m))):
             self.jobs.log(meta, f"{uid}: loading {m} ({want[m]})…")
             child = unit.load(LoadRequest(server=want[m], model=m, lane=uid))
             emitted = 0

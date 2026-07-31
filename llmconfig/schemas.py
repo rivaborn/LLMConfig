@@ -171,6 +171,21 @@ class SparkModelEntry(BaseModel):
         )
 
 
+def boot_order_key(entry) -> tuple:
+    """Load order for co-resident models on one unit: `needs_empty_node` first
+    (a fastsafetensors/quantize-at-load recipe must OWN an empty node — launched
+    second it kills the resident, runbook load-order landmine), then biggest
+    declared budget (packing the big one first fails fast rather than after the
+    small ones already loaded). Shared by cookbook-apply and boot autoload so
+    list order in `lane_defaults.yaml` is only a tiebreak, never load-bearing.
+
+    Duck-typed on purpose: takes any registry entry or None (unknown alias,
+    Ollama tag, GPU-lane entry without the fields) and degrades to "no
+    preference", preserving the caller's original order for those."""
+    return (not getattr(entry, "needs_empty_node", False),
+            -(getattr(entry, "mem_fraction", 0.0) or 0.0))
+
+
 class ModelsResponse(BaseModel):
     ollama: list[OllamaModel] = Field(default_factory=list)
     vllm: list[VllmAlias] = Field(default_factory=list)

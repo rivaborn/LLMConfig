@@ -231,3 +231,91 @@ async def test_status_reports_owner(monkeypatch, tmp_path):
     assert status.owner == "vllm"
     assert status.vllm_up is True
     assert status.loaded.model == "qwen3-coder-30b"
+
+
+# --------------------------------------------------------------------------- #
+# Boot autoload ordering (needs_empty_node first — see schemas.boot_order_key)
+# --------------------------------------------------------------------------- #
+async def test_autoload_orders_needs_empty_node_first(monkeypatch, tmp_path):
+    """A reranker-shaped default (needs_empty_node) must be DISPATCHED before its
+    co-residents even when lane_defaults.yaml lists it last — file order is only
+    a tiebreak (live incident 2026-07-28: fastsafetensors beside a resident)."""
+    from types import SimpleNamespace
+
+    from llmconfig.lane_state import LaneDefaults
+
+    s = Settings(_env_file=None, gpu_uuid="GPU-x", registry_path=tmp_path / "p.yaml",
+                 spark_enabled=True, spark_nodes="spark9=10.0.0.9")
+    jobs = JobManager()
+    orch = Orchestrator(s, Registry(s.registry_path), jobs)
+    orch.defaults = LaneDefaults(s, path=tmp_path / "ld.yaml")
+
+    entries = {
+        "emb": SimpleNamespace(needs_empty_node=False, mem_fraction=0.33),
+        "rr":  SimpleNamespace(needs_empty_node=True,  mem_fraction=0.35),
+        "big": SimpleNamespace(needs_empty_node=False, mem_fraction=0.80),
+    }
+    unit = orch.units["spark9"]
+    unit.registry = SimpleNamespace(get=lambda a: entries.get(a))
+
+    dispatched: list[str] = []
+
+    def fake_load(req):
+        dispatched.append(req.model)
+        job = jobs.create(kind=f"load:{req.model}")
+
+        async def body(j):
+            return {}
+
+        return jobs.start(job, body)
+
+    unit.load = fake_load
+
+    # Deliberately wrong file order: reranker LAST, biggest budget in the middle.
+    orch.defaults.set("spark9", "spark", "emb")
+    orch.defaults.add("spark9", "spark", "big")
+    orch.defaults.add("spark9", "spark", "rr")
+
+    started = orch.autoload_defaults()
+    for j in started:                       # completed fakes are already reaped
+        t = jobs._tasks.get(j.id)
+        if t is not None:
+            await t
+
+    assert dispatched == ["rr", "big", "emb"], \
+        "needs_empty_node first, then biggest budget, regardless of file order"
+
+
+async def test_autoload_lane_defaults_keep_file_order(monkeypatch, tmp_path):
+    """GPU-lane entries have no ordering fields — boot_order_key degrades to a
+    constant and the sort must keep the user's file order (Ollama tags resolve
+    to no registry entry at all)."""
+    from llmconfig.lane_state import LaneDefaults
+
+    s = Settings(_env_file=None, gpu_uuid="GPU-x", registry_path=tmp_path / "p.yaml")
+    jobs = JobManager()
+    orch = Orchestrator(s, Registry(s.registry_path), jobs)
+    orch.defaults = LaneDefaults(s, path=tmp_path / "ld.yaml")
+
+    dispatched: list[str] = []
+
+    def fake_load(req):
+        dispatched.append(req.model)
+        job = jobs.create(kind=f"load:{req.model}")
+
+        async def body(j):
+            return {}
+
+        return jobs.start(job, body)
+
+    orch.primary.load = fake_load
+    orch.defaults.set("primary", "ollama", "b-tag:1")
+    orch.defaults.add("primary", "ollama", "a-tag:1")
+
+    started = orch.autoload_defaults()
+    for j in started:                       # completed fakes are already reaped
+        t = jobs._tasks.get(j.id)
+        if t is not None:
+            await t
+
+    assert dispatched == ["b-tag:1", "a-tag:1"], "no fields -> stable file order"

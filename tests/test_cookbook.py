@@ -309,6 +309,22 @@ async def test_set_default_syncs_lane_defaults_with_tombstones(tmp_path):
     assert cb.default_in_sync() is False, "drift is reported, not fought"
 
 
+async def test_set_default_writes_boot_order(tmp_path):
+    """LaneDefaults should READ in true boot order: needs_empty_node first, even
+    when the state's stored list has it last (autoload re-sorts anyway — this is
+    for the human reading lane_defaults.yaml)."""
+    u = FakeSpark("spark1", [entry("emb", frac=0.33),
+                             entry("rr", frac=0.35, needs_empty=True)],
+                  jobs=JobManager())
+    cb, orch, leases = make([u], tmp_path)
+    cb._states["s"] = {"saved_at": 0.0, "units": {"spark1": [
+        {"server": "spark", "model": "emb"}, {"server": "spark", "model": "rr"}]}}
+
+    cb.set_default("s")
+    assert orch.defaults.entries_or_none("spark1") == [
+        {"server": "spark", "model": "rr"}, {"server": "spark", "model": "emb"}]
+
+
 async def test_deleting_the_default_clears_the_marker(tmp_path):
     u = FakeSpark("spark1", [entry("m1")], resident=["m1"], jobs=JobManager())
     cb, orch, leases = make([u], tmp_path)

@@ -577,6 +577,10 @@ def create_app() -> FastAPI:
         `mode` picks between the two meanings a multi-model unit needs: `replace`
         (the default, and the only sane one for a GPU lane) makes this the unit's
         sole default; `add`/`remove` co-schedule on a Spark.
+
+        List order is NOT boot order: autoload sorts at dispatch with
+        `boot_order_key` (needs_empty_node first, biggest declared budget next),
+        so adding models in the "wrong" order is harmless.
         """
         _lane(lane_id)  # validate
         server = (body.get("server") or "").strip()

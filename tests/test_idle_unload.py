@@ -402,6 +402,29 @@ async def test_companion_reaped_when_opted_in(monkeypatch, tmp_path):
     assert worlds["companion"].ollama == {}
 
 
+async def test_primary_exempt_when_opted_out(monkeypatch, tmp_path):
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path,
+                                    primary_idle_unload_enabled=False)
+    _load_ollama(worlds["primary"], orch.primary)
+    orch.primary.last_activity = time.time() - IDLE
+
+    await reaper._tick()
+
+    assert "qwen3:32b" in worlds["primary"].ollama, \
+        "PRIMARY_IDLE_UNLOAD_ENABLED=false pins the 3090's resident model"
+
+
+async def test_primary_still_reaped_by_default(monkeypatch, tmp_path):
+    # The new knob defaults True — adding it must not change stock behavior.
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path)
+    _load_ollama(worlds["primary"], orch.primary)
+    orch.primary.last_activity = time.time() - IDLE
+
+    await reaper._tick()
+
+    assert worlds["primary"].ollama == {}
+
+
 async def test_lane_failure_does_not_kill_tick(monkeypatch, tmp_path):
     worlds, orch, reaper, _ = _make(monkeypatch, tmp_path, two_lanes=True,
                                     companion_idle_unload_enabled=True)

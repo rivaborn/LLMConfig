@@ -32,7 +32,8 @@ from .lane import Lane
 from .lane_state import LaneDefaults
 from .registry import (DEFAULT_COMPANION_REGISTRY, DEFAULT_SPARK_CLUSTER_REGISTRY,
                        Registry, SparkRegistry)
-from .schemas import Job, LaneStatus, LoadRequest, StatusResponse, UnloadRequest
+from .schemas import (Job, LaneStatus, LoadRequest, StatusResponse, UnloadRequest,
+                      boot_order_key)
 from .spark_group import SparkGroup
 from .spark_unit import SparkUnit
 from .wsl import WslKeepalive
@@ -235,17 +236,27 @@ class Orchestrator:
 
         One job PER MODEL: the unit's own lock serialises them, so a Spark asked for
         an embedder and a reranker loads them back-to-back rather than dropping all
-        but the last.
+        but the last. Within a unit the jobs are dispatched in `boot_order_key`
+        order (needs_empty_node first, biggest budget next — the same rule
+        cookbook-apply uses), NOT file order: the reranker's fastsafetensors
+        loader kills a resident it launches beside (live, 2026-07-28), so a
+        hand-edited lane_defaults.yaml listing it second must still load it first.
+        Job-creation order is lock-acquisition order, and SparkUnit's own
+        needs_empty_node refusal remains the backstop.
         """
         jobs: list[Job] = []
         for cfg in self.s.units():
             if not cfg.enabled:
                 continue
-            for d in self.defaults_for(cfg.id):
-                if d["server"] not in ("ollama", "vllm", "spark") or not d["model"]:
-                    continue
+            unit = self.unit(cfg.id)
+            reg = getattr(unit, "registry", None)
+            wanted = [d for d in self.defaults_for(cfg.id)
+                      if d["server"] in ("ollama", "vllm", "spark") and d["model"]]
+            wanted.sort(key=lambda d: boot_order_key(
+                reg.get(d["model"]) if reg is not None else None))
+            for d in wanted:
                 req = LoadRequest(server=d["server"], model=d["model"], lane=cfg.id)
-                jobs.append(self.unit(cfg.id).load(req))
+                jobs.append(unit.load(req))
         return jobs
 
     def attach_load_times(self, load_times) -> None:

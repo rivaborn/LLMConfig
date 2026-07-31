@@ -434,6 +434,10 @@ class Settings(BaseSettings):
     # small model resident, so reaping saves ~nothing and would cost the opencode
     # /swap echo relay its instant response. Opt it in explicitly if that changes.
     companion_idle_unload_enabled: bool = False
+    # The primary 3090 has its own knob so a pinned daily-driver model (vl32) can be
+    # exempted without turning the reaper OFF globally — the global switch would also
+    # stop the per-tick Monitor folding that keeps `idle_s`/usage honest fleet-wide.
+    primary_idle_unload_enabled: bool = True
     # Recent-activity window for classifying a loaded lane "active" (GET /api/usage
     # and the `usage` field on /api/status lanes).
     usage_active_window_s: float = 60.0
@@ -538,6 +542,7 @@ class Settings(BaseSettings):
                 vllm_systemd_unit=self.vllm_systemd_unit,
                 registry_path=self.registry_path,
                 enabled=True,
+                idle_unload_enabled=self.primary_idle_unload_enabled,
             ),
         ]
         if self.companion_enabled:
