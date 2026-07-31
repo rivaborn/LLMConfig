@@ -104,9 +104,14 @@ class Cookbook:
                 ents = _entries(models)
                 if ents is not None:
                     units[str(uid)] = ents
-            if units:
+            groups = {}
+            for gid, g in (st.get("groups") or {}).items():
+                if isinstance(g, dict) and isinstance(g.get("model"), str):
+                    groups[str(gid)] = {"model": g["model"]}
+            if units or groups:
                 self._states[str(name)] = {
-                    "saved_at": float(st.get("saved_at") or 0.0), "units": units}
+                    "saved_at": float(st.get("saved_at") or 0.0),
+                    "units": units, "groups": groups}
         d = str(raw.get("default") or "")
         self._default = d if d in self._states else ""
 
@@ -121,7 +126,8 @@ class Cookbook:
     # ------------------------------------------------------------------ #
     def states(self) -> dict[str, dict]:
         return {n: {"saved_at": st["saved_at"],
-                    "units": {u: [dict(e) for e in ms] for u, ms in st["units"].items()}}
+                    "units": {u: [dict(e) for e in ms] for u, ms in st["units"].items()},
+                    "groups": {g: dict(v) for g, v in (st.get("groups") or {}).items()}}
                 for n, st in self._states.items()}
 
     @property
@@ -132,7 +138,8 @@ class Cookbook:
         st = self._states.get(name)
         return None if st is None else {
             "saved_at": st["saved_at"],
-            "units": {u: [dict(e) for e in ms] for u, ms in st["units"].items()}}
+            "units": {u: [dict(e) for e in ms] for u, ms in st["units"].items()},
+            "groups": {g: dict(v) for g, v in (st.get("groups") or {}).items()}}
 
     def default_in_sync(self) -> Optional[bool]:
         """Does LaneDefaults still match the default state? None = no default.
@@ -166,11 +173,11 @@ class Cookbook:
         for unit in self.orch.units.values():
             if not unit.cfg.enabled:
                 continue
-            # v1: SparkGroups are outside the cookbook. A state naming a model on
-            # spark1 AND a multi-node model spanning spark1 would be internally
-            # contradictory, and _apply_unit runs units in parallel with no
-            # cross-unit ordering — sequencing "free the members, then load the
-            # group" is real follow-up work, not a snapshot detail.
+            # SparkGroups are recorded in the state's `groups:` section, not as
+            # units — a member-id row for a spanning model would be unapplyable
+            # (the alias lives in the cluster catalog) and internally
+            # contradictory with the member's own row. Apply sequences them:
+            # frees first, single-node units in parallel, groups last.
             if getattr(unit, "kind", "") == "spark_group":
                 continue
             if unit._lock.locked() or unit._active_job_id:
@@ -193,7 +200,23 @@ class Cookbook:
                 targets.append({"server": m.server,
                                 "model": self._canonical(unit, m.server, m.model)})
             units[unit.cfg.id] = targets      # [] recorded too: apply frees the unit
-        self._states[name] = {"saved_at": round(time.time(), 1), "units": units}
+
+        # Multi-node (SparkGroup) deployments, recorded as their OWN section —
+        # never under a member id (a member-id row is unapplyable: the alias
+        # lives in the CLUSTER catalog). The member rows above already skipped
+        # group-claimed residents; this is where those deployments land instead.
+        groups: dict[str, dict] = {}
+        gstate = getattr(self.orch, "group_state", None)
+        for gid, g in getattr(self.orch, "groups", {}).items():
+            if g._lock.locked() or g._active_job_id:
+                raise RuntimeError(
+                    f"group '{gid}' has a swap in progress — snapshot would "
+                    f"record a half-state; retry when it settles")
+            claim = gstate.get(gid) if gstate is not None else None
+            if claim is not None:
+                groups[gid] = {"model": claim.alias}
+        self._states[name] = {"saved_at": round(time.time(), 1),
+                              "units": units, "groups": groups}
         self.save()
         return self.get(name)
 
@@ -219,7 +242,12 @@ class Cookbook:
 
     def set_default(self, name: str) -> None:
         """Mark `name` AND sync LaneDefaults so the existing startup autoload
-        reproduces it — including `[]` tombstones for units pinned empty."""
+        reproduces it — including `[]` tombstones for units pinned empty.
+
+        The state's `groups:` section is deliberately NOT synced anywhere:
+        LaneDefaults has no group concept and boot autoload cannot launch a
+        multi-node job. A group that outlives a restart is re-claimed by boot
+        reclaim; one that doesn't must be re-applied from the cookbook."""
         st = self._states.get(name)
         if st is None:
             raise KeyError(name)
@@ -250,14 +278,73 @@ class Cookbook:
                     f"two applies would interleave into an arbitrary hybrid")
 
         targets_by_unit = {u: [dict(e) for e in ms] for u, ms in st["units"].items()}
+        desired_groups = {g: dict(v) for g, v in (st.get("groups") or {}).items()}
+
+        # Desired groups must not share a member — impossible from a live
+        # snapshot (claims are exclusive) but a hand-edited file can say
+        # anything, and applying it would deadlock-or-thrash by design.
+        def _members_of(gid: str) -> tuple:
+            g = self.orch.units.get(gid)
+            if g is not None and hasattr(g.cfg, "member_ids"):
+                return tuple(g.cfg.member_ids)
+            # No unit yet: derive from the canonical id (group_id_for joins
+            # sorted member ids with "_"; spark unit ids carry no underscores).
+            return tuple(gid.split("_"))
+
+        seen: dict = {}
+        for gid in desired_groups:
+            for m in _members_of(gid):
+                if m in seen:
+                    raise RuntimeError(
+                        f"state '{name}' is inconsistent: groups '{seen[m]}' and "
+                        f"'{gid}' both claim member '{m}' — refusing to apply")
+                seen[m] = gid
+        # Members are reserved for their group's own load — but only if this
+        # orchestrator can actually run one. Without group support the desired
+        # groups will fail in phase 3, and holding their members hostage would
+        # break the unit half of the state too.
+        has_group_support = callable(getattr(self.orch, "get_or_create_group", None))
+        group_members = set(seen) if has_group_support else set()
+
         meta = self.jobs.create(kind=f"cookbook:apply:{name}")
 
         async def body(meta_job: Job) -> dict:
             result = {"loaded": [], "unloaded": [], "skipped": [],
                       "displaced_holds": [], "failed": []}
+
+            # ---- phase 1: tear down live groups the state does not want ----
+            # A stale group claim would make its members refuse their per-unit
+            # applies, and a desired group's own load frees its members whole
+            # (invariant 18), so only UNDESIRED groups need explicit teardown.
+            gstate = getattr(self.orch, "group_state", None)
+            for gid, g in list(getattr(self.orch, "groups", {}).items()):
+                claim = gstate.get(gid) if gstate is not None else None
+                if claim is None:
+                    continue
+                wanted = desired_groups.get(gid)
+                if wanted is not None and wanted.get("model") == claim.alias:
+                    continue                      # phase 3 will see it resident
+                self.jobs.log(meta_job, f"{gid}: unloading group ({claim.alias})…")
+                try:
+                    await g.unload(UnloadRequest(server="spark", lane=gid))
+                    result["unloaded"].append({"unit": gid, "model": claim.alias})
+                except Exception as e:  # noqa: BLE001 — continue; phase 3 re-validates
+                    self.jobs.log(meta_job, f"{gid}: group unload FAILED — {e}")
+                    result["failed"].append({"unit": gid, "error": str(e)})
+
+            # ---- phase 2: single-node units in parallel (as ever) ----
+            # Members of a DESIRED group are skipped: the group load claims and
+            # frees them whole, so a per-unit apply would either be refused
+            # (claimed) or race the group's own eviction.
             units = [self.orch.units[uid] for uid in targets_by_unit
-                     if uid in self.orch.units and self.orch.units[uid].cfg.enabled]
-            missing_units = sorted(set(targets_by_unit) - {u.cfg.id for u in units})
+                     if uid in self.orch.units and self.orch.units[uid].cfg.enabled
+                     and uid not in group_members]
+            for uid in sorted(set(targets_by_unit) & group_members):
+                self.jobs.log(meta_job,
+                              f"{uid}: member of desired group {seen[uid]} — "
+                              f"handled by the group load")
+            missing_units = sorted(set(targets_by_unit) - {u.cfg.id for u in units}
+                                   - group_members)
             for uid in missing_units:
                 self.jobs.log(meta_job, f"{uid}: not an enabled unit — skipped")
                 result["skipped"].append({"unit": uid, "reason": "unit not enabled/known"})
@@ -270,6 +357,49 @@ class Cookbook:
                 if isinstance(out, BaseException):
                     self.jobs.log(meta_job, f"{u.cfg.id}: FAILED — {out}")
                     result["failed"].append({"unit": u.cfg.id, "error": str(out)})
+
+            # ---- phase 3: desired groups, sequentially and last ----
+            # Sequential on purpose: overlapping-member DESIRED sets are refused
+            # above, but two group loads still share the global member-lock
+            # order (invariant 18) and there are at most two pairs — parallelism
+            # buys nothing and interleaves the meta-job log.
+            for gid in sorted(desired_groups):
+                model = desired_groups[gid]["model"]
+                claim = gstate.get(gid) if gstate is not None else None
+                if claim is not None and claim.alias == model:
+                    self.jobs.log(meta_job, f"{gid}: already serving {model}")
+                    result["skipped"].append({"unit": gid, "model": model,
+                                              "reason": "already resident"})
+                    continue
+                try:
+                    getter = getattr(self.orch, "get_or_create_group", None)
+                    if getter is None:
+                        raise RuntimeError("orchestrator has no group support")
+                    group = getter(list(_members_of(gid)))
+                except Exception as e:  # noqa: BLE001 — fabric off, bad members…
+                    self.jobs.log(meta_job, f"{gid}: cannot create group — {e}")
+                    result["failed"].append({"unit": gid, "model": model,
+                                             "error": str(e)})
+                    continue
+                self.jobs.log(meta_job, f"{gid}: loading {model} (tp span)…")
+                child = group.load(LoadRequest(server="spark", model=model, lane=gid))
+                emitted = 0
+                while child.state in ("pending", "running"):
+                    while emitted < len(child.log):
+                        self.jobs.log(meta_job, f"{gid}: {child.log[emitted]}")
+                        emitted += 1
+                    await asyncio.sleep(1.0)
+                while emitted < len(child.log):
+                    self.jobs.log(meta_job, f"{gid}: {child.log[emitted]}")
+                    emitted += 1
+                if child.state == "succeeded":
+                    result["loaded"].append({"unit": gid, "model": model})
+                else:
+                    err = child.error or "group load failed"
+                    self.jobs.log(meta_job, f"{gid}: {model} FAILED — {err}")
+                    result["failed"].append({"unit": gid, "model": model,
+                                             "error": err})
+
             self.jobs.log(meta_job, "apply complete")
             return result
 
