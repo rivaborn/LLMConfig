@@ -47,13 +47,13 @@ cluster yet — the CX7 fabric only came up 2026-07-30.
 
 ### Not included, and why
 
-| Recipe                                                | Why not                                                             |
-| ----------------------------------------------------- | ------------------------------------------------------------------- |
-| `local/deepseek-v4-flash-ft.yaml`                     | present as a **fork**, render-verified, but **never launched**      |
-| `local/deepseek-v4-flash-dspark.yaml`                 | same, and its `vllm-node-dspark` image did not exist when written   |
-| `@eugr/openai-gpt-oss-120b`                           | catalogued, never launched — no samples                             |
-| `@sparkrun-transitional/qwen3.5-35b-a3b-fp8-sglang`   | **failed** on spark4; appears in `failures:`, never in samples      |
-| `@sparkrun-transitional/qwen3.5-122b-a10b-fp8-sglang` | catalogued for 2 nodes, never launched; no SGLang image on any node |
+| Recipe                                                | Why not                                                                                                      |
+| ----------------------------------------------------- | ------------------------------------------------------------------------------------------------------------ |
+| `local/deepseek-v4-flash-ft.yaml`                     | ✅ **VERIFIED 2026-07-30**: tp=2 launch on spark1+spark2 (330 s), serving, MTP engaged (`DeepSeekV4MTPModel`) |
+| `local/deepseek-v4-flash-dspark.yaml`                 | ✅ **VERIFIED 2026-07-30**: tp=2 launch on spark1+spark2 (510 s), served inference; image built same day      |
+| `@eugr/openai-gpt-oss-120b`                           | catalogued, never launched — no samples                                                                      |
+| `@sparkrun-transitional/qwen3.5-35b-a3b-fp8-sglang`   | **failed** on spark4; appears in `failures:`, never in samples                                               |
+| `@sparkrun-transitional/qwen3.5-122b-a10b-fp8-sglang` | catalogued for 2 nodes, never launched; no SGLang image on any node                                          |
 
 `qwen3-vl-reranker-8b` also has one recorded failure (on spark1) alongside its
 five successes — its `needs_empty_node` transient is lethal to co-residents, so a
