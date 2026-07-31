@@ -221,6 +221,28 @@ def create_app() -> FastAPI:
         the /v1 forward auto-loads the model, so "reachable" IS "servable"."""
         return {"status": "ok"}
 
+    @app.middleware("http")
+    async def _lane_path_prefix(request: Request, call_next):
+        """`/lane/<unit>/v1/…` (and `/lane/<unit>/health`) = the same gateway
+        with an IMPLIED `X-LLM-Lane: <unit>` — for clients that cannot send
+        headers. Surya's attach (epubocr) is the motivating case: it probes
+        `{base}/health` and requires `{base}/v1/models` to list its model
+        FIRST, which only a lane-scoped catalog can guarantee. The rewrite
+        happens before routing, and the injected header REPLACES any sent one
+        (the path is the more explicit statement of intent). WSL mirrored
+        networking never exposes the per-slot relays to the LAN, so this is
+        the supported remote path to a specific unit."""
+        path = request.scope["path"]
+        if path.startswith("/lane/"):
+            lane_id, _, tail = path[len("/lane/"):].partition("/")
+            if lane_id and (tail == "health" or tail == "v1" or tail.startswith("v1/")):
+                request.scope["path"] = "/" + tail
+                headers = [(k, v) for k, v in request.scope["headers"]
+                           if k != b"x-llm-lane"]
+                headers.append((b"x-llm-lane", lane_id.encode()))
+                request.scope["headers"] = headers
+        return await call_next(request)
+
     @app.get("/api/status", response_model=StatusResponse)
     async def api_status() -> StatusResponse:
         return await _status_with_usage()

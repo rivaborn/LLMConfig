@@ -929,3 +929,45 @@ async def test_resolve_classic_lane_relay_unchanged(monkeypatch, tmp_path):
     e = lane.registry.entries()[0]
     got = await gateway.resolve(lane, e.served_name or e.alias)
     assert got == ("vllm", e.alias, lane.cfg.vllm_relay_url)
+
+
+# --------------------------------------------------------------------------- #
+# /lane/<unit>/... path prefix: implied X-LLM-Lane for header-less clients
+# --------------------------------------------------------------------------- #
+async def test_lane_path_prefix_implies_the_header(monkeypatch, tmp_path):
+    import llmconfig.main as main_mod
+    from llmconfig.gpu import GpuInfo
+
+    s = Settings(_env_file=None, monitor_enabled=False, idle_unload_enabled=False,
+                 registry_path=tmp_path / "reg.yaml", gpu_uuid="GPU-x")
+    monkeypatch.setattr(main_mod, "get_settings", lambda: s)
+
+    async def fake_query_gpu(set_=None, uuid=None, **kw):
+        return GpuInfo(found=True, uuid=uuid or "GPU-x", total_mb=24576,
+                       used_mb=400, free_mb=24176)
+
+    monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)
+    app = main_mod.create_app()
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app),
+                                 base_url="http://t") as c:
+        r = await c.get("/lane/primary/health")
+        assert r.status_code == 200 and r.json() == {"status": "ok"}
+
+        # The prefixed catalog must equal the header-pinned one (single-lane
+        # view), NOT the un-laned union — that is the whole point: surya's
+        # attach requires its model FIRST in a scoped list.
+        pinned = await c.get("/v1/models", headers={"X-LLM-Lane": "primary"})
+        prefixed = await c.get("/lane/primary/v1/models")
+        assert prefixed.status_code == pinned.status_code == 200
+        assert [m["id"] for m in prefixed.json()["data"]] == \
+               [m["id"] for m in pinned.json()["data"]]
+
+        # A sent header loses to the path (the more explicit statement).
+        overridden = await c.get("/lane/primary/v1/models",
+                                 headers={"X-LLM-Lane": "auto"})
+        assert [m["id"] for m in overridden.json()["data"]] == \
+               [m["id"] for m in pinned.json()["data"]]
+
+        # Unprefixed paths are untouched.
+        assert (await c.get("/health")).status_code == 200
