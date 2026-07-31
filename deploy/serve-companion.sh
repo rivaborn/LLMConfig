@@ -11,8 +11,9 @@
 #      slot down on every launch. systemd owns lifecycle (vllm-companion@<alias>);
 #      the only defensive kill below is scoped to THIS alias's own port.
 #   3. Budgets are per-alias --gpu-memory-utilization fractions of the 8 GB
-#      TOTAL and must sum <= ~0.80 across resident slots (driver baseline ~600 MiB
-#      + two CUDA contexts eat the rest). surya2 0.55 + relay 0.25 = 0.80.
+#      TOTAL. Measured fit 2026-07-31: surya2 0.55 lands at 4.6 GiB actual,
+#      leaving 2.95 GiB after the ~600 MiB driver baseline — the relay's 0.35
+#      (2.87 GiB) is exactly that remainder. Anything more OOMs at profile.
 set -euo pipefail
 
 ALIAS="${1:-}"
