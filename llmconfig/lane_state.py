@@ -161,3 +161,67 @@ class LaneDefaults:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         data = {k: {"models": v} for k, v in self._data.items()}
         atomic_write_text(self.path, yaml.safe_dump({"lanes": data}, sort_keys=False, allow_unicode=True))
+
+
+PINS_PATH = REPO_ROOT / "data" / "lane_pins.yaml"
+
+
+class LanePins:
+    """Persisted per-lane PIN override — the UI checkbox on a GPU card.
+
+    Pinned = the resident model is skipped by the idle reaper. This is the
+    RUNTIME authority: when a lane has an entry here it overrides the static
+    `.env` participation flags (`PRIMARY_IDLE_UNLOAD_ENABLED`,
+    `COMPANION_IDLE_UNLOAD_ENABLED`, per-lane `idle_unload_enabled`) in BOTH
+    directions — pinned=false makes an exempt lane reapable. A lane with no
+    entry keeps its configured behavior. The global `IDLE_UNLOAD_ENABLED`
+    master switch still gates whether the reaper runs at all — with the loop
+    off nothing reaps anything, pinned or not.
+
+    Exists because the 3090 is the fleet's power hog (~117 W in P0 with a
+    model resident vs ~25 W reaped): whether its model stays resident is a
+    day-to-day call, not a deploy-time one.
+
+    Stored shape (user-editable; reading must never raise):
+
+    ```yaml
+    lanes:
+      primary: true
+    ```
+    """
+
+    def __init__(self, settings: Settings | None = None, path: Path | None = None):
+        self.s = settings or get_settings()
+        self.path = path or PINS_PATH
+        self._data: dict[str, bool] = {}
+        self.load()
+
+    def load(self) -> None:
+        self._data = {}
+        if not self.path.exists():
+            return
+        try:
+            raw = yaml.safe_load(self.path.read_text(encoding="utf-8")) or {}
+            lanes = raw.get("lanes", {}) or {}
+            if isinstance(lanes, dict):
+                self._data = {str(k): bool(v) for k, v in lanes.items()
+                              if isinstance(v, bool)}
+        except Exception:  # noqa: BLE001 — user-editable; corrupt = no overrides
+            self._data = {}
+
+    def get(self, lane_id: str) -> Optional[bool]:
+        """The override, or None when the lane has none (config applies)."""
+        return self._data.get(lane_id)
+
+    def set(self, lane_id: str, pinned: Optional[bool]) -> None:
+        """Set the override; None clears it (back to configured behavior)."""
+        if pinned is None:
+            self._data.pop(lane_id, None)
+        else:
+            self._data[lane_id] = bool(pinned)
+        self.save()
+
+    def save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_text(self.path, yaml.safe_dump(
+            {"lanes": dict(self._data)}, sort_keys=False, allow_unicode=True))

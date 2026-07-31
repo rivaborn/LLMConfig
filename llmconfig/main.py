@@ -178,10 +178,17 @@ def create_app() -> FastAPI:
     async def _status_with_usage() -> StatusResponse:
         resp = await orch.status()
         for ls in resp.lanes:
-            ls.usage = classify_usage(ls, monitor.util_for(orch.lane(ls.id).cfg.gpu_uuid), settings)
+            unit = orch.lane(ls.id)
+            ls.usage = classify_usage(ls, monitor.util_for(unit.cfg.gpu_uuid), settings)
             # Additive — `usage` keeps its three values because off-box consumers
             # switch on it; the lease is reported alongside, never as a 4th state.
             ls.lease = leases.brief(ls.id)  # sync, no await
+            # EFFECTIVE pin for GPU lanes: the runtime override when set, else
+            # the static config's exemption. Sparks stay None — they are
+            # policy-exempt as a fleet, not per-card.
+            if unit.kind == "gpu":
+                pin = orch.pins.get(ls.id)
+                ls.pinned = pin if pin is not None else not unit.cfg.idle_unload_enabled
         return resp
 
     if (WEB_DIR / "static").is_dir():
@@ -633,6 +640,32 @@ def create_app() -> FastAPI:
             orch.defaults.set(lane_id, server, model)
         return {"lane": lane_id, "default": orch.default_for(lane_id),
                 "defaults": orch.defaults_for(lane_id)}
+
+    @app.put("/api/lanes/{lane_id}/pin", dependencies=write)
+    async def api_lane_pin_set(lane_id: str, body: dict) -> dict:
+        """Pin (or unpin) a GPU lane's resident model against the idle reaper.
+
+        `pinned: true|false` sets the runtime override — it beats the static
+        `.env` participation flags in BOTH directions; `pinned: null` clears
+        the override back to configured behavior. The UI checkbox on the
+        3090's card drives this: the card is the fleet's power hog, so
+        pin-vs-reap is a day-to-day call, not a deploy-time one.
+        """
+        unit = _lane(lane_id)
+        if getattr(unit, "kind", "") != "gpu":
+            raise HTTPException(status_code=400,
+                                detail=f"'{lane_id}' is not a GPU lane — Sparks are "
+                                       f"policy-exempt as a fleet (SPARK_IDLE_UNLOAD_ENABLED)")
+        if "pinned" not in body:
+            raise HTTPException(status_code=400, detail="body needs 'pinned' (true/false/null)")
+        pinned = body["pinned"]
+        if pinned is not None and not isinstance(pinned, bool):
+            raise HTTPException(status_code=400, detail="'pinned' must be true, false or null")
+        orch.pins.set(lane_id, pinned)
+        effective = orch.pins.get(lane_id)
+        if effective is None:
+            effective = not unit.cfg.idle_unload_enabled
+        return {"lane": lane_id, "override": orch.pins.get(lane_id), "pinned": effective}
 
     # ---- curated Spark model catalog (mirrors the vLLM alias endpoints) ----
     def _spark(lane_id: str) -> SparkUnit:

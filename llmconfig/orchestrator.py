@@ -29,7 +29,7 @@ from .group_state import GroupPlacements, GroupState
 from .jobs import JobManager
 from .gpu import GpuInfo, query_all_gpus
 from .lane import Lane
-from .lane_state import LaneDefaults
+from .lane_state import LaneDefaults, LanePins
 from .slot_lane import SlotLane
 from .registry import (DEFAULT_COMPANION_REGISTRY, DEFAULT_SPARK_CLUSTER_REGISTRY,
                        Registry, SparkRegistry)
@@ -53,6 +53,7 @@ class Orchestrator:
         self.jobs = jobs
         self.keepalive = WslKeepalive(settings)
         self.defaults = LaneDefaults(settings)
+        self.pins = LanePins(settings)
         self.units: dict[str, Unit] = {}
 
         for cfg in settings.lanes():

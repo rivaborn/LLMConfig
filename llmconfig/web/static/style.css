@@ -90,6 +90,11 @@ header {
   border: 1px solid var(--line); border-radius: 8px; padding: 6px 8px; font: inherit; font-size: 12px;
 }
 .uc-switch .btn { padding: 6px 10px; font-size: 12px; }
+.uc-pin {
+  display: flex; align-items: center; gap: 6px; margin-top: 4px;
+  color: var(--muted); font-size: 11px; cursor: pointer; user-select: none;
+}
+.uc-pin input { accent-color: var(--accent, #6aa9ff); cursor: pointer; }
 .hint { color: var(--muted); margin: 0 0 10px; font-size: 12px; }
 .header-hint { flex: 1; min-width: 200px; }
 

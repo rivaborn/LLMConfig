@@ -494,3 +494,118 @@ def test_classify_active_on_current_util_despite_stale_idle_s():
 def test_classify_active_during_swap():
     s = Settings(_env_file=None)
     assert classify_usage(_lane_status("free", swap=True), None, s) == "active"
+
+
+# --------------------------------------------------------------------------- #
+# The pin override (UI checkbox) — beats the static config in BOTH directions
+# --------------------------------------------------------------------------- #
+async def test_pin_true_shields_a_reapable_lane(monkeypatch, tmp_path):
+    from llmconfig.lane_state import LanePins
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path)   # primary reapable by cfg
+    orch.pins = LanePins(orch.s, path=tmp_path / "pins.yaml")
+    orch.pins.set("primary", True)
+    _load_ollama(worlds["primary"], orch.primary)
+    orch.primary.last_activity = time.time() - IDLE
+
+    await reaper._tick()
+
+    assert "qwen3:32b" in worlds["primary"].ollama, \
+        "pinned=True overrides the cfg's reapable default"
+
+
+async def test_pin_false_makes_an_exempt_lane_reapable(monkeypatch, tmp_path):
+    from llmconfig.lane_state import LanePins
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path,
+                                    primary_idle_unload_enabled=False)  # .env pins it
+    orch.pins = LanePins(orch.s, path=tmp_path / "pins.yaml")
+    orch.pins.set("primary", False)
+    _load_ollama(worlds["primary"], orch.primary)
+    orch.primary.last_activity = time.time() - IDLE
+
+    await reaper._tick()
+
+    assert worlds["primary"].ollama == {}, \
+        "pinned=False overrides the .env exemption — the checkbox is the authority"
+
+
+async def test_pin_absent_keeps_configured_behavior(monkeypatch, tmp_path):
+    from llmconfig.lane_state import LanePins
+    worlds, orch, reaper, _ = _make(monkeypatch, tmp_path,
+                                    primary_idle_unload_enabled=False)
+    orch.pins = LanePins(orch.s, path=tmp_path / "pins.yaml")   # no entry
+    _load_ollama(worlds["primary"], orch.primary)
+    orch.primary.last_activity = time.time() - IDLE
+
+    await reaper._tick()
+
+    assert "qwen3:32b" in worlds["primary"].ollama, "no override -> cfg applies"
+
+
+def test_lane_pins_persist_and_clear(tmp_path):
+    from llmconfig.config import Settings
+    from llmconfig.lane_state import LanePins
+    s = Settings(_env_file=None)
+    p = LanePins(s, path=tmp_path / "pins.yaml")
+    assert p.get("primary") is None
+    p.set("primary", False)
+    assert LanePins(s, path=tmp_path / "pins.yaml").get("primary") is False
+    p.set("primary", None)                                     # clear
+    assert LanePins(s, path=tmp_path / "pins.yaml").get("primary") is None
+    # corrupt file must not raise — no overrides is the safe read
+    (tmp_path / "pins.yaml").write_text("lanes: [broken", encoding="utf-8")
+    assert LanePins(s, path=tmp_path / "pins.yaml").get("primary") is None
+
+
+async def test_pin_api_round_trip(monkeypatch, tmp_path):
+    """PUT /api/lanes/primary/pin drives the override; /api/status reports the
+    EFFECTIVE pin; Sparks are refused (fleet policy, not per-card)."""
+    import httpx
+    from httpx import ASGITransport
+
+    import llmconfig.main as main_mod
+    from llmconfig.lane_state import LanePins
+
+    s = Settings(_env_file=None, monitor_enabled=False, idle_unload_enabled=False,
+                 registry_path=tmp_path / "reg.yaml", gpu_uuid="GPU-x",
+                 spark_enabled=True, spark_nodes="spark9=10.0.0.9")
+    monkeypatch.setattr(main_mod, "get_settings", lambda: s)
+
+    async def fake_query_gpu(set_=None, uuid=None, **kw):
+        return GpuInfo(found=True, uuid=uuid or "GPU-x", total_mb=24576,
+                       used_mb=400, free_mb=24176)
+
+    monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)
+    app = main_mod.create_app()
+    app.state.orch.pins = LanePins(s, path=tmp_path / "pins.yaml")
+
+    # Keep /api/status off the network: the spark unit's status probes SSH.
+    async def fake_spark_status(gpu=None):
+        return LaneStatus(id="spark9", name="spark9", owner="free",
+                          ollama_up=False, vllm_up=False, gpu=GpuOut(found=False))
+
+    monkeypatch.setattr(app.state.orch.units["spark9"], "status", fake_spark_status)
+
+    async with httpx.AsyncClient(transport=ASGITransport(app=app),
+                                 base_url="http://t") as c:
+        # Default: primary reapable by cfg -> effective pinned False
+        st = await c.get("/api/status")
+        lane = [l for l in st.json()["lanes"] if l["id"] == "primary"][0]
+        assert lane["pinned"] is False
+        spark = [l for l in st.json()["lanes"] if l["id"] == "spark9"][0]
+        assert spark["pinned"] is None, "pinning is a GPU-lane concept"
+
+        r = await c.put("/api/lanes/primary/pin", json={"pinned": True})
+        assert r.status_code == 200 and r.json()["pinned"] is True
+
+        st = await c.get("/api/status")
+        lane = [l for l in st.json()["lanes"] if l["id"] == "primary"][0]
+        assert lane["pinned"] is True
+
+        r = await c.put("/api/lanes/primary/pin", json={"pinned": None})
+        assert r.json()["override"] is None and r.json()["pinned"] is False
+
+        r = await c.put("/api/lanes/spark9/pin", json={"pinned": True})
+        assert r.status_code == 400
+
+        r = await c.put("/api/lanes/primary/pin", json={})
+        assert r.status_code == 400

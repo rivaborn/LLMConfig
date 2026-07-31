@@ -155,7 +155,14 @@ class IdleReaper:
             for known in list(getattr(lane, "model_activity", {})):
                 lane.touch(ts, model=known)
         # Cheap guards before any HTTP/nvidia-smi probing.
-        if not lane.cfg.enabled or not lane.cfg.idle_unload_enabled:
+        if not lane.cfg.enabled:
+            return False
+        # The runtime PIN override (the UI checkbox) beats the static config in
+        # BOTH directions: pinned=True shields a lane the .env left reapable,
+        # pinned=False makes an .env-exempt lane reapable. No entry = config.
+        pins = getattr(self.orch, "pins", None)
+        pin = pins.get(lane.cfg.id) if pins is not None else None
+        if pin is True or (pin is None and not lane.cfg.idle_unload_enabled):
             return False
         # A claimed unit is off-limits — including a *preemptible* claim, because the
         # reaper is a power-saving optimisation, not a competing caller. Checked here

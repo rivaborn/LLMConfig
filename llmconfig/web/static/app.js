@@ -128,13 +128,34 @@ function buildCard(unit) {
       <select class="uc-select" aria-label="Model for ${esc(unit.name || unit.id)}"></select>
       <button class="btn uc-load" title="Load the selected model">${unit.max_models > 1 ? "Add" : "Switch"}</button>
       <button class="btn btn-warn uc-unload" title="Free the whole unit">Free all</button>
-    </div>`;
+    </div>
+    ${unit.id === "primary" ? `
+    <label class="uc-pin" title="Checked: the loaded model is never idle-reaped (card stays in P0, ~117 W). Unchecked: reaped after the idle timeout (card drops to ~25 W). Overrides the .env reaper flags either way.">
+      <input type="checkbox" class="uc-pin-box"> Pin model (skip idle reaping)
+    </label>` : ""}`;
   const q = (s) => el.querySelector(s);
   const refs = {
     owner: q(".owner"), models: q(".uc-models"),
     vramFill: q(".vram-fill"), vramText: q(".vram-text"),
     select: q(".uc-select"), load: q(".uc-load"), unload: q(".uc-unload"),
+    pin: q(".uc-pin-box"),
   };
+  if (refs.pin) {
+    refs.pin.onchange = async () => {
+      refs.pin.disabled = true;
+      try {
+        await api(`/api/lanes/${unit.id}/pin`, {
+          method: "PUT",
+          body: JSON.stringify({ pinned: refs.pin.checked }),
+        });
+      } catch (e) {
+        refs.pin.checked = !refs.pin.checked;   // revert — the write failed
+        log("pin: " + (e.message || e), true);
+      } finally {
+        refs.pin.disabled = false;
+      }
+    };
+  }
   refs.load.onclick = () => {
     const v = refs.select.value;
     if (!v) return;
@@ -381,6 +402,10 @@ async function refreshStatus() {
       c.refs.vramText.textContent = vramText;
       c.refs.unload.disabled = isBusy(l.id) || !l.loaded;
       c.refs.load.disabled = isBusy(l.id);
+      // Follow the server's EFFECTIVE pin — but never fight the user's click
+      // mid-write (the checkbox is disabled while its PUT is in flight).
+      if (c.refs.pin && typeof l.pinned === "boolean" && !c.refs.pin.disabled)
+        c.refs.pin.checked = l.pinned;
     }
 
     const p = panels[l.id];

@@ -313,6 +313,11 @@ class LaneStatus(BaseModel):
     # three values because off-box consumers switch on it; a lease is never a
     # fourth usage state.
     lease: Optional["LeaseBrief"] = None
+    # EFFECTIVE reap exemption for a GPU lane (the UI pin checkbox): True = the
+    # resident model is never idle-reaped. Runtime override folded with the
+    # static config by the REST layer; None on units where pinning does not
+    # apply (Sparks are policy-exempt as a fleet, not per-card).
+    pinned: Optional[bool] = None
 
 
 class StatusResponse(BaseModel):
