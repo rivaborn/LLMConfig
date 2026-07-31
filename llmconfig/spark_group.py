@@ -338,7 +338,13 @@ class SparkGroup:
                     )
                 if r.rc == 124:
                     raise _launch_failed(
-                        f"sparkrun timed out launching '{recipe}': {r.text()[:400]}")
+                        f"sparkrun timed out launching '{recipe}' after its load_timeout_s "
+                    f"budget: {r.text()[:300]} — if the launch was still "
+                    f"DISTRIBUTING the model, the upstream repo has likely moved "
+                    f"since staging and sparkrun is re-downloading the delta "
+                    f"(possibly whole new format dirs); no budget survives that. "
+                    f"Re-stage the weights first, then relaunch — and check the "
+                    f"head for an ORPHANED `hf download` this kill leaves behind.")
                 raise _launch_failed(
                     f"sparkrun failed to launch '{recipe}' (rc={r.rc}): {r.text()[:400]}")
             for line in (r.out or "").splitlines()[-5:]:

@@ -291,7 +291,11 @@ class SparkBackend:
                              timeout=float(timeout or self.cfg.load_timeout_s),
                              settings=self.s)
 
-    _JOB_RE = re.compile(r"^Job:\s+(\S+)\s+\(tp=\d+\)\s+\[([0-9a-f]+)\]")
+    # `(tp=N)` for v1-runtime jobs, `(tp=N, pp=N)` for v2 vllm-distributed ones —
+    # the strict `\(tp=\d+\)` missed the v2 shape entirely, so a MiniMax teardown
+    # resolved NO job id, "stopped" nothing with rc=0, and only the reload guard
+    # caught the lie (live, 2026-07-30). Tolerate anything inside the parens.
+    _JOB_RE = re.compile(r"^Job:\s+(\S+)\s+\(tp=\d+[^)]*\)\s+\[([0-9a-f]+)\]")
 
     async def _job_id_for(self, recipe: str,
                           any_host_of: set[str] | None = None) -> Optional[str]:
@@ -391,11 +395,14 @@ class SparkBackend:
             if time.monotonic() >= next_alive_probe:
                 next_alive_probe = time.monotonic() + 30.0
                 state = await self.serve_status(port or self.cfg.api_port)
-                if state == "dead":
+                if state in ("dead", "wedged"):
                     dead_checks += 1
                     if dead_checks >= 2:
                         if on_log:
-                            on_log("server process died at startup — stopping the wait")
+                            on_log("server process died at startup — stopping the wait"
+                                   if state == "dead" else
+                                   "engine failed to start (process alive, port never "
+                                   "coming — see the serve-log excerpt) — stopping the wait")
                         return False
                 else:
                     dead_checks = 0
@@ -520,10 +527,18 @@ class SparkBackend:
         # quoted, version of this probe degraded to matching every container, so
         # gemma's SERVE_ALIVE masked the dead embedder and the fast-fail never
         # fired (live, 2026-07-26). Base64's alphabet is transparent to all four.
+        # A live pid is NOT proof of a live server: when the ENGINE dies during
+        # init (e.g. its shm segments vanished — the 2026-07-30 RemoveIPC
+        # incident), the exec'd APIServer lingers, hung, so kill -0 says alive
+        # forever while the port never answers; four loads each burned 20-60 min
+        # that way. "EngineCore failed to start" in the serve log is vLLM's
+        # terminal no-recovery marker — report it as SERVE_WEDGED.
         script = (
             "for c in $(docker ps -q); do "
             f"docker exec $c sh -c 'grep -q port.{int(port)} /tmp/sparkrun_serve.sh 2>/dev/null "
-            "&& { kill -0 $(cat /tmp/sparkrun_serve.pid) 2>/dev/null && echo SERVE_ALIVE "
+            "&& { kill -0 $(cat /tmp/sparkrun_serve.pid) 2>/dev/null "
+            '&& { grep -q "EngineCore failed to start" /tmp/sparkrun_serve.log 2>/dev/null '
+            "&& echo SERVE_WEDGED || echo SERVE_ALIVE; } "
             f"|| echo SERVE_DEAD; {tail_cmd}" + "}' 2>/dev/null; done"
         )
         b64 = base64.b64encode(script.encode()).decode()
@@ -538,6 +553,11 @@ class SparkBackend:
         """
         r = await self._ssh(self._serve_probe(port), timeout=20.0)
         out = r.out or ""
+        # Order matters: a wedged slot also prints nothing else, but if BOTH
+        # markers somehow appear (two containers matching the port glob), the
+        # terminal one wins — an alive neighbour must not mask a wedged target.
+        if "SERVE_WEDGED" in out:
+            return "wedged"
         if "SERVE_ALIVE" in out:
             return "alive"
         if "SERVE_DEAD" in out:
@@ -556,7 +576,7 @@ class SparkBackend:
     _ERROR_MARKERS = (
         "CUDA error|Traceback|RuntimeError|ValueError|AssertionError|"
         "OutOfMemoryError|No available memory for the cache blocks|"
-        "Engine core initialization failed|ERROR .*died|Worker.*exception"
+        "Engine core initialization failed|EngineCore failed to start|ERROR .*died|Worker.*exception"
     )
 
     def _excerpt_probe(self, port: int, n: int) -> str:

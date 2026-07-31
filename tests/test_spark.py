@@ -1091,6 +1091,28 @@ async def test_serve_status_and_real_log_come_from_inside_the_container(cfg, cal
     assert await b.serve_status(8001) == "unknown", "no matching container = unknown, never dead"
 
 
+async def test_serve_status_reports_wedged_engine_behind_a_live_pid(cfg, calls):
+    """A live pid is not a live server: when the ENGINE dies during init (the
+    2026-07-30 RemoveIPC incident), the exec'd APIServer lingers hung — kill -0
+    said alive forever while the port never answered, and four loads each
+    burned 20-60 min of wait_ready budget. The probe now greps the serve log
+    for vLLM's terminal marker and reports SERVE_WEDGED, which wait_ready
+    treats exactly like dead."""
+    import base64 as _b64
+    b = make_unit(cfg).spark
+
+    calls.plan["base64 -d"] = CmdResult(0, "SERVE_WEDGED\n", "")
+    assert await b.serve_status(8001) == "wedged"
+    probe = next(c for c in calls if "base64 -d" in c)
+    payload = probe.split("echo ", 1)[1].split(" |", 1)[0].strip("'")
+    script = _b64.b64decode(payload).decode()
+    assert "EngineCore failed to start" in script, "terminal-marker grep must be in the probe"
+
+    # An alive neighbour matching the same port glob must not mask the wedge.
+    calls.plan["base64 -d"] = CmdResult(0, "SERVE_ALIVE\nSERVE_WEDGED\n", "")
+    assert await b.serve_status(8001) == "wedged"
+
+
 # --------------------------------------------------------------------------- #
 # Placement-driven eviction (LoadRequest.evict) — re-validated under the lock
 # --------------------------------------------------------------------------- #
@@ -1229,7 +1251,27 @@ STATUS_OUT = (
     "  solo       10.9.9.10       Up 2 hours   tf5\n"
     "Job: @eugr/other  (tp=1)  [cccc55556666]  (1 container(s))\n"
     "  solo       10.9.9.9        Up 1 hour    vllm-node\n"
+    # v2 vllm-distributed shape: `(tp=N, pp=N)` header, node_K container rows.
+    "Job: @official/mm-v2  (tp=2, pp=1)  [dddd77778888]  (2 container(s))\n"
+    "  node_0     10.9.9.9        Up 8 minutes   sparkrun-eugr-vllm\n"
+    "  node_1     10.9.9.10       Up 8 minutes   sparkrun-eugr-vllm\n"
 )
+
+
+async def test_targeted_stop_resolves_v2_distributed_job_headers(cfg, calls):
+    """The v2 vllm-distributed runtime prints `(tp=2, pp=1)` in the Job header
+    and names containers node_0/node_1. The old `\\(tp=\\d+\\)` regex missed the
+    header entirely, so teardown resolved NO job id, 'stopped' nothing with
+    rc=0, and only the reload guard caught it (live 2026-07-30: a MiniMax tp=2
+    survived its own unload and blocked the next launch)."""
+    b = make_unit(cfg).spark
+    calls.plan["sparkrun status"] = CmdResult(0, STATUS_OUT, "")
+
+    r = await b.stop(recipe="@official/mm-v2", any_host_of={"10.9.9.9", "10.9.9.10"})
+    assert r.ok
+    stop_cmd = calls[-1]
+    assert "sparkrun stop dddd77778888" in stop_cmd, \
+        f"v2 job header must resolve to its id, got: {stop_cmd}"
 
 
 async def test_targeted_stop_resolves_the_job_id_on_this_host(cfg, calls):
