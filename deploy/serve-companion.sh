@@ -60,19 +60,22 @@ case "$ALIAS" in
     # Surya 2 OCR VLM for epubocr — must be vLLM (epubocr consumes logprobs for
     # per-block confidence; needs --mm-processor-kwargs pixel bounds). Copied
     # from serve.sh's 3090 case with the 8 GB retune. Weights are only 1.37 GiB
-    # (measured) — the budget hog is the multimodal PROFILE run at max_pixels
-    # 6291456, which OOM'd the reload beside the resident relay (-0.45 GiB
-    # available KV at util 0.50). Ladder rung applied 2026-07-31: max_pixels
-    # 2359296 (~1536x1536 — ample for book-page OCR) + 1 image per prompt.
+    # (measured) — the budget went to the 6.3 MP multimodal profile (-0.45 GiB
+    # at util 0.50) and then to the 18k bf16 KV pool (-0.0 after the max_pixels
+    # cut). Final fit 2026-07-31: max_pixels 2359296 (~1536x1536, ample for
+    # book pages), 1 image/prompt, window 12288 (epubocr's real need is ~9k:
+    # ~2.3k vision tokens + prompt + the 6144 output cap), util 0.54 against
+    # the ~4.5 GiB the shrunk relay leaves free. KV stays bf16 — fp8 KV would
+    # nudge the logprobs epubocr's confidence floor reads.
     PORT=11439
     pkill -f "vllm serve.*--port ${PORT}" 2>/dev/null || true
     exec vllm serve datalab-to/surya-ocr-2 \
       --host "$HOST" \
       --port "$PORT" \
       --served-model-name surya-ocr-2 \
-      --max-model-len 18000 \
+      --max-model-len 12288 \
       --dtype bfloat16 \
-      --gpu-memory-utilization 0.50 \
+      --gpu-memory-utilization 0.54 \
       --enforce-eager \
       --mm-processor-kwargs '{"min_pixels":3136,"max_pixels":2359296}' \
       --limit-mm-per-prompt '{"image":1,"video":0}' \
@@ -101,7 +104,7 @@ case "$ALIAS" in
       --port "$PORT" \
       --served-model-name qwen2.5-1.5b \
       --max-model-len 32768 \
-      --gpu-memory-utilization 0.35 \
+      --gpu-memory-utilization 0.30 \
       --cpu-offload-gb 1 \
       --kv-cache-dtype fp8_e5m2 \
       --max-num-batched-tokens 2048 \
