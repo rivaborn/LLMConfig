@@ -212,6 +212,15 @@ def create_app() -> FastAPI:
         # Always revalidate the HTML itself so new tokens are picked up.
         return HTMLResponse(html, headers={"Cache-Control": "no-cache"})
 
+    @app.get("/health")
+    async def health() -> dict:
+        """Liveness, vLLM-shaped. Surya's inference client (epubocr) probes
+        `{base}/health` before attaching to `{base}/v1` — serving it here lets
+        that client ride the gateway (auto-load, activity tracking) instead of
+        needing a LAN-exposed per-slot relay. App-up is the correct semantic:
+        the /v1 forward auto-loads the model, so "reachable" IS "servable"."""
+        return {"status": "ok"}
+
     @app.get("/api/status", response_model=StatusResponse)
     async def api_status() -> StatusResponse:
         return await _status_with_usage()
