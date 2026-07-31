@@ -1,0 +1,86 @@
+# Recipe: DeepSeek-V4-Flash-0731  (2-node tensor-parallel, local fork)
+#
+# The OFFICIAL release superseding the -Preview this lab served as
+# `deepseek-v4-flash` until 2026-07-31: native FP8, ~167 GB, 304B MoE,
+# SAME architecture as -DSpark (the spec-decode module ships in the model),
+# and substantially stronger agentic scores (Terminal Bench 82.7 vs 61.8,
+# DeepSWE 54.4 vs 7.3). Model card: huggingface.co/deepseek-ai/DeepSeek-V4-Flash-0731
+#
+# Based on ../local/deepseek-v4-flash-dspark.yaml — READ ITS HEADER for the
+# two load-bearing constraints inherited verbatim:
+#   1. Runs on the PATCHED **vllm-node-dspark** image (FlashInfer PR 3817),
+#      staged on all four nodes since the 2026-07-31 fleet-parity pass.
+#   2. Every JSON argument is SINGLE-BRACE + LITERAL (sparkrun's renderer
+#      cannot substitute inside braces — the {{...}} form fails silently).
+#      num_speculative_tokens is therefore NOT catalog-tunable; edit here.
+#
+# Deltas from the DSpark fork:
+#   - model: the official 0731 repo (FP8; encoding/ handled by
+#     --tokenizer-mode deepseek_v4, proven on this image by the DSpark fork).
+#   - spec-decode per the model card: 7 draft tokens + greedy draft sampling
+#     (image validates >= dspark_block_size 5; 7 passes). FALLBACK LADDER if
+#     config parse rejects it: drop "draft_sample_method" first (older builds
+#     may not know the key), then 7 -> 5.
+#   - dspark_noise_token_id hf-override DROPPED: the preview-DSpark repo
+#     lacked it in config; the official release should declare it natively.
+#     Re-add '{"dspark_noise_token_id":128799}' if launch complains.
+#   - GB300-isms from the model card's reference command deliberately absent
+#     (--data-parallel-size, --enable-expert-parallel, deep_gemm_mega_moe,
+#     fp4 indexer cache) — optimizations for hardware this cluster is not.
+#
+# Window: 262144 to start, same estimator-distrust rationale as the DSpark
+# fork (the card claims million-token capability — raise only after measuring
+# the real KV pool at fp8 on GB10).
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-0731
+description: vLLM serving deepseek-ai/DeepSeek-V4-Flash-0731 (official release) on 2 DGX Sparks
+
+model: deepseek-ai/DeepSeek-V4-Flash-0731
+
+container: vllm-node-dspark
+
+cluster_only: true
+
+mods: []
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  block_size: 256
+  max_num_seqs: 4
+  max_num_batched_tokens: 10240
+
+env:
+  DG_JIT_USE_NVRTC: "0"
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
+  VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
+
+# Prefix caching deliberately absent and load-format safetensors — both
+# inherited from the DSpark fork (spec-decode + prefix-caching kv_block_zeroer
+# assertion; instanttensor crashes on this build). Expect a slow first load.
+command: |
+  vllm serve deepseek-ai/DeepSeek-V4-Flash-0731 \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --tensor-parallel-size {tensor_parallel} \
+      --kv-cache-dtype fp8 \
+      --block-size {block_size} \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"greedy"}' \
+      --tokenizer-mode deepseek_v4 \
+      --distributed-executor-backend ray \
+      --tool-call-parser deepseek_v4 \
+      --enable-auto-tool-choice \
+      --reasoning-parser deepseek_v4 \
+      --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}' \
+      --default-chat-template-kwargs.thinking=true \
+      --default-chat-template-kwargs.reasoning_effort=high \
+      --load-format safetensors
