@@ -1,7 +1,8 @@
 # Daily driver — a four-model local AI workspace
 
-**Discussion date:** 2026-07-30 · **Status:** ✅ **IMPLEMENTED 2026-07-31** (serving
-half — items 1–11; item 12, the RAG software stack, deferred). See the
+**Discussion date:** 2026-07-30 · **Status:** ✅ **FULLY IMPLEMENTED 2026-07-31**
+(items 1–11 serving half + item 12, the RAG stack — `rivaborn/ragstack` on
+`ubuntuservices`). See the
 implementation record at the end of this file; the wiki write-up is queued in
 `HomelabDocumentation/drafts/_merge/hosts-ollama-host.md` ("the daily-driver
 cutover") and `_merge/runbooks-local-llm-server-dgx-spark.md` (Edit 17).
@@ -300,7 +301,7 @@ Implemented in one day against the plan above, with these deltas:
 | 8–9      | ✅ done 2026-07-30 (fabric pairs + DS4 tp=2, MTP fork) |
 | 10       | ✅ lane defaults = the layout table below; spark1/2 are tombstones (the DS4 group returns via boot reclaim, not autoload) |
 | 11       | ✅ reranker+embedder proven-loaded on spark4 (88% figure confirmed: 84.6%); all Sparks were already reaper-exempt |
-| 12       | ⏸ deferred (vector DB + ingestion) |
+| 12       | ✅ **done 2026-07-31** — `rivaborn/ragstack` on `ubuntuservices`: Qdrant (:6333) + FastAPI (:11440), corpus = the wiki DR replica (190 pages → 1,130 chunks, 253 s ingest, alias-flip re-index = the DR story). Golden eval **10/10** with ANN + page-dedupe; the reranker is OFF as served (non-discriminative — upstream recipe lacks the Qwen3 yes/no template; Spark-side follow-up) |
 
 Extras the day demanded: `/lane/<unit>/v1` gateway prefix (surya's header-less
 attach), gateway `/health`, `PRIMARY_IDLE_UNLOAD_ENABLED` (vl32 pinned without
