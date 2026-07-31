@@ -893,3 +893,39 @@ async def test_hold_gives_session_affinity_across_requests(monkeypatch, tmp_path
                                 "messages": [{"role": "user", "content": "two"}]})
     assert r1.headers["x-llm-unit"] == r2.headers["x-llm-unit"]
     assert len(leases.active_all("spark1")) == 1, "one lease, not one per request"
+
+
+# --------------------------------------------------------------------------- #
+# SlotLane routing: resolve() returns the SLOT's relay, not the lane default
+# --------------------------------------------------------------------------- #
+async def test_resolve_prefers_slot_relay_when_lane_exposes_it(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    gateway = OpenAIGateway(orch, jobs, Settings(_env_file=None), None)
+
+    entries = [SimpleNamespace(alias="surya2", served_name="surya-ocr-2", status="ok"),
+               SimpleNamespace(alias="qwen25-relay", served_name="qwen2.5-1.5b", status="ok")]
+    slot_urls = {"surya2": "http://127.0.0.1:11438",
+                 "qwen25-relay": "http://127.0.0.1:11441"}
+    lane = SimpleNamespace(
+        cfg=SimpleNamespace(id="companion", vllm_enabled=True,
+                            vllm_relay_url="http://127.0.0.1:9999"),
+        registry=SimpleNamespace(entries=lambda: entries),
+        relay_url_for=lambda alias: slot_urls.get(alias, "http://127.0.0.1:9999"),
+    )
+    got = await gateway.resolve(lane, "surya-ocr-2")
+    assert got == ("vllm", "surya2", "http://127.0.0.1:11438")
+    got = await gateway.resolve(lane, "qwen2.5-1.5b")
+    assert got == ("vllm", "qwen25-relay", "http://127.0.0.1:11441")
+
+
+async def test_resolve_classic_lane_relay_unchanged(monkeypatch, tmp_path):
+    # Regression guard for the hot path: a Lane without relay_url_for must keep
+    # resolving to its single configured relay.
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    gateway = OpenAIGateway(orch, jobs, Settings(_env_file=None), None)
+    lane = orch.primary
+    e = lane.registry.entries()[0]
+    got = await gateway.resolve(lane, e.served_name or e.alias)
+    assert got == ("vllm", e.alias, lane.cfg.vllm_relay_url)

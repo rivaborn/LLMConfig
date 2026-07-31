@@ -81,6 +81,12 @@ class Lane:
         """This lane's card only (by UUID) — never the other lane's."""
         return await query_gpu(self.s, uuid=self.cfg.gpu_uuid)
 
+    async def vllm_up(self) -> bool:
+        """Is this lane serving vLLM right now? Part of the shared unit contract —
+        SlotLane answers for all its slots, so callers (the idle reaper's
+        keepalive accounting) never reach into `lane.vllm` directly."""
+        return self.cfg.vllm_enabled and await self.vllm.up()
+
     async def _served_info(self) -> ServedModel:
         """The relay's view, or an empty answer on an Ollama-only lane.
 

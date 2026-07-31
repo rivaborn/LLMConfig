@@ -1,33 +1,50 @@
 # Default vLLM alias catalog for the COMPANION lane (RTX 3070 Ti, 8 GB).
 # Seeded into ./data/vllm_models_companion.yaml on first run. These aliases must
 # mirror the `serve-companion.sh` alias table on the box (pins the 3070 Ti UUID,
-# lower --gpu-memory-utilization). Keep models small — 8 GB only fits ~3-4B-class
-# AWQ models, embedders, and tiny sanity checks. `served_name` is what /v1/models
-# reports. Edit the generated ./data/vllm_models_companion.yaml (this is the default).
+# per-alias --gpu-memory-utilization). `served_name` is what /v1/models reports.
+# Edit the generated ./data/vllm_models_companion.yaml (this is the default).
+#
+# The daily-driver pair below co-resides via SLOT mode (COMPANION_VLLM_SLOTS):
+# each alias runs as its own vllm-companion@<alias> systemd instance on its own
+# port/relay, so a reload of one never blips the other. Budgets: surya2 at
+# --gpu-memory-utilization 0.55 (~4.5 GB), the relay at 0.25 (~2 GB) — 0.80 of
+# 8192 committed + 600 MiB driver baseline leaves ~1 GB slack.
 aliases:
+  - alias: surya2
+    hf_repo: datalab-to/surya-ocr-2
+    served_name: surya-ocr-2
+    mode: eager
+    status: unverified
+    notes: >-
+      Surya-2 OCR VLM (~3 GB bf16) for epubocr — needs vLLM (logprobs feed the
+      per-block confidence scores; --mm-processor-kwargs min/max_pixels).
+      Slot-mode resident beside the opencode relay. max_model_len 18000.
+      Verify on first slot launch; if the multimodal profile run OOMs, lower
+      max_pixels (6291456 -> 2359296) before touching the util split.
+    load_timeout_s: 300
+    managed_by: serve.sh
+
+  - alias: qwen25-relay
+    hf_repo: Qwen/Qwen2.5-1.5B-Instruct-AWQ
+    served_name: qwen2.5-1.5b
+    mode: eager
+    status: unverified
+    notes: >-
+      The opencode /swap echo relay, vLLM-served (replaces the Ollama tag
+      qwen2.5:1.5b — Ollama declares no budget and cannot join a budgeted
+      card). AWQ ~1.1 GB weights; --max-model-len 32768 so opencode's ~24.5k
+      baseline prompt fits. Slot-mode resident beside surya2.
+    load_timeout_s: 180
+    managed_by: serve.sh
+
   - alias: smoke
     hf_repo: Qwen/Qwen2.5-0.5B-Instruct
     served_name: smoke
     mode: compile
     status: unverified
-    notes: Companion sanity check (~1 GB). Verify once serve-companion.sh is on the box
-    load_timeout_s: 120
-    managed_by: serve.sh
-
-  - alias: qwen3-4b
-    hf_repo: Qwen/Qwen3-4B-AWQ
-    served_name: qwen3-4b
-    mode: compile
-    status: unverified
-    notes: Small chat; AWQ-INT4 (~4-5 GB incl. KV) — daily companion model
-    load_timeout_s: 180
-    managed_by: serve.sh
-
-  - alias: embed
-    hf_repo: BAAI/bge-m3
-    served_name: bge-m3
-    mode: eager
-    status: unverified
-    notes: Embeddings (vLLM --task embed). Always-on retrieval companion (~2 GB)
+    notes: >-
+      Companion sanity check (~1 GB). NO slot by default — loading it in slot
+      mode needs a COMPANION_VLLM_SLOTS entry. Also the fallback relay model if
+      the 1.5B + surya2 split proves too tight on 8 GB.
     load_timeout_s: 120
     managed_by: serve.sh

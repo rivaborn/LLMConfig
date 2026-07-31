@@ -183,10 +183,10 @@ async def test_companion_load_leaves_primary_untouched(monkeypatch, tmp_path):
     wp.vllm = "qwen3-coder-30b"
     wp.used_mb = 20000
 
-    job = await _run(orch, jobs, "companion", LoadRequest(server="vllm", model="qwen3-4b", lane="companion"))
+    job = await _run(orch, jobs, "companion", LoadRequest(server="vllm", model="smoke", lane="companion"))
 
     assert job.state == "succeeded", job.error
-    assert wc.vllm == "qwen3-4b"
+    assert wc.vllm == "smoke"
     # primary lane must be completely untouched (still serving its big model)
     assert wp.vllm == "qwen3-coder-30b"
     assert wp.used_mb == 20000

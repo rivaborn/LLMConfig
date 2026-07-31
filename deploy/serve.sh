@@ -7,8 +7,11 @@ ALIAS="${1:-}"
 PORT="${PORT:-11436}"
 HOST="${HOST:-0.0.0.0}"
 
-# Stop any running vLLM server first.
-pkill -f 'vllm serve' 2>/dev/null || true
+# Stop any running vLLM server ON THIS LANE first. Scoped to the primary's own
+# port: a bare `pkill -f 'vllm serve'` also kills the companion lane's slot
+# processes (serve-companion.sh, :11439/:11440) on every primary swap — the
+# 3070 Ti's surya2/relay pair must survive a vl32 reload.
+pkill -f "vllm serve.*--port ${PORT}" 2>/dev/null || true
 sleep 2
 
 # Activate venv if not already.

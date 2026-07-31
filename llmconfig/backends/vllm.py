@@ -118,6 +118,8 @@ class VllmBackend:
         # cgroup, incl. the vllm child). Then a lane-SCOPED fallback that matches only
         # this lane's serve script path — never a global `pkill -f venv/bin/vllm`,
         # which would cross-kill the other lane's vLLM when both GPUs are serving.
+        # ⚠️ WILDCARD stop — correct for a one-model Lane, forbidden on a SlotLane
+        # (it would take every sibling slot down); slot lanes use stop_instance().
         await run_wsl(
             user_systemctl(f"stop '{self.systemd_unit}*' 2>/dev/null; true"),
             login=False,
@@ -128,6 +130,28 @@ class VllmBackend:
             f"pkill -f '{self.serve_script}' 2>/dev/null; true",
             login=False,
             timeout=15.0,
+            settings=self.s,
+        )
+
+    async def stop_instance(self, alias: str) -> None:
+        """Stop ONE templated instance — the slot-lane primitive. No serve-script
+        pkill fallback: on a multi-slot lane every slot shares the script path, so
+        the fallback would be exactly the cross-kill stop() warns about."""
+        await run_wsl(
+            user_systemctl(f"stop '{self._unit(alias)}' 2>/dev/null; true"),
+            login=False,
+            timeout=30.0,
+            settings=self.s,
+        )
+
+    async def serve_instance(self, alias: str):
+        """(Re)start ONE templated instance WITHOUT the wildcard stop `serve()`
+        performs — sibling slots must keep serving through this."""
+        await self.stop_instance(alias)
+        return await run_wsl(
+            user_systemctl(f"restart {self._unit(alias)}"),
+            login=False,
+            timeout=40.0,
             settings=self.s,
         )
 

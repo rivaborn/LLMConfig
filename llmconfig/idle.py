@@ -235,9 +235,12 @@ class IdleReaper:
             return
         lanes = list(self.orch.lanes.values())
         for lane in lanes:
-            # An Ollama-only lane can never be serving vLLM, and probing its dead
-            # relay costs a blackholed SYN (invariant 5) on every reaper tick.
-            if lane.cfg.vllm_enabled and await lane.vllm.up():
+            # `vllm_up()` is the shared unit contract: Lane skips its dead relay
+            # on an Ollama-only lane (invariant 5's blackholed SYN), SlotLane
+            # answers for ALL its slots — reaching into `lane.vllm` here would
+            # miss every slot but a default one and release the keepalive under
+            # live companion slots.
+            if await lane.vllm_up():
                 return
         if any(lane._lock.locked() for lane in lanes):
             return

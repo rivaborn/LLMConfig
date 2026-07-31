@@ -114,14 +114,20 @@ class OpenAIGateway:
         # vLLM: match the served_name; prefer a non-blocked alias if several ever share one.
         # Skipped entirely on an Ollama-only lane — resolving there would send the
         # request down a load path that cannot succeed.
+        # A SlotLane serves N models on N relays, so the relay is per-ALIAS there
+        # (`relay_url_for`); a classic Lane keeps its single configured relay.
+        def _relay(alias: str) -> str:
+            fn = getattr(lane, "relay_url_for", None)
+            return fn(alias) if fn is not None else lane.cfg.vllm_relay_url
+
         match: Optional[str] = None
         for e in (lane.registry.entries() if lane.cfg.vllm_enabled else []):
             if (e.served_name or e.alias) == model:
                 if e.status != "blocked":
-                    return ("vllm", e.alias, lane.cfg.vllm_relay_url)
+                    return ("vllm", e.alias, _relay(e.alias))
                 match = match or e.alias
         if match is not None:
-            return ("vllm", match, lane.cfg.vllm_relay_url)
+            return ("vllm", match, _relay(match))
         # Ollama: a tag present in the lane's catalog
         if ":" in model:
             if self.placer is not None:

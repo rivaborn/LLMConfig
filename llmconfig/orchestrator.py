@@ -30,6 +30,7 @@ from .jobs import JobManager
 from .gpu import GpuInfo, query_all_gpus
 from .lane import Lane
 from .lane_state import LaneDefaults
+from .slot_lane import SlotLane
 from .registry import (DEFAULT_COMPANION_REGISTRY, DEFAULT_SPARK_CLUSTER_REGISTRY,
                        Registry, SparkRegistry)
 from .schemas import (Job, LaneStatus, LoadRequest, StatusResponse, UnloadRequest,
@@ -61,7 +62,10 @@ class Orchestrator:
                 reg = registry
             else:
                 reg = Registry(cfg.registry_path, default_path=DEFAULT_COMPANION_REGISTRY)
-            self.units[cfg.id] = Lane(settings, cfg, reg, jobs, self.keepalive)
+            # A configured slot table turns the lane multi-model: SlotLane's
+            # per-slot lifecycle replaces Lane's whole-card eviction gate.
+            cls = SlotLane if cfg.vllm_slots else Lane
+            self.units[cfg.id] = cls(settings, cfg, reg, jobs, self.keepalive)
 
         for scfg in settings.sparks():
             self.units[scfg.id] = SparkUnit(settings, scfg, SparkRegistry(scfg.registry_path), jobs)
@@ -106,7 +110,7 @@ class Orchestrator:
     def lanes(self) -> dict[str, Lane]:
         """Only the local GPU lanes — what the keepalive and idle-reaper vLLM logic
         legitimately care about. Use `units` for anything unit-kind-agnostic."""
-        return {k: v for k, v in self.units.items() if isinstance(v, Lane)}
+        return {k: v for k, v in self.units.items() if isinstance(v, (Lane, SlotLane))}
 
     @property
     def sparks(self) -> dict[str, SparkUnit]:
@@ -170,7 +174,7 @@ class Orchestrator:
         gpus = await query_all_gpus(self.s)
 
         async def _unit_status(u: Unit) -> LaneStatus:
-            if isinstance(u, Lane):
+            if isinstance(u, (Lane, SlotLane)):
                 gpu = gpus.get(u.cfg.gpu_uuid) or GpuInfo(
                     found=False, uuid=u.cfg.gpu_uuid, error=f"GPU {u.cfg.gpu_uuid} not present"
                 )

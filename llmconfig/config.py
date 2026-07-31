@@ -48,6 +48,12 @@ class LaneConfig:
     # Whether the idle reaper may unload this lane (the global idle_unload_enabled
     # is the master switch; this is per-lane participation).
     idle_unload_enabled: bool = True
+    # Multi-model SLOT table: ((alias, relay_port, budget_mb), ...). Non-empty
+    # turns this lane into a `SlotLane` — N co-resident vLLM processes, one
+    # templated systemd instance + socat relay per slot, admission = "the alias
+    # names a slot". Empty (the default) keeps the classic one-model `Lane`
+    # with its eviction-wait gate. See COMPANION_VLLM_SLOTS.
+    vllm_slots: tuple = ()
     kind: str = "gpu"
 
 
@@ -191,6 +197,36 @@ def _parse_fabric_links(spec: str) -> list[frozenset[str]]:
     return links
 
 
+def _parse_vllm_slots(spec: str) -> tuple:
+    """Parse `COMPANION_VLLM_SLOTS` → ((alias, relay_port, budget_mb), ...).
+
+    Format: comma-separated `alias=relay_port:budget_mb`, e.g.
+        surya2=11438:4600,qwen25-relay=11441:2100
+    `relay_port` is the socat relay LLMConfig probes; `budget_mb` is the VRAM
+    this slot's process is expected to take (the pre-launch free-memory gate
+    waits for at least that much free). Malformed entries are skipped rather
+    than raising — same tolerance contract as `_parse_spark_nodes`.
+    """
+    slots: list[tuple[str, int, int]] = []
+    seen: set[str] = set()
+    for chunk in (spec or "").split(","):
+        chunk = chunk.strip()
+        if not chunk or "=" not in chunk:
+            continue
+        alias, _, rest = chunk.partition("=")
+        alias = alias.strip()
+        port_s, _, budget_s = rest.partition(":")
+        try:
+            port, budget = int(port_s.strip()), int(budget_s.strip())
+        except ValueError:
+            continue
+        if not alias or alias in seen or port <= 0 or budget <= 0:
+            continue
+        seen.add(alias)
+        slots.append((alias, port, budget))
+    return tuple(slots)
+
+
 def _parse_spark_nodes(spec: str) -> list[tuple[str, str, str]]:
     """Parse `SPARK_NODES` → [(id, host, name)].
 
@@ -264,6 +300,13 @@ class Settings(BaseSettings):
     companion_vllm_enabled: bool = False
     companion_vllm_serve_script: str = "/home/folar/vllm/serve-companion.sh"
     companion_vllm_systemd_unit: str = "vllm-companion@"
+    # Multi-model SLOT table (`alias=relay_port:budget_mb`, comma-separated).
+    # Non-empty turns the companion into a `SlotLane`: N co-resident vLLM
+    # processes on the 8 GB card, each its own vllm-companion@<alias> instance
+    # and socat relay, torn down and restarted INDIVIDUALLY — no code path
+    # touches a sibling slot. Daily-driver shape:
+    #   COMPANION_VLLM_SLOTS=surya2=11438:4600,qwen25-relay=11441:2100
+    companion_vllm_slots: str = ""
     companion_registry_path: Path = REPO_ROOT / "data" / "vllm_models_companion.yaml"
     companion_default_server: str = ""   # "ollama" | "vllm" | "" — auto-load on startup
     companion_default_model: str = ""    # Ollama tag or vLLM alias
@@ -564,6 +607,7 @@ class Settings(BaseSettings):
                     default_server=self.companion_default_server,
                     default_model=self.companion_default_model,
                     idle_unload_enabled=self.companion_idle_unload_enabled,
+                    vllm_slots=_parse_vllm_slots(self.companion_vllm_slots),
                 )
             )
         return lanes
