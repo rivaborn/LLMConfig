@@ -657,3 +657,37 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+@app.command()
+def reload() -> None:
+    """Re-read catalogs/state from disk without restarting the server.
+
+    Cluster recipes (`data/spark_cluster_models.yaml`) have no write API, so a
+    hand-edit there is inert until this runs. Structural settings — lane/spark
+    definitions, GPU UUIDs, paths, the listen socket — are reported, not applied.
+    """
+    try:
+        with _client() as c:
+            r = c.post("/api/reload")
+            if r.status_code >= 400:
+                typer.secho(f"reload failed: {r.status_code} {r.text}", fg="red", err=True)
+                raise typer.Exit(1)
+            d = r.json()
+    except httpx.HTTPError as e:
+        _bail(e)
+
+    for label, count in sorted((d.get("catalogs") or {}).items()):
+        typer.echo(f"  {label:<24} {'-' if count is None else count}")
+    applied = d.get("settings_applied") or {}
+    if applied:
+        typer.secho("applied settings:", fg="green")
+        for k, v in sorted(applied.items()):
+            typer.echo(f"  {k} = {v}")
+    pending = d.get("settings_restart_required") or {}
+    if pending:
+        typer.secho("RESTART REQUIRED for:", fg="yellow")
+        for k, v in sorted(pending.items()):
+            typer.echo(f"  {k} = {v}")
+    if not applied and not pending:
+        typer.echo("settings unchanged")

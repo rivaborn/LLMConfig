@@ -168,6 +168,17 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 - `fsio.py` — `atomic_write_text()`: every YAML `save()` goes through it (temp +
   `os.replace`); a mid-write power cut must never torch a state file (invariant
   17's reboots are a live path). Route any new persisted-file write through it.
+- `reload.py` — runtime re-read of every disk-backed catalog/state file (`POST /api/reload`,
+  `llmconfig reload`). Catalogs are loaded once from their holder's `__init__` and the **cluster**
+  registry has no write API, so a hand-edited `data/spark_cluster_models.yaml` was inert until a
+  restart. Reloading calls each holder's own `load()` through the object the units already hold —
+  nothing is rebound, no unit is rebuilt, so it is safe while models are resident. **`Settings` is
+  split**: fields read per-call are applied in place (`get_settings()` is `lru_cache`d, so the
+  in-place write reaches every holder), while structural ones — lane/spark/group definitions, GPU
+  UUIDs, catalog paths, the listen socket — are *reported* as restart-required and left alone,
+  because units are BUILT from them and a hot-swap would desync `settings.units()` from
+  `orch.units`. When unsure whether a field is structural, add it to `STRUCTURAL_FIELDS`: the cost
+  of denying is a restart, the cost of allowing is a lane pinned to a UUID it no longer matches.
 - `doctor.py` — read-only recon (`run_doctor`) that verifies every on-box assumption.
 - `openai_gateway.py` — the OpenAI-compatible `/v1` gateway (auto-load on first request;
   chat + completions + embeddings/rerank/score; auto-placement wiring in `_choose`).
@@ -513,6 +524,11 @@ pytest                                        # unit tests (no GPU needed; httpx
   folar`, which needs the user session — that's why it's a task, not NSSM).
 - **Restart cleanly.** `Stop-ScheduledTask LLMConfig` can leave the uvicorn child
   holding `:11430`; kill it before `Start-ScheduledTask` or the new instance wedges.
+- **Prefer `llmconfig reload` over a restart for catalog edits.** `POST /api/reload` re-reads every
+  `data/*.yaml` in place (see `reload.py`), so adding a Spark/cluster recipe or fixing an
+  `extra_args` cap no longer costs a bounce — a restart drops the gateway, re-runs the boot reclaim
+  and re-fires `autoload_defaults()`. Only `.env`/structural changes and new code still need one,
+  and `reload` names exactly which fields those were.
 - **Never run the Ollama tray app (`ollama app.exe`).** Its auto-updater can't stop the
   NSSM service, corrupts the in-place update, and silently drops Ollama to **CPU-only**
   (`library=cpu`). Update via `deploy/update-ollama.ps1` (a weekly task automates it and

@@ -29,6 +29,7 @@ from .openai_gateway import OpenAIGateway, build_gateway_router
 from .orchestrator import Orchestrator
 from .placement import Placer
 from .registry import make_registry
+from .reload import reload_catalogs, reload_settings
 from .schemas import (
     ClusterLoadRequest,
     ClusterUnloadRequest,
@@ -48,6 +49,7 @@ from .schemas import (
     ModelsResponse,
     SparkModel,
     SparkModelEntry,
+    ReloadResult,
     StatusResponse,
     UnloadRequest,
     UsageResponse,
@@ -455,6 +457,32 @@ def create_app() -> FastAPI:
         if job is None:
             raise HTTPException(status_code=404, detail="job not found")
         return job
+
+    @app.post("/api/reload", response_model=ReloadResult, dependencies=write)
+    async def api_reload() -> ReloadResult:
+        """Re-read the on-disk catalogs and state without restarting.
+
+        Catalogs are read once at construction and the CLUSTER registry has no
+        write API, so a hand-edited `data/spark_cluster_models.yaml` used to need
+        a bounce of the Scheduled Task to take effect — dropping the gateway and
+        re-running the boot autoload to pick up a one-line change.
+
+        Structural `Settings` (lane/spark/group definitions, GPU UUIDs, paths,
+        the listen socket) are reported, never applied: units are BUILT from
+        those, so hot-swapping them would desync `settings.units()` from
+        `orch.units`. See `reload.py`.
+
+        Placement caches are invalidated afterwards because ranking reads the
+        registries — a stale snapshot would rank on the pre-reload catalog.
+        """
+        catalogs = reload_catalogs(orch, registry, cookbook, load_times)
+        applied, restart_required = reload_settings(settings)
+        placer.invalidate()
+        return ReloadResult(
+            catalogs=catalogs,
+            settings_applied=applied,
+            settings_restart_required=restart_required,
+        )
 
     @app.get("/api/doctor")
     async def api_doctor() -> dict:

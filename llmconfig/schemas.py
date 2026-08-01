@@ -547,3 +547,17 @@ class LeaseListResponse(BaseModel):
     # Leases are in-memory: a restart drops them all. Clients use this to tell
     # "your lease was revoked" apart from "the server restarted".
     server_started_at: float = 0.0
+
+
+class ReloadResult(BaseModel):
+    """What `POST /api/reload` re-read, and what still needs a restart.
+
+    `catalogs` maps a label to its entry count after the re-read (None when the
+    holder exposes no countable `entries()`). `settings_restart_required` is the
+    load-bearing half of the report: those fields differ on disk from the running
+    process and were deliberately NOT applied — see `reload.py` for why a
+    structural change may not be hot-swapped under live units.
+    """
+    catalogs: dict[str, Optional[int]] = Field(default_factory=dict)
+    settings_applied: dict[str, str] = Field(default_factory=dict)
+    settings_restart_required: dict[str, str] = Field(default_factory=dict)
