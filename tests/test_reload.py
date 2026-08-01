@@ -88,12 +88,31 @@ def test_unit_registries_reload_and_shared_holder_is_not_double_counted(tmp_path
 
 
 def test_unit_without_registry_is_skipped(tmp_path):
-    """A SparkGroup has no `.registry` — it reads the cluster catalog."""
-    class _Group:
-        kind = "spark_group"
+    """Not every unit owns a catalog; a registry-less unit must not break the sweep."""
+    class _Bare:
+        kind = "lane"
 
-    out = reload_catalogs(_FakeOrch(units={"spark1_spark2": _Group()}), registry=None)
+    out = reload_catalogs(_FakeOrch(units={"bare": _Bare()}), registry=None)
     assert out == {}
+
+
+def test_group_sharing_the_cluster_registry_keeps_the_stable_label(tmp_path):
+    """A SparkGroup's `.registry` IS the cluster registry — label it once, stably.
+
+    Regression from the live run on 2026-08-01: the unit sweep reached the shared
+    object first, so the cluster catalog was reported as `unit:spark1_spark2` and
+    `cluster_registry` vanished from the report — and only when a group happened
+    to exist, so the report's shape depended on fabric state.
+    """
+    path = tmp_path / "spark_cluster_models.yaml"
+    _write_cluster(path, "ds4")
+    cluster = SparkRegistry(path, default_path=tmp_path / "missing.yaml")
+
+    orch = _FakeOrch(units={"spark1_spark2": _FakeUnit(cluster)}, cluster_registry=cluster)
+    out = reload_catalogs(orch, registry=None)
+
+    assert out["cluster_registry"] == 1
+    assert "unit:spark1_spark2" not in out
 
 
 def test_structural_fields_are_refused_and_runtime_fields_applied():

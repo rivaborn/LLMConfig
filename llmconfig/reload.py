@@ -129,14 +129,20 @@ def reload_catalogs(
     # vLLM alias catalog (the primary lane holds this same object).
     _do("vllm_registry", registry)
 
-    # Per-unit catalogs: Lane/SlotLane and SparkUnit both expose `.registry`.
-    # A SparkGroup does not — it reads the cluster registry, reloaded below.
+    # Multi-node recipes live ONLY here (invariant 18) — the entry that started
+    # all this, and the one with no write API. Reloaded BEFORE the unit sweep on
+    # purpose: a SparkGroup's `.registry` IS this object, so letting the sweep
+    # reach it first labelled the cluster catalog `unit:spark1_spark2` and
+    # dropped `cluster_registry` from the report entirely — and only when a group
+    # happened to be instantiated, making the report shape depend on fabric
+    # state. Claiming the stable label first keeps the de-dup working and the
+    # report readable (caught by the live end-to-end run, 2026-08-01).
+    _do("cluster_registry", getattr(orch, "cluster_registry", None))
+
+    # Per-unit catalogs: Lane/SlotLane and SparkUnit each own theirs; a
+    # SparkGroup shares the cluster registry above and so de-duplicates away.
     for uid, unit in orch.units.items():
         _do(f"unit:{uid}", getattr(unit, "registry", None))
-
-    # Multi-node recipes live ONLY here (invariant 18) — the entry that started
-    # all this, and the one with no write API.
-    _do("cluster_registry", getattr(orch, "cluster_registry", None))
 
     # Persisted policy/state that is likewise read once at construction.
     _do("lane_defaults", getattr(orch, "defaults", None))
