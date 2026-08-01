@@ -204,6 +204,7 @@ require `X-API-Key` only when `LLMCONFIG_API_KEY` is set. Read endpoints take
 | `GET /api/placement/decisions`          | Last ~50 auto-placement decisions: unit, tier, candidate facts|
 | `POST /api/load`                        | `{server,model,lane?,force?,max_pack?}` → a Job               |
 | `POST /api/unload`                      | `{server?,lane?}` → free that lane's GPU                      |
+| `POST /api/reload`                      | Re-read every `data/*.yaml` catalog in place — no restart      |
 | `GET / PUT /api/lanes/{id}/default`     | Get / set a lane's startup-default model                      |
 | `POST /api/ollama/pull`                 | Pull an Ollama model (job)                                    |
 | `DELETE /api/ollama/{name}`             | Delete an Ollama model                                        |
@@ -476,6 +477,12 @@ gotchas, is in [`deploy/README-deploy.md`](deploy/README-deploy.md).
   Run it as the elevated Scheduled Task / a LocalSystem service.
 - **New app instance wedges on `:11430`** → `Stop-ScheduledTask` left the old uvicorn
   child holding the port; kill it before `Start-ScheduledTask`.
+- **A catalog edit "did nothing"** → every `data/*.yaml` is read once at startup, and the
+  *cluster* catalog (`spark_cluster_models.yaml`) has no write API, so a hand-edit is
+  invisible until reloaded. Run `llmconfig reload` (or `POST /api/reload`) — no restart
+  needed. It prints what it re-read, and names any `.env` field that changed but is
+  structural (lane/spark definitions, GPU UUIDs, paths, the listen socket): those are
+  reported, never hot-applied, and still need a restart.
 - **A model loads on the wrong card** → a GPU was pinned by index somewhere. Everything
   pins by UUID; `serve.sh` resolves the vLLM index via torch (vLLM ignores
   `CUDA_DEVICE_ORDER` and uses FASTEST_FIRST order). Run `llmconfig doctor`.
