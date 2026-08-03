@@ -59,9 +59,25 @@ env:
   VLLM_ALLOW_LONG_MAX_MODEL_LEN: "1"
   VLLM_USE_BREAKABLE_CUDAGRAPH: "0"
 
-# Prefix caching deliberately absent and load-format safetensors — both
-# inherited from the DSpark fork (spec-decode + prefix-caching kv_block_zeroer
-# assertion; instanttensor crashes on this build). Expect a slow first load.
+# PREFIX CACHING IS EXPLICITLY OFF — and it must be PASSED, not merely omitted.
+#
+# 2026-08-02, the hard way: the first version of this recipe said "prefix
+# caching deliberately absent", copying the DSpark fork's wording. But absent
+# is NOT disabled — vLLM 0.26 defaults `enable_prefix_caching` to TRUE, so
+# omitting the flag leaves it ON, and the engine log confirmed
+# `enable_prefix_caching=True`. Combined with dspark speculative decoding that
+# does not raise the DSpark thread's `assert kv_block_zeroer is not None`; it
+# SILENTLY CORRUPTS OUTPUT. Symptom: a reply starts coherent and degenerates
+# into multilingual token salad part-way through, and
+# `SpecDecoding metrics` show per-position acceptance collapsing to
+# `0.027, 0.000, 0.000, ...` (0.2-0.4% avg) on affected requests, against a
+# healthy 33.8% with the normal decay curve on unaffected ones.
+#
+# A short prompt hides it completely — "Say OK" and a single tool call both
+# passed validation on 2026-07-31. It takes a few hundred tokens to show.
+#
+# load-format safetensors is inherited from the DSpark fork (instanttensor
+# crashes on this build). Expect a slow first load.
 command: |
   vllm serve deepseek-ai/DeepSeek-V4-Flash-0731 \
       --host {host} \
@@ -74,6 +90,7 @@ command: |
       --max-num-seqs {max_num_seqs} \
       --max-num-batched-tokens {max_num_batched_tokens} \
       --gpu-memory-utilization {gpu_memory_utilization} \
+      --no-enable-prefix-caching \
       --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"greedy"}' \
       --tokenizer-mode deepseek_v4 \
       --distributed-executor-backend ray \
