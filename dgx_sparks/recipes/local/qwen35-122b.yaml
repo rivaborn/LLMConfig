@@ -1,0 +1,82 @@
+# Recipe: Qwen3.5-122B-A10B-INT4-Autoround — the STABLE `qwen35-122b` alias
+#
+# This is the recipe the catalog alias **`qwen35-122b`** points at on all four
+# nodes. The alias is the stable handle: when this model is next updated, the
+# alias stays and its `recipe:` moves — exactly as `deepseek-v4-flash` was
+# repointed from the -Preview fork to the official 0731 release on 2026-07-31
+# without a single consumer edit. Do not bake a version into the alias.
+#
+# LOCAL FORK of @eugr/qwen3.5-122b-int4-autoround with exactly TWO deliberate
+# differences, both carried over from the earlier local forks:
+#
+#   1. `tensor_parallel: 1` — this is the SOLO per-node deployment (the alias
+#      is catalogued on spark1..4 individually, tp=1). Upstream defaults to 2.
+#   2. `env: VLLM_MARLIN_USE_ATOMIC_ADD` ships as 0, not upstream's 1. The
+#      catalog also passes `-o env.VLLM_MARLIN_USE_ATOMIC_ADD=0`, so the
+#      effective value is 0 either way — but a fork shipping upstream's `1`
+#      would be one forgotten override away from unlaunchable (CUDA illegal
+#      instruction during CUDA-graph capture; LLMConfig ae5983c).
+#
+# WHY THE RELEASE IMAGE, NOT THE NIGHTLY (2026-08-02)
+# `container: vllm-node` is the RELEASE image, and it is the reason a launch of
+# this alias never touches the network:
+#
+#   - `vllm-node` is a purely LOCAL tag with no registry behind it, byte-identical
+#     (image b3eef044419a) on all four sparks — sparkrun has nothing to pull.
+#   - The `-nightly` fork instead names `ghcr.io/spark-arena/dgx-vllm-eugr-nightly`,
+#     which sparkrun resolves through `build-and-copy.sh` — and that script pulls
+#     `eugr/spark-vllm:latest` from Docker Hub on EVERY cold load. Measured
+#     2026-08-02: ~7 minutes of image refresh before the weights were even
+#     opened, on a node where the model was already fully staged.
+#
+# ⚠️ The `-nightly` fork was created on 2026-07-30 on the belief that `vllm-node`
+# had an image-wide `ShmRingBuffer` fault on spark2/spark4. That diagnosis was
+# WRONG: the failures came from a dropped SSH session wiping memory, not the
+# image. `vllm-node` is verified on all four nodes. See the corrected note in
+# qwen35-122b-int4-nightly.yaml.
+#
+# Weights are staged fleet-wide: 72 G, 15 shards, 0 incomplete on every node
+# (verified 2026-08-02), so a cold load is engine start only.
+#
+# Everything else is byte-identical to upstream ON PURPOSE — fastsafetensors,
+# qwen3_xml / qwen3 parsers, the eugr chat-template mod, prefix caching. If a
+# flag needs to change, change it HERE with a note saying why.
+
+recipe_version: "1"
+name: Qwen3.5-122B-INT4-Autoround
+description: vLLM serving Qwen3.5-122B-INT4-Autoround on the release image (stable qwen35-122b alias)
+
+model: Intel/Qwen3.5-122B-A10B-int4-AutoRound
+
+container: vllm-node
+
+mods:
+  - mods/fix-qwen3.5-chat-template
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  max_num_batched_tokens: 8192
+
+env:
+  VLLM_MARLIN_USE_ATOMIC_ADD: 0
+
+command: |
+  vllm serve Intel/Qwen3.5-122B-A10B-int4-AutoRound \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --load-format fastsafetensors \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    --chat-template unsloth.jinja \
+    -tp {tensor_parallel} \
+    --distributed-executor-backend ray
