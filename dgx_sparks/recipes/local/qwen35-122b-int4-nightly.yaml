@@ -8,15 +8,30 @@
 #      split-K CUDA-graph-capture killer — same belt-and-braces as the -ft fork,
 #      so a forgotten catalog override can never make this unlaunchable).
 #
-# WHY THIS FORK EXISTS — vllm-node 0.23.1 is being retired as a dependency.
-# On 2026-07-30 that image began failing engine start with
-#   AttributeError: 'ShmRingBuffer' object has no attribute 'shared_memory'
-# on a GROWING set of nodes: spark2 all day (4/4), spark4 from ~17:38 EDT
-# (gemma x2, this very model x1) after a morning of successes. The fault is
-# image-wide and model-independent on afflicted nodes, survives reboot and
-# full power-drain, and no 0.26.x-image model shows it anywhere. Root cause
-# unidentified; the engineering decision is to move off the image rather than
-# keep debugging a months-old rc build. This recipe is the 122B's landing spot.
+# ⚠️ SUPERSEDED 2026-08-02 — PREFER `qwen35-122b` (local/qwen35-122b.yaml).
+#
+# THE PREMISE BELOW WAS A MISDIAGNOSIS. This fork was created on 2026-07-30 in
+# the belief that vllm-node 0.23.1 had an image-wide fault. It did not: the
+# `ShmRingBuffer` engine-start failures were caused by a DROPPED SSH SESSION
+# wiping node memory, not by the image. vllm-node is verified on all four
+# nodes and `qwen35-122b` runs the 122B on it.
+#
+# Keeping this fork costs real time on every cold load. `container:` here is a
+# ghcr reference that sparkrun resolves through build-and-copy.sh, which pulls
+# `eugr/spark-vllm:latest` from Docker Hub EVERY launch — measured 2026-08-02
+# at ~7 minutes of image refresh (and ~20 minutes end-to-end) on a node where
+# the weights were already fully staged. The release image is a local-only tag
+# with nothing to pull. Use this recipe only to test a 0.26.x-specific fix.
+#
+# Original (incorrect) rationale, kept for the record:
+#   "vllm-node 0.23.1 is being retired as a dependency. On 2026-07-30 that
+#   image began failing engine start with AttributeError: 'ShmRingBuffer'
+#   object has no attribute 'shared_memory' on a GROWING set of nodes: spark2
+#   all day (4/4), spark4 from ~17:38 EDT after a morning of successes. The
+#   fault is image-wide and model-independent on afflicted nodes, survives
+#   reboot and full power-drain... Root cause unidentified."
+# The tell that should have prompted more digging: "survives reboot and full
+# power-drain" is odd for an image fault and fits an external cause better.
 #
 # Everything else is byte-identical to upstream ON PURPOSE, including
 # fastsafetensors (the nightly's official recipes use it too), qwen3_xml /
