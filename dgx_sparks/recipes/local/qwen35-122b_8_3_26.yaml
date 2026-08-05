@@ -1,0 +1,82 @@
+# Recipe: Qwen3.5-122B-INT4-Autoround  on the PINNED 2026-08-03 image
+#
+# Renamed 2026-08-04 from `qwen35-122b-int4-nightly`. The old name described a
+# MOVING target and that was the whole problem: `container:` was a ghcr
+# "nightly:latest" reference that sparkrun resolves through build-and-copy.sh,
+# which pulls `eugr/spark-vllm:latest` from Docker Hub. Both tags advance
+# whenever upstream publishes, so every cold load was a coin flip between
+# "instant" and "download 11 GB first".
+#
+# Measured 2026-08-04: the tag had moved (ab975f8b -> 1d335d4f) and a load on
+# spark4 spent ~14 minutes in image prep before the engine started. A survey
+# the same evening found all FOUR nodes holding four DIFFERENT digests
+# (ab975f8b / adc80460 / e58fc979 / 1d335d4f) — nothing was reproducible.
+#
+# The name now encodes what it actually is: the 122B on the 2026-08-03 build.
+# `container:` is pinned BY DIGEST, and LLMConfig additionally passes
+# `--image <digest>` (settings.spark_image), which is the lever that actually
+# skips the pull — verified on spark4 2026-08-04: image prep 14 min -> 0.4 s,
+# "Container image up-to-date on all 1 host(s)", zero bytes downloaded.
+#
+# That digest is the same 2026-08-03 build as the upstream wheel releases
+# `prebuilt-vllm-current`      (0.26.1rc1.dev298+g1ea84d74b.d20260803)
+# `prebuilt-flashinfer-current`(0.6.17-51920591-d20260803)
+# — note those `-current` tags are themselves moving pointers; the digest and
+# the version strings are the only immutable handles.
+#
+# TO BUMP: pull the new image on one node, read its digest
+# (`docker images --digests eugr/spark-vllm`), update BOTH this file and
+# settings.spark_image, pre-pull it on all four nodes SERIALLY (they share one
+# public IP — three parallel pulls measured 12 MB/s combined vs 57 MB/s alone),
+# then rename this recipe to the new date. A bump is a deliberate act.
+#
+# Second deliberate difference from @eugr/qwen3.5-122b-int4-autoround, retained:
+#   `env: VLLM_MARLIN_USE_ATOMIC_ADD: 0` — the GB10 marlin split-K
+#   CUDA-graph-capture killer, shipped as 0 here so a forgotten catalog
+#   override can never make this unlaunchable.
+#
+# HISTORICAL NOTE, kept because the misdiagnosis is instructive: this file
+# began on 2026-07-30 as a fork made in the belief that `vllm-node` 0.23.1 had
+# an image-wide `ShmRingBuffer` fault. It did not — the engine-start failures
+# were a DROPPED SSH SESSION wiping node memory. The tell that should have
+# prompted more digging: "survives reboot and full power-drain" fits an
+# external cause far better than an image fault. `local/qwen35-122b.yaml` runs
+# the same model on the release image and remains the STABLE alias.
+#
+# Everything else is byte-identical to upstream ON PURPOSE, including
+# fastsafetensors, qwen3_xml / qwen3 parsers, and the eugr chat-template mod
+# (copied into local/mods/ so this file is self-contained; sparkrun resolves
+# mods adjacent to the recipe first).
+
+recipe_version: "1"
+name: Qwen3.5-122B-INT4-Autoround-8-3-26
+description: vLLM serving Qwen3.5-122B-INT4-Autoround on the pinned 2026-08-03 image (digest 1d335d4f)
+model: Intel/Qwen3.5-122B-A10B-int4-AutoRound
+container: eugr/spark-vllm@sha256:1d335d4fb3d1c5dce6e79f87a4019a04e98fa9ceb7b894d50d413159382ab6c6
+mods:
+  - mods/fix-qwen3.5-chat-template
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 2
+  gpu_memory_utilization: 0.8
+  max_model_len: 262144
+  max_num_batched_tokens: 8192
+env:
+  VLLM_MARLIN_USE_ATOMIC_ADD: 0
+command: |
+  vllm serve Intel/Qwen3.5-122B-A10B-int4-AutoRound \
+    --max-model-len {max_model_len} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --port {port} \
+    --host {host} \
+    --load-format fastsafetensors \
+    --enable-prefix-caching \
+    --enable-auto-tool-choice \
+    --tool-call-parser qwen3_xml \
+    --reasoning-parser qwen3 \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --trust-remote-code \
+    --chat-template unsloth.jinja \
+    -tp {tensor_parallel} \
+    --distributed-executor-backend ray

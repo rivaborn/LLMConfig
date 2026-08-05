@@ -29,11 +29,13 @@
 #     2026-08-02: ~7 minutes of image refresh before the weights were even
 #     opened, on a node where the model was already fully staged.
 #
-# ⚠️ The `-nightly` fork was created on 2026-07-30 on the belief that `vllm-node`
-# had an image-wide `ShmRingBuffer` fault on spark2/spark4. That diagnosis was
-# WRONG: the failures came from a dropped SSH session wiping memory, not the
-# image. `vllm-node` is verified on all four nodes. See the corrected note in
-# qwen35-122b-int4-nightly.yaml.
+# ⚠️ The sibling fork (now `qwen35-122b_8_3_26.yaml`, renamed 2026-08-04 from
+# `qwen35-122b-int4-nightly`) was created on 2026-07-30 on the belief that
+# `vllm-node` had an image-wide `ShmRingBuffer` fault on spark2/spark4. That
+# diagnosis was WRONG: the failures came from a dropped SSH session wiping
+# memory, not the image. `vllm-node` is verified on all four nodes. The fork
+# now exists to pin the 2026-08-03 runtime BY DIGEST rather than track a moving
+# tag. See the corrected note in qwen35-122b_8_3_26.yaml.
 #
 # Weights are staged fleet-wide: 72 G, 15 shards, 0 incomplete on every node
 # (verified 2026-08-02), so a cold load is engine start only.

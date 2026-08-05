@@ -314,7 +314,7 @@ Final layout (cookbook state **`DF4_RAG Daily Driver`**):
 
 ```
 pair A   spark1+spark2   deepseek-v4-flash  tp=2 (MTP fork)
-         spark3          qwen35-122b-int4-nightly
+         spark3          qwen35-122b_8_3_26
          spark4          qwen3-vl-reranker-8b + qwen3-vl-embedding-8b  (84.6%)
 3090                     vl32  (pinned — reaper exempt)
 3070 Ti                  surya2 + qwen2.5-1.5b relay  (SlotLane, 97%)

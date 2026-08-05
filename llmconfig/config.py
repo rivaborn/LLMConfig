@@ -469,6 +469,26 @@ class Settings(BaseSettings):
     # broken key does not cost a doomed native attempt on every single poll,
     # then retried so a fixed key resumes native without a restart.
     spark_ssh_native_retry_s: float = 300.0
+    # Runtime image, pinned by DIGEST and passed as `sparkrun run --image`.
+    #
+    # `eugr/spark-vllm:latest` and the `prebuilt-*-current` release tags are all
+    # MOVING pointers that advance with every upstream nightly. The cost is not
+    # theoretical: on 2026-08-04 the tag had moved, a load spent ~14 min pulling
+    # 11 GB before the engine started, and a survey found all four nodes holding
+    # four DIFFERENT digests. Pinning makes image prep 0.4 s and deterministic.
+    #
+    # This digest is the 2026-08-03 build == the wheels in the upstream
+    # `prebuilt-vllm-current` (0.26.1rc1.dev298+g1ea84d74b.d20260803) and
+    # `prebuilt-flashinfer-current` (0.6.17-51920591-d20260803) releases.
+    #
+    # TRADE-OFF: this freezes the runtime until the digest is deliberately
+    # bumped, which is the point — upstream fixes arrive when you choose, not
+    # mid-load. Set to "" to go back to whatever the recipe's `container:`
+    # resolves to. Bump procedure + history: dgx_sparks/recipes/README.md.
+    spark_image: str = (
+        "eugr/spark-vllm@sha256:"
+        "1d335d4fb3d1c5dce6e79f87a4019a04e98fa9ceb7b894d50d413159382ab6c6"
+    )
 
     # --- monitoring (the Monitor tab: thermals/power/VRAM history) ---
     monitor_enabled: bool = True

@@ -263,6 +263,15 @@ class SparkBackend:
         single-node load keeps the verified single-host template untouched.
         """
         args = list(extra or [])
+        # Pin the runtime image. Without this, sparkrun resolves the recipe's
+        # `container:` through build-and-copy.sh, which pulls
+        # `eugr/spark-vllm:latest` — a MOVING tag. On 2026-08-04 it had advanced
+        # and a load spent ~14 min re-downloading 11 GB before the engine even
+        # started; the four nodes were each holding a DIFFERENT digest.
+        # `--image <digest>` skips that pull entirely (measured: image prep
+        # 14 min -> 0.4 s, "Container image up-to-date on all 1 host(s)").
+        if self.s.spark_image:
+            args += ["--image", self.s.spark_image]
         if mem_fraction:
             args += ["--gpu-mem", str(mem_fraction)]
         if hosts:
