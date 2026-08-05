@@ -83,6 +83,26 @@ def test_edit_replaces_unit_rows(book):
     assert st["units"]["spark3"][0]["model"] == "qwen35-122b"
 
 
+def test_omitted_units_are_preserved(book):
+    """Regression, paid for live: a partial body must not drop the rest of the fleet.
+
+    The first real call sent only spark3+spark4 and wiped this state's primary,
+    companion, spark1 and spark2 rows. Merge semantics, not replace.
+    """
+    book._states[NAME]["units"]["primary"] = [{"server": "vllm", "model": "vl32"}]
+    st = book.edit_units(NAME, {"spark4": [{"server": "spark", "model": "qwen3-vl-reranker-8b"}]})
+    assert st["units"]["primary"] == [{"server": "vllm", "model": "vl32"}]
+    assert st["units"]["spark3"][0]["model"] == "qwen35-122b", "untouched unit kept"
+    assert [t["model"] for t in st["units"]["spark4"]] == ["qwen3-vl-reranker-8b"]
+
+
+def test_explicit_empty_still_clears(book):
+    """Merge must not cost the ability to pin a unit empty."""
+    st = book.edit_units(NAME, {"spark4": []})
+    assert st["units"]["spark4"] == []
+    assert st["units"]["spark3"][0]["model"] == "qwen35-122b"
+
+
 def test_groups_are_left_untouched(book):
     """The whole point of the exclusion: editing units must not drop the tp job."""
     st = book.edit_units(NAME, {"spark3": [{"server": "spark", "model": "qwen35-122b"}]})

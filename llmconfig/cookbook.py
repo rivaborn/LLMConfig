@@ -239,6 +239,15 @@ class Cookbook:
         Groups stay where `snapshot()` puts them: their own section, applied
         last, out of this method's reach.
 
+        **MERGE, not replace.** Only the units named in `units` are rewritten;
+        any the caller omits keep their existing rows. This is deliberate and was
+        paid for: the first live call sent just `spark3`+`spark4` and silently
+        dropped this state's `primary`, `companion`, `spark1` and `spark2` rows.
+        "Change which model runs on one Spark" is the whole point of the method,
+        so requiring the caller to restate the entire fleet to avoid destroying it
+        is a footgun. Clearing a unit stays explicit and possible: pass `[]`,
+        which pins it empty.
+
         Raises KeyError (no such state) or ValueError (bad unit/model), so the
         route can map them to 404/400 without inspecting messages.
         """
@@ -277,7 +286,7 @@ class Cookbook:
                 rows.append({"server": server, "model": model})
             clean[uid] = rows      # [] is meaningful: pin the unit empty
 
-        st["units"] = clean
+        st["units"] = {**st.get("units", {}), **clean}   # merge — see docstring
         st["saved_at"] = round(time.time(), 1)
         self.save()
         return self.get(name)

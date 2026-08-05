@@ -359,6 +359,10 @@ def create_app() -> FastAPI:
         intent directly, so changing one line no longer costs a full round of
         loads. `groups:` is left alone — a multi-node deployment is not a
         per-unit row (see `Cookbook.edit_units`).
+
+        Units omitted from the body keep their rows (merge, not replace) — a
+        partial body must not silently drop the rest of the fleet. Pass `[]` to
+        pin a unit empty.
         """
         units = body.get("units")
         if not isinstance(units, dict):
