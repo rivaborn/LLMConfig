@@ -491,26 +491,27 @@ class Settings(BaseSettings):
     # broken key does not cost a doomed native attempt on every single poll,
     # then retried so a fixed key resumes native without a restart.
     spark_ssh_native_retry_s: float = 300.0
-    # Runtime image, pinned by DIGEST and passed as `sparkrun run --image`.
+    # GLOBAL `sparkrun run --image` override. Default EMPTY, and it should stay
+    # empty — pin in the recipe's `container:` instead.
     #
-    # `eugr/spark-vllm:latest` and the `prebuilt-*-current` release tags are all
-    # MOVING pointers that advance with every upstream nightly. The cost is not
-    # theoretical: on 2026-08-04 the tag had moved, a load spent ~14 min pulling
-    # 11 GB before the engine started, and a survey found all four nodes holding
-    # four DIFFERENT digests. Pinning makes image prep 0.4 s and deterministic.
+    # This shipped 2026-08-04 with a digest default, to stop `eugr/spark-vllm:latest`
+    # (a moving tag) costing ~14 min of surprise pull mid-load. It worked, and it
+    # was the wrong lever: an override is GLOBAL, so it silently replaced every
+    # recipe's own runtime. This fleet runs three —
+    #     deepseek-v4-flash-0731 -> vllm-node-dspark
+    #     qwen35-122b            -> vllm-node
+    #     qwen35-122b_8_3_26     -> eugr/spark-vllm@sha256:1d335d4f...
+    # — so DS4 was forced onto the generic image and died in warmup with
+    # `tvm.error.InternalError ... must go through sparse_mla_sm120_decode_dsv4`,
+    # a DeepSeek-V4-specific kernel. The model was fine; the runtime was wrong.
     #
-    # This digest is the 2026-08-03 build == the wheels in the upstream
-    # `prebuilt-vllm-current` (0.26.1rc1.dev298+g1ea84d74b.d20260803) and
-    # `prebuilt-flashinfer-current` (0.6.17-51920591-d20260803) releases.
-    #
-    # TRADE-OFF: this freezes the runtime until the digest is deliberately
-    # bumped, which is the point — upstream fixes arrive when you choose, not
-    # mid-load. Set to "" to go back to whatever the recipe's `container:`
-    # resolves to. Bump procedure + history: dgx_sparks/recipes/README.md.
-    spark_image: str = (
-        "eugr/spark-vllm@sha256:"
-        "1d335d4fb3d1c5dce6e79f87a4019a04e98fa9ceb7b894d50d413159382ab6c6"
-    )
+    # Measured 2026-08-05, which is why nothing was lost by removing it: a load
+    # of qwen35-122b_8_3_26 with this EMPTY pulled nothing at all (no `docker
+    # pull` process across the whole prep window) and the container resolved to
+    # image id b64273578569 — byte-identical to the pinned digest. A digest in
+    # `container:` already skips the pull, per recipe, without touching any other
+    # model. Bump procedure: dgx_sparks/recipes/README.md.
+    spark_image: str = ""
 
     # --- monitoring (the Monitor tab: thermals/power/VRAM history) ---
     monitor_enabled: bool = True

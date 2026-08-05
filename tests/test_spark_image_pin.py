@@ -42,11 +42,14 @@ def _backend(tmp_path, **over):
     return spark_mod.SparkBackend(Settings(**over), cfg, SparkRegistry(cfg.registry_path))
 
 
-def test_default_settings_pin_the_image_by_digest():
-    """The shipped default must be a DIGEST, never a moving tag."""
-    img = Settings().spark_image
-    assert img.startswith("eugr/spark-vllm@sha256:"), img
-    assert ":latest" not in img
+def test_the_global_override_ships_empty():
+    """It must default to OFF — a global override clobbers per-recipe runtimes.
+
+    It shipped 2026-08-04 with a digest default and broke DS4 the same day: the
+    override replaced `container: vllm-node-dspark` with the generic eugr image
+    and the engine died in a DeepSeek-V4 sparse-MLA kernel. Pin in the recipe.
+    """
+    assert Settings().spark_image == ""
 
 
 async def test_run_passes_image_flag(tmp_path, sent):
