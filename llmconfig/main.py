@@ -391,10 +391,23 @@ def create_app() -> FastAPI:
         pin a unit empty.
         """
         units = body.get("units")
-        if not isinstance(units, dict):
-            raise HTTPException(status_code=400, detail="body needs a 'units' object")
+        groups = body.get("groups")
+        if units is None and groups is None:
+            raise HTTPException(status_code=400,
+                                detail="body needs a 'units' and/or 'groups' object")
+        if units is not None and not isinstance(units, dict):
+            raise HTTPException(status_code=400, detail="'units' must be an object")
+        if groups is not None and not isinstance(groups, dict):
+            raise HTTPException(status_code=400, detail="'groups' must be an object")
         try:
-            state = cookbook.edit_units(name, units)
+            state = cookbook.get(name)
+            if units is not None:
+                state = cookbook.edit_units(name, units)
+            if groups is not None:
+                # AFTER units, so clearing a member and claiming its pair in one
+                # call succeeds — the members-must-be-empty check then sees the
+                # cleared rows rather than the pre-edit ones.
+                state = cookbook.edit_groups(name, groups)
         except KeyError:
             raise HTTPException(status_code=404, detail=f"no cookbook state '{name}'")
         except ValueError as e:
@@ -847,6 +860,33 @@ def create_app() -> FastAPI:
                 pub.add_note = (f"launches tp={k} across {gid.replace('_', '+')} "
                                 f"(claims every node whole)")
             out.append(pub)
+        return out
+
+    @app.get("/api/cluster/pairs")
+    async def api_cluster_pairs() -> list[dict]:
+        """The cabled node sets, ready to render — id, ordered members, head, claim.
+
+        The Cluster tab makes the operator pick nodes by hand; the Home screen and
+        the cookbook editor need the *canonical* list instead, so neither has to
+        hardcode `spark1+spark2` or re-derive the head from a sort (which breaks
+        the day a `spark10` exists). Members keep the order written in
+        `SPARK_FABRIC_LINKS`, because `spark_group_config` takes the head from
+        `members[0]`.
+        """
+        gstate = getattr(orch, "group_state", None)
+        out: list[dict] = []
+        for members in settings.fabric_link_members():
+            gid = group_id_for(list(members))
+            claim = gstate.get(gid) if gstate is not None else None
+            out.append({
+                "id": gid,
+                "members": list(members),
+                "head": members[0],
+                "name": "Sparks " + "+".join(
+                    "".join(ch for ch in m if ch.isdigit()) or m for m in members),
+                "loaded": claim.alias if claim is not None else None,
+                "fabric_enabled": settings.spark_fabric_enabled,
+            })
         return out
 
     @app.post("/api/cluster/load", response_model=Job, dependencies=write)

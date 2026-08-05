@@ -34,6 +34,11 @@
       <span class="cb-note" id="cb-note"></span>
     </div>
     <div id="unit-grid" class="unit-grid"></div>
+    <!-- Cabled Spark pairs: load a tensor-parallel model without the Cluster tab.
+         Rendered from /api/cluster/pairs, so member order (and the head) is
+         whatever SPARK_FABRIC_LINKS says. -->
+    <h3 id="pairs-h" class="cluster-h" hidden>Multi-node pairs</h3>
+    <div id="pair-grid" class="unit-grid"></div>
   </section>
 
   <!-- Per-unit views are injected here by app.js (id="view-<unitId>"). -->

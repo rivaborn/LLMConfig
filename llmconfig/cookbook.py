@@ -49,7 +49,7 @@ import yaml
 
 from .fsio import atomic_write_text
 
-from .config import REPO_ROOT, Settings
+from .config import REPO_ROOT, Settings, group_id_for
 from .schemas import Job, LoadRequest, UnloadRequest, boot_order_key
 
 if TYPE_CHECKING:
@@ -231,13 +231,13 @@ class Cookbook:
         re-saving — minutes of loads to edit one line. This writes the intent
         directly.
 
-        **Multi-node models cannot be set here, and that needs no special case.**
-        Every target is validated against the *unit's own catalog*, and by the
-        `SparkModelEntry` invariant a model with `min_nodes > 1` lives only in
-        `data/spark_cluster_models.yaml` — never in a per-node catalog. So a
-        spanning model simply fails to resolve, with the same error as a typo.
-        Groups stay where `snapshot()` puts them: their own section, applied
-        last, out of this method's reach.
+        **Multi-node models are not per-unit rows** — they go through
+        `edit_groups`, which validates cabling and node count. Nothing here needs
+        a special case to enforce that: every target is checked against the
+        *unit's own catalog*, and by the `SparkModelEntry` invariant a model with
+        `min_nodes > 1` lives only in `data/spark_cluster_models.yaml`, never in a
+        per-node catalog. So a spanning model fails to resolve here with the same
+        error as a typo, and is settable in the place that can validate it.
 
         **MERGE, not replace.** Only the units named in `units` are rewritten;
         any the caller omits keep their existing rows. This is deliberate and was
@@ -264,8 +264,8 @@ class Cookbook:
             if getattr(unit, "kind", "") == "spark_group":
                 raise ValueError(
                     f"'{uid}' is a multi-node group — a spanning deployment is recorded "
-                    f"in the state's `groups:` section, not as a per-unit row. Launch it "
-                    f"from the Cluster tab and re-save the state.")
+                    f"in the state's `groups:` section, not as a per-unit row. Send it "
+                    f"under `groups` instead (see edit_groups).")
             rows: list[dict] = []
             for t in (targets or []):
                 server = str((t or {}).get("server") or "").strip()
@@ -287,6 +287,75 @@ class Cookbook:
             clean[uid] = rows      # [] is meaningful: pin the unit empty
 
         st["units"] = {**st.get("units", {}), **clean}   # merge — see docstring
+        st["saved_at"] = round(time.time(), 1)
+        self.save()
+        return self.get(name)
+
+    def edit_groups(self, name: str, groups: dict[str, object]) -> dict:
+        """Set (or clear) the multi-node deployments of an EXISTING state.
+
+        Groups were originally out of reach of the editor on the reading that a
+        spanning model "must not be added that way". The opposite is true: a
+        cookbook state is the only place a whole-fleet layout is written down, and
+        omitting the tp jobs made it describe half a fleet. `snapshot()` still
+        records them; this lets them be authored without staging first.
+
+        `{gid: {"model": alias}}` sets one; `{gid: None}` clears it. Merge, not
+        replace, for the same reason `edit_units` is.
+
+        Validated against reality, not just shape:
+          * the gid must be a CABLED set (`SPARK_FABRIC_LINKS`) — a tp job across
+            uncabled nodes hangs rather than failing, which is far worse;
+          * the alias must be in the CLUSTER catalog and fit the member count;
+          * a group's members must not also carry single-node rows, since the
+            group claims whole nodes and the state would be unapplyable.
+        """
+        st = self._states.get(name)
+        if st is None:
+            raise KeyError(name)
+
+        by_gid = {group_id_for(list(m)): tuple(m)
+                  for m in self.s.fabric_link_members()}
+        cur = dict(st.get("groups") or {})
+
+        for gid, spec in (groups or {}).items():
+            gid = str(gid)
+            members = by_gid.get(gid)
+            if members is None:
+                raise ValueError(
+                    f"'{gid}' is not a cabled node set — a tensor-parallel job across "
+                    f"nodes that are not linked HANGS rather than failing. "
+                    f"Cabled: {self.s.fabric_links_describe()}")
+            if spec is None or (isinstance(spec, dict) and not spec.get("model")):
+                cur.pop(gid, None)
+                continue
+            alias = str((spec or {}).get("model") or "").strip()
+            entry = self.orch.cluster_registry.get(alias) \
+                if getattr(self.orch, "cluster_registry", None) else None
+            if entry is None:
+                raise ValueError(
+                    f"'{alias}' is not in the cluster catalog. A multi-node model "
+                    f"lives in data/spark_cluster_models.yaml; a single-node one "
+                    f"belongs on a unit row instead.")
+            n = len(members)
+            if not (entry.min_nodes <= n <= entry.max_nodes):
+                raise ValueError(
+                    f"'{alias}' needs {entry.min_nodes}–{entry.max_nodes} nodes; "
+                    f"{gid} has {n}")
+            cur[gid] = {"model": alias}
+
+        # A claimed group owns its members outright — a state that also parks a
+        # single-node model there cannot be applied.
+        units = st.get("units") or {}
+        for gid, g in cur.items():
+            for m in by_gid.get(gid, ()):  # pragma: no branch — gid validated above
+                if units.get(m):
+                    raise ValueError(
+                        f"{gid} runs '{g['model']}' across {'+'.join(by_gid[gid])}, but "
+                        f"'{m}' also has its own model in this state. A group claims "
+                        f"whole nodes — clear {m} first (set it empty).")
+
+        st["groups"] = cur
         st["saved_at"] = round(time.time(), 1)
         self.save()
         return self.get(name)

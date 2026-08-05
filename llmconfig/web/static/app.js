@@ -644,6 +644,72 @@ function setButtons() {
   });
 }
 
+// ---- Home: cabled Spark pairs (tensor-parallel loads without the Cluster tab)
+// The Cluster tab is a planner — pick nodes, then a model. On the Home screen the
+// pairs are already known, so a tp model is one dropdown away like any other. Fit
+// and addability stay SERVER-side (/api/cluster/models — invariant 14).
+async function refreshPairs() {
+  const grid = $("pair-grid"), head = $("pairs-h");
+  if (!grid) return;
+  let pairs = [];
+  try { pairs = await api("/api/cluster/pairs"); } catch (e) { pairs = []; }
+  if (head) head.hidden = pairs.length === 0;
+  grid.innerHTML = "";
+  for (const p of pairs) {
+    const card = document.createElement("div");
+    card.className = "unit-card";
+    const title = document.createElement("div");
+    title.className = "uc-name";
+    title.textContent = p.name;
+    title.title = `${p.id} — head ${p.head}, members ${p.members.join(", ")}`;
+    const state = document.createElement("div");
+    state.className = "uc-sub";
+    state.textContent = p.loaded ? `serving ${p.loaded}` : "idle";
+    const sel = document.createElement("select");
+    sel.className = "uc-select";
+    const none = document.createElement("option");
+    none.value = ""; none.textContent = p.loaded ? "— unload —" : "— pick a model —";
+    sel.appendChild(none);
+    let models = [];
+    try {
+      models = await api("/api/cluster/models?nodes=" + encodeURIComponent(p.members.join(",")));
+    } catch (e) { models = []; }
+    models.forEach((m) => {
+      const o = document.createElement("option");
+      o.value = m.alias;
+      o.textContent = `${m.alias} · tp${m.tp}`;
+      // Server-computed fit; never re-derived here.
+      if (m.addable === false && m.alias !== p.loaded) { o.disabled = true; o.title = m.add_note || ""; }
+      sel.appendChild(o);
+    });
+    sel.value = p.loaded || "";
+    if (!p.fabric_enabled) {
+      sel.disabled = true;
+      state.textContent += " — fabric disabled (SPARK_FABRIC_ENABLED=false)";
+    }
+    sel.onchange = async () => {
+      const want = sel.value;
+      if (want === (p.loaded || "")) return;
+      const verb = want ? `load ${want} across ${p.members.join("+")}` : `unload ${p.loaded}`;
+      if (!confirm(`${verb}? This claims BOTH nodes.`)) { sel.value = p.loaded || ""; return; }
+      p.members.forEach((m) => markBusy(m, true));
+      try {
+        if (want) {
+          const job = await api("/api/cluster/load",
+                                { method: "POST", body: JSON.stringify({ nodes: p.members, model: want }) });
+          await pollJob(job.id);
+        } else {
+          await api("/api/cluster/unload", { method: "POST", body: JSON.stringify({ group: p.id }) });
+        }
+      } catch (e) { log("error: " + e.message, true); }
+      p.members.forEach((m) => markBusy(m, false));
+      await refreshAll(); await refreshPairs();
+    };
+    card.appendChild(title); card.appendChild(state); card.appendChild(sel);
+    grid.appendChild(card);
+  }
+}
+
 // ---- cookbook: named fleet states ----------------------------------------
 let COOKBOOK = { default: "", states: {} };
 
@@ -795,16 +861,56 @@ async function cbEdit() {
   });
   wrap.appendChild(table);
 
-  // Groups are shown so the state reads completely, but deliberately read-only.
-  const groups = Object.entries(state.groups || {});
-  if (groups.length) {
-    const g = document.createElement("p");
-    g.className = "hint";
-    g.innerHTML = "<strong>Multi-node (not editable here):</strong> " +
-      groups.map(([gid, v]) => `${gid} → ${v.model}`).join(", ") +
-      ". A model spanning several Sparks is not a per-unit row — launch it from the " +
-      "Cluster tab and use “Save current…” to record it.";
-    wrap.appendChild(g);
+  // Multi-node pairs, EDITABLE. A cookbook state is the only place a whole-fleet
+  // layout is written down, so leaving the tp jobs out made it describe half a
+  // fleet. Pairs come from the server (/api/cluster/pairs) so member ORDER — and
+  // therefore the head — is whatever SPARK_FABRIC_LINKS says, never a sort.
+  let pairs = [];
+  try { pairs = await api("/api/cluster/pairs"); } catch (e) { pairs = []; }
+  const groupRows = [];
+  if (pairs.length) {
+    const h = document.createElement("h4");
+    h.className = "cb-editor-h";
+    h.textContent = "Multi-node (tensor-parallel) pairs";
+    wrap.appendChild(h);
+    const note = document.createElement("p");
+    note.className = "hint";
+    note.textContent = pairs[0].fabric_enabled
+      ? "A pair claims BOTH its nodes — set its members empty above, or saving is refused."
+      : "The 200G fabric is disabled (SPARK_FABRIC_ENABLED=false), so these cannot launch yet.";
+    wrap.appendChild(note);
+
+    const gtable = document.createElement("div");
+    gtable.className = "cb-editor-rows";
+    for (const p of pairs) {
+      let models = [];
+      try {
+        models = await api("/api/cluster/models?nodes=" + encodeURIComponent(p.members.join(",")));
+      } catch (e) { models = []; }
+      const row = document.createElement("div");
+      row.className = "cb-editor-row";
+      const lab = document.createElement("label");
+      lab.textContent = p.name;
+      lab.title = `${p.id} — head ${p.head}`;
+      const sel = document.createElement("select");
+      const none = document.createElement("option");
+      none.value = ""; none.textContent = "— none —";
+      sel.appendChild(none);
+      models.forEach((m) => {
+        const o = document.createElement("option");
+        o.value = m.alias;
+        o.textContent = `${m.alias} · tp${m.tp} · ${m.min_nodes}-${m.max_nodes} nodes`;
+        sel.appendChild(o);
+      });
+      sel.value = (state.groups && state.groups[p.id] && state.groups[p.id].model) || "";
+      const holder = document.createElement("div");
+      holder.className = "cb-editor-selects";
+      holder.appendChild(sel);
+      row.appendChild(lab); row.appendChild(holder);
+      gtable.appendChild(row);
+      groupRows.push({ gid: p.id, sel });
+    }
+    wrap.appendChild(gtable);
   }
 
   const bar = document.createElement("div");
@@ -838,9 +944,15 @@ async function cbEdit() {
       });
       units[row.dataset.unit] = targets;            // [] is meaningful — pin empty
     });
+    // null clears a pair; the server applies units first, so freeing a member and
+    // claiming its pair in the same save works.
+    const groups = {};
+    groupRows.forEach(({ gid, sel }) => {
+      groups[gid] = sel.value ? { model: sel.value } : null;
+    });
     try {
       await api(`/api/cookbook/${encodeURIComponent(name)}/units`,
-                { method: "PUT", body: JSON.stringify({ units }) });
+                { method: "PUT", body: JSON.stringify({ units, groups }) });
       log(`edited cookbook state '${name}'`, true);
       close();
     } catch (e) { log("error: " + e.message, true); return; }
@@ -1077,3 +1189,5 @@ setInterval(() => { if (!anyBusy()) refreshModels(); }, 12000);
 });
 cbRefresh();
 setInterval(() => { if (!anyBusy()) cbRefresh(); }, 30000);
+refreshPairs();
+setInterval(() => { if (!anyBusy()) refreshPairs(); }, 30000);

@@ -197,6 +197,28 @@ def _parse_fabric_links(spec: str) -> list[frozenset[str]]:
     return links
 
 
+def _parse_fabric_link_members(spec: str) -> list[tuple[str, ...]]:
+    """Same links, but ORDER-PRESERVING — because order picks the head.
+
+    `_parse_fabric_links` returns frozensets, which is right for the subset test
+    but throws away which node was written first. `spark_group_config` takes the
+    head from `ids[0]`, so `spark1+spark2` and `spark2+spark1` are different
+    deployments. Anything offering these pairs in a UI has to preserve what the
+    operator wrote rather than re-deriving it from a sort (which would also break
+    the day a `spark10` exists).
+    """
+    out: list[tuple[str, ...]] = []
+    for chunk in (spec or "").split(","):
+        seen: list[str] = []
+        for p in chunk.split("+"):
+            p = p.strip()
+            if p and p not in seen:
+                seen.append(p)
+        if len(seen) >= 2:
+            out.append(tuple(seen))
+    return out
+
+
 def _parse_vllm_slots(spec: str) -> tuple:
     """Parse `COMPANION_VLLM_SLOTS` → ((alias, relay_port, budget_mb), ...).
 
@@ -694,6 +716,10 @@ class Settings(BaseSettings):
     def fabric_links(self) -> list[frozenset[str]]:
         """The cabled node sets from `SPARK_FABRIC_LINKS`; `[]` = unconstrained."""
         return _parse_fabric_links(self.spark_fabric_links)
+
+    def fabric_link_members(self) -> list[tuple[str, ...]]:
+        """The cabled sets in CONFIGURED order, so member[0] is the head."""
+        return _parse_fabric_link_members(self.spark_fabric_links)
 
     def fabric_link_ok(self, member_ids: list[str] | tuple[str, ...]) -> bool:
         """Can these nodes actually talk to each other?
