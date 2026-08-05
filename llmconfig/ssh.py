@@ -39,6 +39,73 @@ DEFAULT_SSH_OPTS: tuple[str, ...] = (
 )
 
 
+# Stderr signatures that mean OUR side is misconfigured — a key that is missing,
+# unreadable, not trusted, or a host key that changed. These are the cases where
+# falling back to the WSL transport is right: WSL holds a working key, so the
+# node stays observable while the native side is fixed.
+#
+# Deliberately NOT here: "Connection refused", "No route to host", timeouts. A
+# node that is off or unreachable fails identically over WSL, so falling back
+# would just pay the timeout twice and slow every poll of an offline Spark.
+_LOCAL_FAILURE_SIGNATURES = (
+    "permission denied",
+    "no such identity",
+    "unprotected private key",
+    "bad permissions",
+    "host key verification failed",
+    "could not open a connection to your authentication agent",
+)
+
+
+def is_local_transport_failure(r: CmdResult) -> bool:
+    """True when a failure is about OUR ssh setup, not the remote node."""
+    if r.rc == 127:                 # no ssh.exe at all
+        return True
+    if r.rc == 0:
+        return False
+    blob = f"{r.err}\n{r.out}".lower()
+    return any(sig in blob for sig in _LOCAL_FAILURE_SIGNATURES)
+
+
+class NativeSshState:
+    """Sticky demotion to WSL when the native transport is misconfigured.
+
+    Without stickiness a broken key would cost every probe a doomed native
+    attempt *plus* the WSL round-trip. Without the retry it would never come
+    back after a fix. So: demote for `spark_ssh_native_retry_s`, then try native
+    again on the next call.
+    """
+
+    def __init__(self) -> None:
+        self.demoted_until: float = 0.0
+        self.reason: str = ""
+
+    def demoted(self, now: float) -> bool:
+        return now < self.demoted_until
+
+    def demote(self, now: float, retry_s: float, reason: str) -> None:
+        first = not self.demoted(now)
+        self.demoted_until = now + retry_s
+        self.reason = reason
+        if first:
+            log.warning("native ssh demoted to the WSL transport for %.0fs: %s", retry_s, reason)
+
+
+_native_state: NativeSshState | None = None
+
+
+def native_state() -> NativeSshState:
+    global _native_state
+    if _native_state is None:
+        _native_state = NativeSshState()
+    return _native_state
+
+
+def reset_native_state() -> None:
+    global _native_state
+    _native_state = None
+
+
 def _ssh_exe() -> str:
     return "ssh.exe" if os.name == "nt" else "ssh"
 

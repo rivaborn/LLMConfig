@@ -37,7 +37,7 @@ from ..gpu import GPU_QUERY, METRICS_QUERY, GpuInfo, GpuMetric, _parse_float, _p
 from ..proc import CmdResult
 from ..registry import SparkRegistry
 from ..schemas import ServedModel, SparkModel
-from ..ssh import run_ssh
+from ..ssh import is_local_transport_failure, native_state, run_ssh
 from ..wsl import run_wsl
 
 LogCb = Callable[[str], None]
@@ -419,10 +419,20 @@ class SparkBackend:
         which is exactly what failed on 2026-08-04. The WSL branch is retained
         for boxes where only the distro holds key auth to the nodes.
         """
-        if self.s.spark_ssh_native:
-            return await run_ssh(
+        if self.s.spark_ssh_native and not native_state().demoted(time.monotonic()):
+            r = await run_ssh(
                 self.cfg.ssh_user, self.cfg.host, remote_command,
                 timeout=timeout, settings=self.s,
+            )
+            # Only a LOCAL misconfiguration (missing/untrusted key, no ssh.exe)
+            # falls through to WSL. A node that is simply down fails the same way
+            # over either transport, so retrying there would double the cost of
+            # polling an offline Spark for nothing.
+            if not is_local_transport_failure(r):
+                return r
+            native_state().demote(
+                time.monotonic(), self.s.spark_ssh_native_retry_s,
+                (r.text() or f"rc {r.rc}")[:200],
             )
         cmd = self.s.spark_ssh_cmd.format(
             user=self.cfg.ssh_user,

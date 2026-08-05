@@ -464,6 +464,11 @@ class Settings(BaseSettings):
     # nodes trust, so this is normally a copy of it readable by the Windows user.
     # Missing file => fall back to ssh's own config rather than failing.
     spark_ssh_key: str = "~/.ssh/id_ed25519_sparkctl"
+    # If the native key goes missing/untrusted, fall back to the WSL transport
+    # rather than silently losing telemetry again — sticky for this long so a
+    # broken key does not cost a doomed native attempt on every single poll,
+    # then retried so a fixed key resumes native without a restart.
+    spark_ssh_native_retry_s: float = 300.0
 
     # --- monitoring (the Monitor tab: thermals/power/VRAM history) ---
     monitor_enabled: bool = True
