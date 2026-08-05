@@ -55,6 +55,7 @@ from .schemas import (
     UsageResponse,
     VllmAliasEntry,
 )
+from .slot_lane import SlotLane
 from .spark_unit import SparkUnit
 from . import wsl as wsl_mod
 from .wsl import WslRecovery, run_wsl, wait_ready
@@ -305,6 +306,31 @@ def create_app() -> FastAPI:
                 resp.spark = await ln.spark.list_models(claim=claim)
             except Exception as e:
                 resp.spark_error = f"{type(e).__name__}: {e}"
+            return resp
+        if isinstance(ln, SlotLane):
+            # A SlotLane has neither `.ollama` nor `.vllm` — it owns ONE backend
+            # per configured slot. Falling through to the Lane branch raised
+            # AttributeError into `*_error`, so the companion lane's dropdowns
+            # rendered permanently empty with the cause buried in a field the UI
+            # does not surface (found 2026-08-05).
+            #
+            # Only the SLOT aliases are listed, never the whole registry: `_load`
+            # refuses anything else ("slots are static config … add it to
+            # COMPANION_VLLM_SLOTS"), and advertising an alias that cannot launch
+            # is the same trap the Ollama-only branch below guards against.
+            try:
+                served = await asyncio.gather(
+                    *(b.served() for b in ln.backends.values()))
+                for (alias, _), now in zip(ln.slots.items(), served):
+                    entry = ln.registry.get(alias)
+                    if entry is None:
+                        continue
+                    pub = entry.to_public()
+                    pub.loaded = bool(now and (entry.served_name or alias) == now)
+                    resp.vllm.append(pub)
+            except Exception as e:
+                resp.vllm_error = f"{type(e).__name__}: {e}"
+            resp.ollama_error = "Ollama is not available on this lane (vLLM slots only)"
             return resp
         try:
             resp.ollama = await ln.ollama.list_models()
