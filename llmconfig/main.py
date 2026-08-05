@@ -11,7 +11,7 @@ import shlex
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Response
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -350,6 +350,27 @@ def create_app() -> FastAPI:
         except RuntimeError as e:
             raise HTTPException(status_code=409, detail=str(e))
         return {"name": name, "state": state}
+
+    @app.put("/api/cookbook/{name}/units", dependencies=write)
+    async def api_cookbook_edit(name: str, body: dict = Body(...)) -> dict:
+        """Edit which model each single-node unit runs, without staging the fleet.
+
+        `PUT /api/cookbook/{name}` snapshots what is loaded NOW; this writes the
+        intent directly, so changing one line no longer costs a full round of
+        loads. `groups:` is left alone — a multi-node deployment is not a
+        per-unit row (see `Cookbook.edit_units`).
+        """
+        units = body.get("units")
+        if not isinstance(units, dict):
+            raise HTTPException(status_code=400, detail="body needs a 'units' object")
+        try:
+            state = cookbook.edit_units(name, units)
+        except KeyError:
+            raise HTTPException(status_code=404, detail=f"no cookbook state '{name}'")
+        except ValueError as e:
+            raise HTTPException(status_code=400, detail=str(e))
+        return {"name": name, "state": state,
+                "default_in_sync": cookbook.default_in_sync()}
 
     @app.post("/api/cookbook/{name}/apply", response_model=Job, dependencies=write)
     async def api_cookbook_apply(name: str) -> Job:

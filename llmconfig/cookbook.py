@@ -220,6 +220,68 @@ class Cookbook:
         self.save()
         return self.get(name)
 
+    # ------------------------------------------------------------------ #
+    # Edit-in-place (author a state without staging the fleet first)
+    # ------------------------------------------------------------------ #
+    def edit_units(self, name: str, units: dict[str, list[dict]]) -> dict:
+        """Replace the per-unit rows of an EXISTING state. `groups:` is untouched.
+
+        `snapshot()` can only record what is currently loaded, so changing which
+        model a state puts on one node meant staging that whole fleet and
+        re-saving — minutes of loads to edit one line. This writes the intent
+        directly.
+
+        **Multi-node models cannot be set here, and that needs no special case.**
+        Every target is validated against the *unit's own catalog*, and by the
+        `SparkModelEntry` invariant a model with `min_nodes > 1` lives only in
+        `data/spark_cluster_models.yaml` — never in a per-node catalog. So a
+        spanning model simply fails to resolve, with the same error as a typo.
+        Groups stay where `snapshot()` puts them: their own section, applied
+        last, out of this method's reach.
+
+        Raises KeyError (no such state) or ValueError (bad unit/model), so the
+        route can map them to 404/400 without inspecting messages.
+        """
+        st = self._states.get(name)
+        if st is None:
+            raise KeyError(name)
+
+        clean: dict[str, list[dict]] = {}
+        for uid, targets in (units or {}).items():
+            uid = str(uid)
+            unit = self.orch.units.get(uid)
+            if unit is None or not unit.cfg.enabled:
+                raise ValueError(f"unknown or disabled unit '{uid}'")
+            if getattr(unit, "kind", "") == "spark_group":
+                raise ValueError(
+                    f"'{uid}' is a multi-node group — a spanning deployment is recorded "
+                    f"in the state's `groups:` section, not as a per-unit row. Launch it "
+                    f"from the Cluster tab and re-save the state.")
+            rows: list[dict] = []
+            for t in (targets or []):
+                server = str((t or {}).get("server") or "").strip()
+                model = str((t or {}).get("model") or "").strip()
+                if not model:
+                    raise ValueError(f"unit '{uid}': a target has no model")
+                if server not in ("spark", "vllm", "ollama"):
+                    raise ValueError(f"unit '{uid}': unknown server '{server}'")
+                # Ollama tags are free-form (they load as-is, cf. _canonical);
+                # everything else must exist in THIS unit's catalog.
+                if server != "ollama":
+                    reg = getattr(unit, "registry", None)
+                    if reg is None or reg.get(model) is None:
+                        raise ValueError(
+                            f"unit '{uid}': '{model}' is not in its catalog. Multi-node "
+                            f"models are not in any per-node catalog by design — they "
+                            f"belong to a group, not a single Spark.")
+                rows.append({"server": server, "model": model})
+            clean[uid] = rows      # [] is meaningful: pin the unit empty
+
+        st["units"] = clean
+        st["saved_at"] = round(time.time(), 1)
+        self.save()
+        return self.get(name)
+
     def _canonical(self, unit: "Unit", server: str, model: str) -> str:
         """Fold a resident's served name onto the loadable alias."""
         if hasattr(unit, "canonical_model"):          # SparkUnit

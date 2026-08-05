@@ -224,6 +224,23 @@ header {
 .cookbook-bar .cb-note { font-size: 12px; color: var(--muted); }
 option:disabled { color: #777; }
 
+/* Cookbook editor — author a state's per-unit targets without loading anything. */
+.cb-editor-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.55);
+                      display: flex; align-items: center; justify-content: center; z-index: 50; }
+.cb-editor { background: var(--panel, #1c1f24); border: 1px solid var(--line, #333);
+             border-radius: 10px; padding: 18px 20px; width: min(680px, 92vw);
+             max-height: 86vh; overflow: auto; }
+.cb-editor h3 { margin: 0 0 6px; font-size: 15px; }
+.cb-editor .hint { margin: 0 0 12px; }
+.cb-editor-rows { display: flex; flex-direction: column; gap: 8px; }
+.cb-editor-row { display: grid; grid-template-columns: 96px 1fr auto; gap: 10px;
+                 align-items: start; }
+.cb-editor-row > label { font-size: 12px; font-weight: 700; padding-top: 6px;
+                         color: var(--muted); }
+.cb-editor-selects { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.cb-editor-selects select { width: 100%; }
+.cb-editor-bar { display: flex; gap: 8px; justify-content: flex-end; margin-top: 16px; }
+
 /* Cluster tab: node picker + model + launch on one bar, placements below. */
 .cluster-bar { display: flex; align-items: center; gap: 10px; margin: 0 0 14px; flex-wrap: wrap; }
 .cluster-bar .uc-select { flex: 0 1 340px; }

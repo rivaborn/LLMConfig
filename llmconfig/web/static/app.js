@@ -730,6 +730,124 @@ async function cbSave() {
   await cbRefresh();
 }
 
+// ---- cookbook: edit a state without staging the fleet ---------------------
+// `Save current…` can only record what is loaded NOW, so changing which model a
+// state puts on one node used to mean loading that whole fleet and re-saving —
+// minutes of loads to edit one line. This writes the intent straight to the
+// state. Multi-node deployments are NOT editable here: they live in the state's
+// `groups:` section, and the server rejects them because a spanning model is
+// absent from every per-node catalog by design.
+async function cbEdit() {
+  const name = $("cb-select").value;
+  if (!name) return;
+  const state = COOKBOOK.states[name];
+  if (!state) return;
+
+  // One <select> per single-node unit, options straight from that unit's catalog.
+  const rows = [];
+  for (const unit of UNITS) {
+    if (unit.kind === "spark_group") continue;      // groups are not per-unit rows
+    let d;
+    try { d = await api("/api/models?lane=" + encodeURIComponent(unit.id)); } catch (e) { continue; }
+    const opts = [{ value: "", label: "— empty (unload everything) —" }];
+    (d.spark || []).forEach((m) => opts.push({ value: `spark::${m.alias}`, label: `${m.alias} · spark` }));
+    (d.vllm || []).forEach((a) => opts.push({ value: `vllm::${a.alias}`, label: `${a.alias} · vllm` }));
+    (d.ollama || []).forEach((m) => opts.push({ value: `ollama::${m.name}`, label: `${m.name} · ollama` }));
+    const cur = (state.units && state.units[unit.id]) || [];
+    rows.push({ unit, opts, cur });
+  }
+
+  const wrap = document.createElement("div");
+  wrap.className = "cb-editor";
+  wrap.innerHTML = `<h3>Edit “${name}”</h3>
+    <p class="hint">Sets which model each unit runs when this state is applied. Nothing loads
+    until you press Apply on the state. A Spark can hold several models; use “+ add” for a
+    second one.</p>`;
+
+  const table = document.createElement("div");
+  table.className = "cb-editor-rows";
+  rows.forEach((r) => {
+    const row = document.createElement("div");
+    row.className = "cb-editor-row";
+    row.dataset.unit = r.unit.id;
+    const lab = document.createElement("label");
+    lab.textContent = r.unit.id;
+    row.appendChild(lab);
+    const holder = document.createElement("div");
+    holder.className = "cb-editor-selects";
+    const addSelect = (val) => {
+      const s = document.createElement("select");
+      r.opts.forEach((o) => {
+        const el = document.createElement("option");
+        el.value = o.value; el.textContent = o.label;
+        s.appendChild(el);
+      });
+      s.value = val || "";
+      holder.appendChild(s);
+    };
+    if (r.cur.length) r.cur.forEach((t) => addSelect(`${t.server}::${t.model}`));
+    else addSelect("");
+    const add = document.createElement("button");
+    add.className = "btn"; add.type = "button"; add.textContent = "+ add";
+    add.onclick = () => addSelect("");
+    row.appendChild(holder); row.appendChild(add);
+    table.appendChild(row);
+  });
+  wrap.appendChild(table);
+
+  // Groups are shown so the state reads completely, but deliberately read-only.
+  const groups = Object.entries(state.groups || {});
+  if (groups.length) {
+    const g = document.createElement("p");
+    g.className = "hint";
+    g.innerHTML = "<strong>Multi-node (not editable here):</strong> " +
+      groups.map(([gid, v]) => `${gid} → ${v.model}`).join(", ") +
+      ". A model spanning several Sparks is not a per-unit row — launch it from the " +
+      "Cluster tab and use “Save current…” to record it.";
+    wrap.appendChild(g);
+  }
+
+  const bar = document.createElement("div");
+  bar.className = "cb-editor-bar";
+  const save = document.createElement("button");
+  save.className = "btn"; save.textContent = "Save state";
+  const cancel = document.createElement("button");
+  cancel.className = "btn"; cancel.textContent = "Cancel";
+  bar.appendChild(save); bar.appendChild(cancel);
+  wrap.appendChild(bar);
+
+  const back = document.createElement("div");
+  back.className = "cb-editor-backdrop";
+  back.appendChild(wrap);
+  document.body.appendChild(back);
+  const close = () => back.remove();
+  cancel.onclick = close;
+  back.onclick = (e) => { if (e.target === back) close(); };
+
+  save.onclick = async () => {
+    const units = {};
+    table.querySelectorAll(".cb-editor-row").forEach((row) => {
+      const targets = [];
+      row.querySelectorAll("select").forEach((s) => {
+        if (!s.value) return;
+        const [server, ...rest] = s.value.split("::");
+        const model = rest.join("::");
+        if (!targets.some((t) => t.server === server && t.model === model)) {
+          targets.push({ server, model });          // de-dupe: two selects, one model
+        }
+      });
+      units[row.dataset.unit] = targets;            // [] is meaningful — pin empty
+    });
+    try {
+      await api(`/api/cookbook/${encodeURIComponent(name)}/units`,
+                { method: "PUT", body: JSON.stringify({ units }) });
+      log(`edited cookbook state '${name}'`, true);
+      close();
+    } catch (e) { log("error: " + e.message, true); return; }
+    await cbRefresh();
+  };
+}
+
 async function cbSetDefault() {
   const name = $("cb-select").value;
   if (!name) return;
@@ -953,9 +1071,9 @@ boot();
 // units' cards. The model catalog (which rebuilds DOM lists) still waits.
 setInterval(() => refreshStatus(), 2500);
 setInterval(() => { if (!anyBusy()) refreshModels(); }, 12000);
-["cb-apply", "cb-save", "cb-default", "cb-delete"].forEach((id, i) => {
+["cb-apply", "cb-save", "cb-edit", "cb-default", "cb-delete"].forEach((id, i) => {
   const el = $(id);
-  if (el) el.onclick = [cbApply, cbSave, cbSetDefault, cbDelete][i];
+  if (el) el.onclick = [cbApply, cbSave, cbEdit, cbSetDefault, cbDelete][i];
 });
 cbRefresh();
 setInterval(() => { if (!anyBusy()) cbRefresh(); }, 30000);
