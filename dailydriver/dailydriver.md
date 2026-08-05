@@ -347,9 +347,14 @@ pair A   spark1+spark2   deepseek-v4-flash                            tp=2 (vllm
 ```
 
 The 122B is now a **single** resident copy on spark3, which is what
-`auto/qwen35-122b` resolves to — and since 2026-08-05 that is also what opencode's
-`plan`, `build` and gate reviewer all point at, so the three share one node
-instead of racing for three.
+`auto/qwen35-122b` resolves to — and since 2026-08-05 that is what opencode's
+`build` agent **and** its review tier (`agent/review.md` plus the `step-gate` /
+`idle-review` plugins) both point at, so they share one node instead of claiming
+two. `plan` deliberately stays on `auto/deepseek-v4-flash`: that is the tp=2 group
+on **spark1+spark2**, a different pair, so a `plan` ↔ `build` switch evicts
+nothing — and it keeps `plan` and `verify` reading the work through a different
+model from the one that wrote it, which is the independence the `review` tier
+gave up.
 
 Read a tp=2 pair correctly: **only the head serves HTTP.** spark2 answers on no
 port and that is not a fault — it is the worker of job `d56a59ad1db2`. Probing
