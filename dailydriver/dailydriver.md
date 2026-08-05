@@ -337,6 +337,20 @@ pair A   spark1+spark2   deepseek-v4-flash    tp=2 (head .50 / worker .51)
          spark4          qwen35-122b_8_3_26   tp=1  (pinned `eugr/spark-vllm@sha256:1d335d4f…`)
 ```
 
+**Later the same day (2026-08-05), after applying `DF4_RAG Daily Driver`:**
+
+```
+pair A   spark1+spark2   deepseek-v4-flash                            tp=2 (vllm-node-dspark)
+         spark3          qwen35-122b                                  tp=1 (vllm-node)
+         spark4          qwen3-vl-reranker-8b + qwen3-vl-embedding-8b  (:8000 / :8001)
+3090                     vl32          3070 Ti   surya2 + qwen25-relay
+```
+
+The 122B is now a **single** resident copy on spark3, which is what
+`auto/qwen35-122b` resolves to — and since 2026-08-05 that is also what opencode's
+`plan`, `build` and gate reviewer all point at, so the three share one node
+instead of racing for three.
+
 Read a tp=2 pair correctly: **only the head serves HTTP.** spark2 answers on no
 port and that is not a fault — it is the worker of job `d56a59ad1db2`. Probing
 a worker's `/v1/models` and concluding "nothing is loaded" is the mistake this
@@ -358,4 +372,16 @@ FlashInfer `0.6.17-51920591-d20260803`), pre-pulled on all four nodes
 *Renamed:* `local/qwen35-122b-int4-nightly.yaml` → `local/qwen35-122b_8_3_26.yaml`,
 serving as `qwen35-122b_8_3_26`. The old name described a moving target, which
 was the defect; the new one names the build it is pinned to. Bumping is now a
-deliberate act — procedure in the recipe header and `settings.spark_image`.
+deliberate act — procedure in the recipe header.
+
+**⛔ Correction, 2026-08-05 — pin in the RECIPE, never globally.** The pin first
+shipped as a global `settings.spark_image` passing `sparkrun run --image`. That
+skips the pull, and it overrides **every** recipe — which is fatal here, because
+this fleet runs three runtimes (`vllm-node-dspark`, `vllm-node`,
+`eugr/spark-vllm@…`). On the next `DF4_RAG` apply, DS4 was forced off its DSpark
+image and died in warmup with `tvm.error.InternalError … must go through
+sparse_mla_sm120_decode_dsv4`. Measured afterwards: the digest in the recipe's
+own `container:` skips the pull **by itself** — no `docker pull` process at all,
+container resolving to the identical image id — so the global override bought
+nothing. `spark_image` now defaults to empty. **When a Spark model dies at
+startup, check the image column in `sparkrun status` before blaming the model.**

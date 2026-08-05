@@ -449,6 +449,37 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
     Verified after deploy: four `/api/status` calls left the `wsl.exe` count
     unchanged at 4; it used to grow by 8 each time.
 
+    **2026-08-05 — a GLOBAL setting must never override a PER-RECIPE choice.**
+    `spark_image` shipped with a digest default that passed `sparkrun run
+    --image` on every load, to stop the moving `eugr/spark-vllm:latest` tag
+    costing ~14 min of surprise pull. It did that, and it silently replaced every
+    recipe's own `container:`. This fleet runs three runtimes —
+    `vllm-node-dspark` (DeepSeek-V4-Flash), `vllm-node` (qwen35-122b),
+    `eugr/spark-vllm@…` (qwen35-122b_8_3_26) — so DS4 landed on the generic image
+    and died in warmup with `tvm.error.InternalError … must go through
+    sparse_mla_sm120_decode_dsv4`, a DeepSeek-V4-specific sparse-MLA kernel. The
+    model was fine; it was on the wrong runtime. Two lessons:
+
+    - **The recipe already had the right mechanism.** Measured afterwards: a
+      digest in `container:` skips the pull on its own — no `docker pull` process
+      at all, container resolving to the identical image id. The override was
+      solving a problem the recipe had already solved, at fleet-wide risk.
+      `spark_image` now defaults to `""`.
+    - **Diagnose from the image column.** A live container with a dead engine
+      looks the same whatever the cause; `sparkrun status` showed
+      `eugr/spark-vllm` where 17 healthy hours had shown `vllm-node-dspark`.
+
+    **2026-08-05 — an unload's residency clears BEFORE its VRAM.** A cookbook
+    apply unloaded a 122B off spark4 and launched the pooling pair into the gap;
+    the reranker got `OSError [Errno 98] Address already in use` and the embedder
+    was refused because `0.80/0.95 is already committed` to the departing model.
+    Both succeeded on retry unchanged. `Cookbook._wait_unloaded` now polls
+    residency before loading onto the same node — the Spark counterpart of
+    `_wait_vram_free`. **It is not sufficient on its own:** measured the same day,
+    spark4 reported an empty model list at **91.1 % VRAM**, ~110 GB still
+    committed. For a `needs_empty_node` model that gap decides the load. Wait for
+    the VRAM figure, not just the model list.
+
 18. **A multi-node (SparkGroup) load holds EVERY member's lock, acquired in
     `orch.units` order, bounded, all-or-nothing** — the one global order is what
     keeps overlapping group loads (spark1+spark2 vs spark2+spark3) queueing

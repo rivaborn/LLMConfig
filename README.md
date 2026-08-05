@@ -137,10 +137,14 @@ Win svc   wsl.exe →    NSSM svc  wsl.exe →      :8000     via wsl.exe
   transport so telemetry degrades instead of going dark; a node that is merely offline
   does **not** fall back, since it fails identically either way and retrying would pay
   two timeouts on every poll. `sparkrun` lifecycle still goes through WSL.
-- The Spark **runtime image is pinned by digest** (`spark_image` → `sparkrun run
-  --image`). `eugr/spark-vllm:latest` and upstream's `prebuilt-*-current` release tags
-  all move on every nightly; on 2026-08-04 that cost ~14 min of mid-load pull and had
-  left the four nodes on four different digests. Pinned, image prep is 0.4 s.
+- The Spark **runtime image is pinned per RECIPE**, in its `container:` field —
+  `eugr/spark-vllm:latest` and upstream's `prebuilt-*-current` release tags all move on
+  every nightly, and on 2026-08-04 that cost ~14 min of mid-load pull with the four nodes
+  each on a different digest. A digest in `container:` skips the pull on its own
+  (measured: no `docker pull` process at all). The global `spark_image` override exists as
+  an `.env` escape hatch but **defaults to empty and should stay there** — it replaces
+  EVERY recipe's runtime, and this fleet runs three (`vllm-node-dspark`, `vllm-node`,
+  `eugr/spark-vllm@…`); shipping it on briefly took DeepSeek-V4-Flash down.
 - The Orchestrator holds a **shared WSL keepalive** (`wsl.exe … sleep infinity`) so the
   distro — and any loaded vLLM model + relay — survives WSL2's idle-shutdown. Sparks
   need no keepalive: their workload lives on the node.
@@ -549,6 +553,7 @@ llmconfig/
   registry.py       vLLM alias + Spark recipe catalogs (YAML)
   schemas.py        pydantic models
   jobs.py           async job manager (streamed logs)
+  cookbook.py       named fleet states: snapshot / edit / apply
   wsl.py            wsl.exe bridge + WslKeepalive + WslHealth/WslRecovery
   ssh.py            native OpenSSH transport for Spark nodes (no WSL)
   winsvc.py         Windows service control
