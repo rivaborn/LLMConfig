@@ -454,6 +454,16 @@ class Settings(BaseSettings):
     # Remote telemetry: plain SSH to the node (the control node's WSL already has
     # passwordless key auth to every Spark).
     spark_ssh_cmd: str = "ssh -o BatchMode=yes -o ConnectTimeout=5 {user}@{host} {command}"
+    # Telemetry transport. Native = Windows OpenSSH straight to the node, so a
+    # wedged distro can no longer take Spark VRAM down with it (2026-08-04: all
+    # four Sparks read found=False for hours while every node was healthy).
+    # Set false to fall back to the WSL path (which uses spark_ssh_cmd above).
+    # `sparkrun` lifecycle is unaffected — it genuinely lives in WSL.
+    spark_ssh_native: bool = True
+    # Key for the native path. The WSL key (wsl40-sparkrun-control) is what the
+    # nodes trust, so this is normally a copy of it readable by the Windows user.
+    # Missing file => fall back to ssh's own config rather than failing.
+    spark_ssh_key: str = "~/.ssh/id_ed25519_sparkctl"
 
     # --- monitoring (the Monitor tab: thermals/power/VRAM history) ---
     monitor_enabled: bool = True
@@ -553,6 +563,12 @@ class Settings(BaseSettings):
     wsl_selfheal_after_failures: int = 3
     wsl_selfheal_cooldown_s: float = 900.0    # never loop the ladder faster than this
     wsl_service_restart_timeout_s: float = 120.0  # observed ~16 stop-poll cycles
+    # Breaker on the exec path. Until 2026-08-04 a wedged distro was re-attempted
+    # by every caller: one /api/status fanned out to 4 Spark lanes, spent 4x the
+    # exec timeout and abandoned 8 wsl.exe. With the breaker open, callers get an
+    # immediate rc 124 and one trial is admitted every wsl_breaker_retry_s.
+    wsl_breaker_enabled: bool = True
+    wsl_breaker_retry_s: float = 60.0
 
     # Bounded wait for a unit's swap lock. Must exceed the longest legitimate
     # queue (spark_load_timeout_s 900 / default_vllm_load_timeout_s 240), but

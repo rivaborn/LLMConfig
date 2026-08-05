@@ -63,7 +63,7 @@ def calls(monkeypatch) -> Calls:
     recorded = Calls()
     recorded.plan = {}
 
-    async def fake_run_wsl(command, *, login=True, timeout=30.0, settings=None):
+    def _respond(command: str) -> CmdResult:
         recorded.append(command)
         for needle, result in recorded.plan.items():
             if needle in command:
@@ -72,7 +72,16 @@ def calls(monkeypatch) -> Calls:
             return CmdResult(0, SMI_ROW, "")
         return CmdResult(0, "ok", "")
 
+    async def fake_run_wsl(command, *, login=True, timeout=30.0, settings=None):
+        return _respond(command)
+
+    async def fake_run_ssh(user, host, command, *, timeout=20.0, settings=None):
+        # Node SSH is native by default now; record the REMOTE command so the
+        # existing substring assertions keep meaning the same thing.
+        return _respond(command)
+
     monkeypatch.setattr(spark_mod, "run_wsl", fake_run_wsl)
+    monkeypatch.setattr(spark_mod, "run_ssh", fake_run_ssh)
     return recorded
 
 
@@ -680,7 +689,11 @@ def stateful_node(monkeypatch, cfg, initial: dict[int, str] | None = None):
                         del state[prt]
         return CmdResult(0, "ok", "")
 
+    async def fake_run_ssh(user, host, command, *, timeout=20.0, settings=None):
+        return await fake_run_wsl(command, login=False, timeout=timeout, settings=settings)
+
     monkeypatch.setattr(spark_mod, "run_wsl", fake_run_wsl)
+    monkeypatch.setattr(spark_mod, "run_ssh", fake_run_ssh)
 
     for port in cfg.slot_ports:
         def make(p):
@@ -1008,7 +1021,12 @@ async def test_launch_timeout_honours_the_recipes_budget(cfg, monkeypatch):
         return CmdResult(0, "ok", "")
 
     state: dict[int, str] = {}
+
+    async def fake_run_ssh(user, host, command, *, timeout=20.0, settings=None):
+        return await fake_run_wsl(command, login=False, timeout=timeout, settings=settings)
+
     monkeypatch.setattr(spark_mod, "run_wsl", fake_run_wsl)
+    monkeypatch.setattr(spark_mod, "run_ssh", fake_run_ssh)
     with respx.mock:
         for port in cfg.slot_ports:
             def make(p):
@@ -1054,7 +1072,12 @@ async def test_admission_refuses_when_measured_free_memory_contradicts_the_budge
         if "nvidia-smi" in command:
             return CmdResult(0, calls_low, "")
         return CmdResult(0, "ok", "")
+
+    async def fake_run_ssh(user, host, command, *, timeout=20.0, settings=None):
+        return await fake_run_wsl(command, login=False, timeout=timeout, settings=settings)
+
     monkeypatch.setattr(spark_mod, "run_wsl", fake_run_wsl)
+    monkeypatch.setattr(spark_mod, "run_ssh", fake_run_ssh)
 
     job = await wait_job(unit.load(LoadRequest(server="spark", model="m2", lane="spark1")))
 

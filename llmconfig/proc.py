@@ -8,13 +8,56 @@ dev machine without WSL) instead of crashing a request handler.
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from dataclasses import dataclass
 
+log = logging.getLogger(__name__)
 
 # How long to wait for a killed process to actually die before abandoning it.
 # Short on purpose: this only runs on a path that has already timed out, and the
 # whole point is that the caller must get control back.
 REAP_TIMEOUT_S = 5.0
+
+# Budget for the `taskkill /T` sweep. It only has to outlive one process-tree
+# walk; if it can't finish in this long we fall back to killing the direct child.
+TREE_KILL_TIMEOUT_S = 5.0
+
+
+async def kill_tree(pid: int) -> bool:
+    """Kill a process AND its descendants. Returns True if the sweep ran.
+
+    `Popen.kill()` on Windows is `TerminateProcess` on ONE handle, and it does
+    not cascade. `wsl.exe` spawns a second `wsl.exe` (the relay to the utility
+    VM), so killing the process we launched leaves its sibling running — and per
+    `WslRecovery` step 1 those orphans are what hold a wedged distro open. On
+    2026-08-04 twenty of them had accumulated, eight per `/api/status` call,
+    while every timeout was reported as a clean reap.
+
+    Non-Windows falls back to the caller's plain kill (returns False). Never
+    raises: this runs on a path that has already failed.
+    """
+    if os.name != "nt":
+        return False
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "taskkill.exe", "/PID", str(pid), "/T", "/F",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+    except (FileNotFoundError, NotImplementedError, OSError) as e:
+        log.debug("kill_tree: cannot exec taskkill (%s)", e)
+        return False
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=TREE_KILL_TIMEOUT_S)
+        return True
+    except asyncio.TimeoutError:
+        # taskkill itself wedged. Don't leave IT behind too.
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+        return False
 
 
 @dataclass
@@ -48,10 +91,15 @@ async def run_argv(argv: list[str], timeout: float = 30.0, env: dict | None = No
     try:
         out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-        except ProcessLookupError:
-            pass
+        # Kill the whole TREE first. `proc.kill()` alone reaps the handle we own
+        # and leaves any child running, which reads as a clean timeout while the
+        # orphan keeps the distro wedged (2026-08-04). Fall back to the direct
+        # kill when the sweep is unavailable (non-Windows) or itself times out.
+        if not await kill_tree(proc.pid):
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
         # Bound the reap. `kill()` is a REQUEST: a process wedged in an
         # uninterruptible kernel call ignores it, and a bare `await proc.wait()`
         # then never returns — which silently breaks this module's whole "a hang

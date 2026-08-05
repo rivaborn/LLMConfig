@@ -56,6 +56,7 @@ from .schemas import (
     VllmAliasEntry,
 )
 from .spark_unit import SparkUnit
+from . import wsl as wsl_mod
 from .wsl import WslRecovery, run_wsl, wait_ready
 
 log = logging.getLogger(__name__)
@@ -80,6 +81,13 @@ def create_app() -> FastAPI:
     sweeper = LeaseSweeper(settings, orch, leases)
 
     recovery = WslRecovery(settings)
+    # Make the ladder reachable at RUNTIME, not only from the boot gate below.
+    # Until 2026-08-04 `recovery.attempt` had exactly one call site — the
+    # `wait_ready` stall hook — so a distro that wedged *after* startup stayed
+    # wedged: Spark telemetry rendered found=False for hours while the fix sat
+    # one function call away. WslHealth counts exec timeouts wherever they
+    # happen and escalates here.
+    wsl_mod.health(settings).register(recovery.attempt)
 
     async def _reclaim_groups() -> None:
         """Re-establish group claims for deployments that outlived a restart.

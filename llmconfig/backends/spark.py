@@ -37,6 +37,7 @@ from ..gpu import GPU_QUERY, METRICS_QUERY, GpuInfo, GpuMetric, _parse_float, _p
 from ..proc import CmdResult
 from ..registry import SparkRegistry
 from ..schemas import ServedModel, SparkModel
+from ..ssh import run_ssh
 from ..wsl import run_wsl
 
 LogCb = Callable[[str], None]
@@ -411,6 +412,18 @@ class SparkBackend:
 
     # ---- remote telemetry (SSH → nvidia-smi, parsed by gpu.py) ----
     async def _ssh(self, remote_command: str, timeout: float = 20.0):
+        """SSH to the node. Native Windows OpenSSH by default, WSL on request.
+
+        Nothing about reaching a Spark needs the distro — going native keeps
+        telemetry, reachability and the serve probes alive through a wedged WSL,
+        which is exactly what failed on 2026-08-04. The WSL branch is retained
+        for boxes where only the distro holds key auth to the nodes.
+        """
+        if self.s.spark_ssh_native:
+            return await run_ssh(
+                self.cfg.ssh_user, self.cfg.host, remote_command,
+                timeout=timeout, settings=self.s,
+            )
         cmd = self.s.spark_ssh_cmd.format(
             user=self.cfg.ssh_user,
             host=self.cfg.host,

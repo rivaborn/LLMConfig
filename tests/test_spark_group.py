@@ -99,7 +99,11 @@ def calls(monkeypatch, state):
                                 "MemTotal: 126950000 kB\nMemAvailable: 100000000 kB\n", "")
         return CmdResult(0, "ok", "")
 
+    async def fake_run_ssh(user, host, command, *, timeout=20.0, settings=None):
+        return await fake_run_wsl(command, login=False, timeout=timeout, settings=settings)
+
     monkeypatch.setattr(spark_mod, "run_wsl", fake_run_wsl)
+    monkeypatch.setattr(spark_mod, "run_ssh", fake_run_ssh)
     return recorded
 
 

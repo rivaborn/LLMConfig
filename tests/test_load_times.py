@@ -186,7 +186,11 @@ async def test_spark_failed_launch_records_nothing(cfg, tmp_path, monkeypatch):
             return CmdResult(0, SMI_ROW, "")
         return CmdResult(0, "ok", "")   # run "succeeds" but the model never serves
 
+    async def fake_run_ssh(user, host, command, *, timeout=20.0, settings=None):
+        return await fake_run_wsl(command, login=False, timeout=timeout, settings=settings)
+
     monkeypatch.setattr(spark_mod, "run_wsl", fake_run_wsl)
+    monkeypatch.setattr(spark_mod, "run_ssh", fake_run_ssh)
     with respx.mock:
         for port in cfg.slot_ports:
             respx.get(f"http://{cfg.host}:{port}/v1/models").mock(

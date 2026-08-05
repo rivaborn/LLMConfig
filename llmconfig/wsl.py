@@ -31,15 +31,144 @@ def wsl_argv(command: str, settings: Settings, *, login: bool) -> list[str]:
     return ["wsl.exe", "-d", settings.wsl_distro, "-u", settings.wsl_user, "--", "bash", flag, command]
 
 
+class WslHealth:
+    """Is the `wsl.exe` EXEC path working? Breaker + escalation for when it isn't.
+
+    Two failures on 2026-08-04 motivated this, both invisible to the pre-existing
+    machinery because `WslRecovery` was only ever reachable from the BOOT gate
+    (`main.py` → `wait_ready(on_stall=...)`):
+
+    * **Nothing recovered a wedge that began at runtime.** The distro answered
+      `wsl --status` while every exec hung; Spark telemetry returned rc 124 per
+      lane and rendered `found=False` indefinitely. The ladder that fixes this
+      already existed and was never called.
+    * **Every caller paid the wedge separately.** One `/api/status` fans out to
+      four Spark lanes, so each poll spent 4 × 20 s and left 8 orphaned
+      `wsl.exe` behind — the failure got *worse* the more it was observed.
+
+    So: count consecutive exec timeouts, OPEN a breaker once they cross
+    `wsl_selfheal_after_failures`, and hand the wedge to `WslRecovery` in the
+    background. While open, callers get an immediate rc 124 instead of spawning
+    another doomed process. One trial is admitted every `wsl_breaker_retry_s`
+    (half-open) so the breaker can close itself even if recovery is disabled.
+
+    Only rc 124 counts. rc 127 (no `wsl.exe` at all — a dev box) must never open
+    the breaker or call recovery, and a non-zero rc from the *remote* command is
+    proof the exec path works, so it RESETS the count.
+    """
+
+    def __init__(self, settings: Settings | None = None):
+        self.s = settings or get_settings()
+        self.consecutive_timeouts = 0
+        self.opened_at: float | None = None
+        self.last_trial: float | None = None
+        self._on_wedged: "Callable[[int], Awaitable[object]] | None" = None
+        self._task: "asyncio.Task | None" = None
+
+    def register(self, on_wedged: "Callable[[int], Awaitable[object]]") -> None:
+        """Wire the escalation (normally `WslRecovery.attempt`).
+
+        Kept as a callback so this module owns *detection* and never *policy* —
+        the same split `wait_ready(on_stall=...)` already uses.
+        """
+        self._on_wedged = on_wedged
+
+    def _now(self) -> float:
+        try:
+            return asyncio.get_running_loop().time()
+        except RuntimeError:
+            return 0.0
+
+    @property
+    def wedged(self) -> bool:
+        return self.opened_at is not None
+
+    def allow(self) -> bool:
+        """False when the breaker is open and no trial is due."""
+        if not self.s.wsl_breaker_enabled or not self.wedged:
+            return True
+        now = self._now()
+        since = now - (self.last_trial if self.last_trial is not None else self.opened_at or now)
+        if since >= self.s.wsl_breaker_retry_s:
+            self.last_trial = now
+            return True
+        return False
+
+    def reason(self) -> str:
+        return (f"WSL exec wedged ({self.consecutive_timeouts} consecutive timeouts) — "
+                f"short-circuited without spawning wsl.exe")
+
+    def record(self, r: CmdResult) -> None:
+        if r.rc == 127:          # no wsl.exe on this box; nothing to recover
+            return
+        if r.rc != 124:          # the exec path answered — including a failed command
+            if self.wedged:
+                log.warning("WSL exec recovered — closing the breaker")
+            self.consecutive_timeouts = 0
+            self.opened_at = None
+            self.last_trial = None
+            return
+        self.consecutive_timeouts += 1
+        if self.consecutive_timeouts >= self.s.wsl_selfheal_after_failures and not self.wedged:
+            self.opened_at = self._now()
+            log.warning("WSL exec wedged after %d consecutive timeouts — breaker OPEN",
+                        self.consecutive_timeouts)
+        if self.wedged:
+            self._escalate()
+
+    def _escalate(self) -> None:
+        """Fire recovery in the BACKGROUND — callers must not wait on the ladder.
+
+        Telemetry runs on a 2.5 s poll; awaiting a ~3.5 min ladder here would
+        stall `/api/status`. `WslRecovery` guards its own re-entrancy and
+        cooldown, so re-scheduling is harmless.
+        """
+        if self._on_wedged is None or (self._task is not None and not self._task.done()):
+            return
+        try:
+            self._task = asyncio.create_task(self._on_wedged(self.consecutive_timeouts))
+        except RuntimeError:
+            pass   # no running loop (sync context) — nothing to schedule onto
+
+
+_health: "WslHealth | None" = None
+
+
+def health(settings: Settings | None = None) -> WslHealth:
+    global _health
+    if _health is None:
+        _health = WslHealth(settings)
+    return _health
+
+
+def reset_health() -> None:
+    """Drop the singleton (tests, and any re-configure of Settings)."""
+    global _health
+    _health = None
+
+
 async def run_wsl(
     command: str,
     *,
     login: bool = True,
     timeout: float = 30.0,
     settings: Settings | None = None,
+    bypass_breaker: bool = False,
 ) -> CmdResult:
+    """Run a command in the distro.
+
+    `bypass_breaker` is for callers whose whole job is to find out whether the
+    exec path works (`probe`, and therefore the recovery ladder's own re-probe).
+    Everything else goes through the breaker so a wedged distro costs one cheap
+    rc 124 instead of another abandoned `wsl.exe`.
+    """
     settings = settings or get_settings()
-    return await run_argv(wsl_argv(command, settings, login=login), timeout=timeout, env=_WSL_ENV)
+    tracker = health(settings)
+    if not bypass_breaker and not tracker.allow():
+        return CmdResult(124, "", tracker.reason())
+    r = await run_argv(wsl_argv(command, settings, login=login), timeout=timeout, env=_WSL_ENV)
+    tracker.record(r)
+    return r
 
 
 async def probe(*, settings: Settings | None = None, timeout: float | None = None) -> CmdResult:
@@ -55,6 +184,7 @@ async def probe(*, settings: Settings | None = None, timeout: float | None = Non
         "true", login=False,
         timeout=timeout if timeout is not None else settings.wsl_ready_probe_timeout_s,
         settings=settings,
+        bypass_breaker=True,   # the probe IS the breaker's way back; never short-circuit it
     )
 
 
