@@ -110,9 +110,10 @@ Ollama     vLLM        Ollama     vLLM          status    lifecycle
 :11434    relay :11437 :11435   relay :11438    HTTP      sparkrun
 Win svc   wsl.exe →    NSSM svc  wsl.exe →      :8000     via wsl.exe
           serve.sh               serve-comp.sh            └ telemetry:
-  └─────┬─────┘          └─────┬─────┘                      ssh nvidia-smi
- nvidia-smi by UUID     nvidia-smi by UUID                  + /proc/meminfo
- eviction-wait gate     eviction-wait gate                 (no gate needed)
+  └─────┬─────┘          └─────┬─────┘                      NATIVE ssh.exe
+ nvidia-smi by UUID     nvidia-smi by UUID                  nvidia-smi
+ eviction-wait gate     eviction-wait gate                  + /proc/meminfo
+                                                           (no WSL, no gate)
 ```
 
 - A **Lane** binds one Ollama+vLLM pair to **one GPU, matched by UUID** (indices are
@@ -128,6 +129,18 @@ Win svc   wsl.exe →    NSSM svc  wsl.exe →      :8000     via wsl.exe
   `sparkrun` CLI, and takes telemetry over SSH; **`status()` never awaits SSH**, because
   the UI polls it every 2.5 s and one powered-off node would otherwise add seconds to
   every call for every client.
+- Spark telemetry uses **native Windows OpenSSH, not WSL** (`ssh.py`). It is only
+  `ssh <node> nvidia-smi` and never needed the distro — it lived there because that is
+  where sparkrun's key is. On 2026-08-04 a wedged WSL exec path took all four VRAM
+  readouts to `found=false` for hours while every node was healthy and reachable.
+  A LOCAL misconfiguration (missing/untrusted key, no `ssh.exe`) falls back to the WSL
+  transport so telemetry degrades instead of going dark; a node that is merely offline
+  does **not** fall back, since it fails identically either way and retrying would pay
+  two timeouts on every poll. `sparkrun` lifecycle still goes through WSL.
+- The Spark **runtime image is pinned by digest** (`spark_image` → `sparkrun run
+  --image`). `eugr/spark-vllm:latest` and upstream's `prebuilt-*-current` release tags
+  all move on every nightly; on 2026-08-04 that cost ~14 min of mid-load pull and had
+  left the four nodes on four different digests. Pinned, image prep is 0.4 s.
 - The Orchestrator holds a **shared WSL keepalive** (`wsl.exe … sleep infinity`) so the
   distro — and any loaded vLLM model + relay — survives WSL2's idle-shutdown. Sparks
   need no keepalive: their workload lives on the node.
@@ -528,6 +541,7 @@ llmconfig/
     ollama.py       Ollama REST client + Windows service control
     vllm.py         vLLM relay status + serve.sh/systemctl lifecycle over wsl.exe
     spark.py        sparkrun over WSL + node HTTP status + remote nvidia-smi
+                    (telemetry via native ssh.py; image pinned by digest)
   gpu.py            nvidia-smi truth (by UUID) + Monitor metric sampling
   nvapi.py          NVAPI hotspot + GDDR6X junction temps (ctypes)
   monitor.py        telemetry sampler + SQLite history
@@ -535,7 +549,8 @@ llmconfig/
   registry.py       vLLM alias + Spark recipe catalogs (YAML)
   schemas.py        pydantic models
   jobs.py           async job manager (streamed logs)
-  wsl.py            wsl.exe bridge + WslKeepalive
+  wsl.py            wsl.exe bridge + WslKeepalive + WslHealth/WslRecovery
+  ssh.py            native OpenSSH transport for Spark nodes (no WSL)
   winsvc.py         Windows service control
   proc.py           subprocess wrapper
   doctor.py         read-only on-box recon

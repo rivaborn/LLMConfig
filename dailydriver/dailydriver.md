@@ -314,7 +314,7 @@ Final layout (cookbook state **`DF4_RAG Daily Driver`**):
 
 ```
 pair A   spark1+spark2   deepseek-v4-flash  tp=2 (MTP fork)
-         spark3          qwen35-122b_8_3_26
+         spark3          qwen35-122b_8_3_26   (named `qwen35-122b-int4-nightly` at the time)
          spark4          qwen3-vl-reranker-8b + qwen3-vl-embedding-8b  (84.6%)
 3090                     vl32  (pinned — reaper exempt)
 3070 Ti                  surya2 + qwen2.5-1.5b relay  (SlotLane, 97%)
@@ -327,3 +327,35 @@ DeepSeek-V4-Flash-0731 release** (`recipes/local/deepseek-v4-flash-0731.yaml`
 Layout, cookbook state, and every consumer unchanged — only the recipe behind
 the alias moved. Weights staged on all four nodes; preview weights cached
 until ~2026-08-07 as rollback.
+
+**2026-08-05 update — the runtime image is PINNED, and the layout has moved.**
+The block above is the 2026-07-30/31 record; the fleet today is:
+
+```
+pair A   spark1+spark2   deepseek-v4-flash    tp=2 (head .50 / worker .51)
+         spark3          qwen35-122b          tp=1  (release image `vllm-node`)
+         spark4          qwen35-122b_8_3_26   tp=1  (pinned `eugr/spark-vllm@sha256:1d335d4f…`)
+```
+
+Read a tp=2 pair correctly: **only the head serves HTTP.** spark2 answers on no
+port and that is not a fault — it is the worker of job `d56a59ad1db2`. Probing
+a worker's `/v1/models` and concluding "nothing is loaded" is the mistake this
+note exists to prevent.
+
+*Why the pin:* `eugr/spark-vllm:latest` is a moving tag, and so are upstream's
+`prebuilt-vllm-current` / `prebuilt-flashinfer-current` release tags — all
+advance on every nightly. On 2026-08-04 the tag had moved and a cold load spent
+**~14 minutes pulling 11 GB** before the engine started; a survey that evening
+found the four nodes holding **four different digests**, so nothing was
+reproducible. `settings.spark_image` now passes `sparkrun run --image <digest>`,
+which skips `build-and-copy.sh`'s pull entirely: image prep measured **14 min →
+0.4 s**, "Container image up-to-date on all 1 host(s)", zero bytes downloaded.
+The digest is the 2026-08-03 build (vLLM `0.26.1rc1.dev298+g1ea84d74b.d20260803`,
+FlashInfer `0.6.17-51920591-d20260803`), pre-pulled on all four nodes
+**serially** — they share one public IP, and three parallel pulls measured
+12 MB/s combined vs 57 MB/s alone (11m20s / 12m41s / 6m06s).
+
+*Renamed:* `local/qwen35-122b-int4-nightly.yaml` → `local/qwen35-122b_8_3_26.yaml`,
+serving as `qwen35-122b_8_3_26`. The old name described a moving target, which
+was the defect; the new one names the build it is pinned to. Bumping is now a
+deliberate act — procedure in the recipe header and `settings.spark_image`.

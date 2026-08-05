@@ -425,6 +425,30 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
     effective step (~16 stop-poll cycles, hence the timeout arg on
     `winsvc.restart_service`).
 
+    **2026-08-04 — the ladder was unreachable at runtime, which cost a second
+    outage.** `recovery.attempt` had exactly ONE call site: `main.py`'s
+    `wait_ready(on_stall=…)` boot gate. A distro that wedged *after* startup was
+    never detected, so all four Spark lanes rendered `found=false, 0 MB` for
+    hours while the fix sat one function call away. Three changes closed it:
+
+    - **`WslHealth` (wsl.py)** counts consecutive exec timeouts wherever they
+      occur and escalates to the ladder **in the background** (callers must never
+      await a ~3.5 min recovery). Only rc 124 counts — rc 127 is a dev box with no
+      `wsl.exe`, and a non-zero rc from the *remote* command proves the exec path
+      works, so it RESETS the count.
+    - **A breaker on the same tracker.** Each `/api/status` fanned out to four
+      Spark lanes, so observing the wedge made it worse: 4 × the exec timeout and
+      8 abandoned `wsl.exe` per poll. While open, callers get an immediate rc 124;
+      one trial is admitted per `wsl_breaker_retry_s`. `probe()` bypasses it,
+      being the breaker's way back.
+    - **`proc.run_argv` kills the process TREE** (`kill_tree`, `taskkill /T /F`).
+      `TerminateProcess` does not cascade and `wsl.exe` runs as a pair, so every
+      "clean reap" leaked the sibling — and per the ladder's own step 1 those
+      orphans are what hold a wedged distro open. Twenty had accumulated.
+
+    Verified after deploy: four `/api/status` calls left the `wsl.exe` count
+    unchanged at 4; it used to grow by 8 each time.
+
 18. **A multi-node (SparkGroup) load holds EVERY member's lock, acquired in
     `orch.units` order, bounded, all-or-nothing** — the one global order is what
     keeps overlapping group loads (spark1+spark2 vs spark2+spark3) queueing
