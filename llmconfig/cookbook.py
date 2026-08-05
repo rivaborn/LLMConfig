@@ -551,6 +551,41 @@ class Cookbook:
 
         return self.jobs.start(meta, body)
 
+    async def _wait_unloaded(self, meta: Job, unit: "Unit", models: list[str]) -> None:
+        """Poll until `models` are really gone from this unit's residency.
+
+        The Spark counterpart of the GPU lanes' `_wait_vram_free`. Residency is
+        the right thing to watch rather than the port or the budget separately:
+        both of the observed failures are downstream of a workload the node still
+        considers present, and `status()` reads that from the node itself.
+
+        Bounded by `evict_timeout_s` and NON-FATAL on timeout: the load that
+        follows has its own admission check and will fail with a far better
+        message than anything invented here. Losing the wait must not be worse
+        than never having had it.
+        """
+        loop = asyncio.get_running_loop()
+        end = loop.time() + self.s.evict_timeout_s
+        want_gone = set(models)
+        while True:
+            try:
+                st = await unit.status()
+                still = {self._canonical(unit, m.server, m.model)
+                         for m in st.loaded_models} & want_gone
+            except Exception as e:  # noqa: BLE001 — a probe blip must not fail the apply
+                self.jobs.log(meta, f"{unit.cfg.id}: residency probe failed ({e}); continuing")
+                return
+            if not still:
+                return
+            if loop.time() >= end:
+                self.jobs.log(
+                    meta,
+                    f"{unit.cfg.id}: {', '.join(sorted(still))} still resident after "
+                    f"{self.s.evict_timeout_s:.0f}s — loading anyway; the load's own "
+                    f"admission check reports the real state")
+                return
+            await asyncio.sleep(self.s.poll_interval_s)
+
     async def _apply_unit(self, meta: Job, unit: "Unit", targets: list[dict],
                           result: dict) -> None:
         uid = unit.cfg.id
@@ -569,6 +604,7 @@ class Cookbook:
             for m in want if m not in resident)
         extras = [m for m in resident if m not in want]
         missing = [m for m in want if m not in resident]
+        freed: list[str] = []
         if needs_rebuild and resident:
             self.jobs.log(meta, f"{uid}: a target needs an empty node — full rebuild")
             extras = list(resident)
@@ -590,6 +626,23 @@ class Cookbook:
             self.jobs.log(meta, f"{uid}: unloading {m}…")
             await unit.unload(UnloadRequest(server=None, lane=uid, model=m))
             result["unloaded"].append({"unit": uid, "model": m})
+            freed.append(m)
+
+        # ---- confirm the unloads SETTLED before loading onto the same node ----
+        # `unload()` returning is not the node having released anything. On
+        # 2026-08-05 a DF4_RAG apply unloaded a 122B off spark4 and immediately
+        # launched the pooling pair into the gap; both failed, from the two sides
+        # of the same race:
+        #   reranker: OSError [Errno 98] Address already in use  (port still bound)
+        #   embedder: "0.80/0.95 is already committed to qwen35-122b_8_3_26"
+        #             (admission still counting the departing model)
+        # Both succeeded on retry with no other change — the node simply needed a
+        # moment. GPU lanes never hit this because `_wait_vram_free` already
+        # applies the rule: verify by OBSERVING, don't trust the call's return.
+        # Sparks had no equivalent, so a cookbook apply that swaps models on one
+        # node was relying on a retry to paper over it.
+        if freed:
+            await self._wait_unloaded(meta, unit, freed)
 
         # ---- loads: needs_empty_node first, then biggest budget first ----
         for m in sorted(missing, key=lambda m: boot_order_key(target_entries.get(m))):
