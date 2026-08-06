@@ -93,9 +93,12 @@
 #     `docker pull` process at all). Keep `SPARK_IMAGE` empty in `.env` — a
 #     global `--image` override clobbers this and lands the model on the wrong
 #     runtime, which is exactly how DS4 died in warmup on 2026-08-05.
-#   - Weights STAGED on all four nodes 2026-08-06 via dgx_sparks/stage-model.sh
-#     (downloaded once per fabric pair, fanned out intra-pair over 200G).
-#     The container image is pre-pulled on all four for the same reason.
+#   - Weights staged 2026-08-06 via dgx_sparks/stage-model.sh: downloaded ONCE
+#     to spark1 (the site uplink is ~100 Mbit aggregate — measured 11.7 MB/s,
+#     and --max-workers cannot beat it), then fanned out over LAN, where even
+#     the 1GbE management hop runs at 105 MB/s and the 200G intra-pair hop at
+#     585 MB/s. The container image is pre-pulled on all four for the same
+#     "never pay it at launch time" reason.
 #   - Serving `glm-5.2` at 262144 obliges an `opencode.json` re-sync in
 #     rivaborn/opencode-config (`limit.context + limit.output == 262144`).
 #     Model ids match by exact string — a renamed `served_model_name` is a

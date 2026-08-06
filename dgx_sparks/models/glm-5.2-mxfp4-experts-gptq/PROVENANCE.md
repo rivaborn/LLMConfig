@@ -92,11 +92,31 @@ pair <-> pair                 NO PATH — management 1GbE only
 
 Both 200G subnets (`192.168.0.x`, `192.168.2.x`) carry all four node addresses
 and look mutually reachable; they are **dual-rail within a pair**, not
-cross-pair links. So the stage downloads **once per pair** from HuggingFace
-(spark1 and spark3 in parallel) and fans out **intra-pair over 200G**
-(spark1→spark2, spark3→spark4), which avoids ever pushing 383 GiB across the
-1GbE management link and halves the internet transfer versus four independent
-downloads.
+cross-pair links.
+
+The route is then decided by measurement, not by the topology diagram:
+
+| Hop | Measured 2026-08-06 |
+| --- | ------------------- |
+| HuggingFace → a node | ~6 MB/s per node, **~11.7 MB/s aggregate** (a shared ~100 Mbit uplink) |
+| spark1 → spark2, 200G intra-pair | **585 MB/s** (ssh cipher-bound — a floor) |
+| spark1 → spark3, 1GbE management | **105 MB/s** (line rate) |
+
+`--max-workers 8` genuinely opens 8 files over ~60 connections and still cannot
+exceed the uplink, so concurrency buys nothing against the WAN.
+
+The consequence is counter-intuitive and worth stating plainly: **the 1GbE
+management hop is ~9× faster than the entire internet uplink.** The design that
+avoids it — download once per fabric pair — would pull 2 × 383.7 GiB over a
+100 Mbit line (~19.4 h). Downloading **once** and fanning out over LAN costs
+~9.8 h of WAN plus ~1.3 h of copying. So:
+
+```
+HF ──► spark1 ──200G──► spark2
+         └────1GbE────► spark3 ──200G──► spark4
+```
+
+Pull from the internet exactly once; move it over any LAN link after that.
 
 The pinned container image is pre-pulled on all four nodes by the same script —
 it was absent everywhere at staging time, and an unpulled image has previously

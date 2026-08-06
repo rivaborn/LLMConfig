@@ -3,112 +3,134 @@
 # container image the recipe pins — so a launch is engine start only.
 #
 # RUN FROM .40's WSL:
-#   bash /mnt/c/Coding/rivaborn/LLMConfig/dgx_sparks/stage-model.sh <repo> <revision> [image]
+#   stage-model.sh download <repo> <revision>          # phase 1, ~hours
+#   stage-model.sh fanout   <repo>                     # phase 2, ~1.3 h
+#   stage-model.sh image    <image@sha256:...>         # phase 3, minutes
+#   stage-model.sh verify   <repo>
 #
-# WHY THIS SHAPE — the fabric dictates it (re-verified 2026-08-06 by ping matrix):
+# Phases are separate because phase 1 runs for hours: it is launched DETACHED on
+# the node (setsid + pidfile) so it survives WSL idle-shutdown — WSL2 tears the
+# distro down seconds after the last wsl.exe exits, which would otherwise kill
+# the job (CLAUDE.md invariant 4).
 #
+# ── TOPOLOGY AND WHY THIS DOWNLOADS ONCE, NOT ONCE PER PAIR ──────────────────
+#
+# Fabric (re-verified by ping matrix 2026-08-06):
 #     spark1(.50) <-> spark2(.51)   200G, on BOTH fabric subnets
 #     spark3(.52) <-> spark4(.53)   200G, on BOTH fabric subnets
 #     pair  <->  pair               NO PATH — 1GbE management only
+# Both 200G subnets (192.168.0.x / 192.168.2.x) carry all four node addresses
+# and look mutually reachable. They are dual-rail WITHIN a pair.
 #
-#   Both 200G subnets (192.168.0.x / 192.168.2.x) carry all four node addresses
-#   and look mutually reachable. They are dual-rail WITHIN a pair. Do not
-#   "optimise" this into a single download plus a fan-out to all three peers:
-#   two of those hops would silently fall back to the 1GbE management link.
+# MEASURED 2026-08-06 (this is what decides the shape):
+#     HuggingFace WAN   ~6 MB/s per node, ~11.7 MB/s AGGREGATE — a shared
+#                       ~100 Mbit uplink. --max-workers 8 genuinely opens 8
+#                       files / ~60 connections and still does not exceed it,
+#                       so concurrency cannot buy anything here.
+#     200G intra-pair   585 MB/s   (ssh cipher-bound; a floor, not a ceiling)
+#     1GbE cross-pair   105 MB/s   (line rate)
 #
-#   So: download ONCE PER PAIR from HF (both pair heads in parallel), then fan
-#   out INTRA-PAIR over 200G. Half the internet transfer of four independent
-#   downloads, and no 383 GiB ever crosses 1GbE.
+# So the 1GbE management hop — the link the "obvious" design avoids — is ~9x
+# faster than the ENTIRE internet uplink. Downloading once per pair would pull
+# 2 x 383.7 GiB over a 100 Mbit line (~19.4 h). Downloading once and fanning out
+# over LAN costs ~9.8 h + ~1.3 h. Halve the WAN transfer, halve the wall clock.
 #
-# Idempotent and resumable: `hf download` skips complete blobs, and the
-# intra-pair copy is rsync. Re-run it after an interruption.
+#   RULE: pull from the internet exactly ONCE, then move it over ANY LAN link.
+#   Do not "optimise" this back into per-pair downloads to avoid the 1GbE hop.
+#
 set -uo pipefail
 
-REPO="${1:?usage: stage-model.sh <hf-repo> <revision> [container-image]}"
-REV="${2:?missing revision — always stage a pinned revision, never a moving branch}"
-IMAGE="${3:-}"
-
-SSH="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+PHASE="${1:?usage: stage-model.sh {download|fanout|image|verify} ...}"
+SEED="192.168.1.50"                       # the one node that talks to HF
+FAST_PEER="192.168.0.51"                  # spark2 over 200G  (from spark1)
+CROSS="192.168.1.52"                      # spark3 over 1GbE mgmt (from spark1)
+CROSS_FAST_PEER="192.168.0.53"            # spark4 over 200G  (from spark3)
+ALL=("192.168.1.50" "192.168.1.51" "192.168.1.52" "192.168.1.53")
 USER_SP="fksogbetun"
-# pair head -> peer, and the peer's address ON THE 200G FABRIC (not management)
-PAIR_HEADS=("192.168.1.50" "192.168.1.52")
-declare -A PEER_MGMT=( ["192.168.1.50"]="192.168.1.51" ["192.168.1.52"]="192.168.1.53" )
-declare -A PEER_FAST=( ["192.168.1.50"]="192.168.0.51" ["192.168.1.52"]="192.168.0.53" )
-
 CACHE="/home/${USER_SP}/.cache/huggingface"
-SNAP_DIR="models--${REPO//\//--}"
+
+# -n is load-bearing, not tidiness: without it ssh reads its own stdin, and when
+# this script is piped in (`wsl -- bash -s < stage-model.sh`) the FIRST ssh
+# swallows the remainder of the script. The symptom is a run that silently does
+# only its first step and exits 0. Calls that deliberately feed a heredoc drop
+# -n and supply stdin explicitly.
+SSH="ssh -n -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
+SSH_IN="ssh -o BatchMode=yes -o ConnectTimeout=10 -o StrictHostKeyChecking=accept-new"
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 
-# --- 0. preflight -----------------------------------------------------------
-log "staging $REPO @ $REV"
-for h in "${PAIR_HEADS[@]}" "${PEER_MGMT[@]}"; do
-  if ! $SSH "${USER_SP}@${h}" true 2>/dev/null; then
-    log "FATAL: cannot ssh to $h"; exit 1
-  fi
-done
-log "all four nodes reachable"
+case "$PHASE" in
 
-# --- 1. download once per pair head, in parallel ----------------------------
-# uvx keeps huggingface_hub ephemeral — nothing permanent is installed on the
-# nodes.
-#
-# HF_HUB_DISABLE_XET=1 on purpose. This repo IS Xet-backed and current
-# huggingface_hub nags to enable HF_XET_HIGH_PERFORMANCE, but Xet transfers have
-# HUNG on this network before, and a hang costs more than the speedup is worth
-# on a multi-hundred-GiB stage. (HF_HUB_ENABLE_HF_TRANSFER is deliberately NOT
-# set: it is a deprecated no-op in this version and only produces a warning.)
-#
-# Throughput comes from --max-workers, i.e. parallel FILES, not parallel chunks
-# per file: measured 2026-08-06, a single 4.78 GiB file pulls at only ~4.6 MB/s,
-# so per-connection rate is the limit and concurrency is what recovers it. This
-# checkpoint's per-layer layout (75 files ~4.8 GiB each) suits that well.
-dl_pids=()
-for head in "${PAIR_HEADS[@]}"; do
-  log "download -> $head (background; progress: tail /tmp/stage-*.log on that node)"
-  $SSH "${USER_SP}@${head}" \
-    "export PATH=\$HOME/.local/bin:\$PATH HF_HOME=$CACHE HF_HUB_DISABLE_XET=1; \
-     uvx --quiet --from 'huggingface_hub[cli]' hf download '$REPO' --revision '$REV' \
-       --max-workers 8 > /tmp/stage-${REPO//\//_}.log 2>&1" &
-  dl_pids+=($!)
-done
-rc=0
-for p in "${dl_pids[@]}"; do wait "$p" || rc=1; done
-if [ "$rc" -ne 0 ]; then
-  log "WARNING: at least one download returned non-zero — check /tmp/stage-*.log on the heads"
+download)
+  REPO="${2:?repo}"; REV="${3:?revision — always pin, never a moving branch}"
+  DIR="$CACHE/hub/models--${REPO//\//--}"
+  # HF_HUB_DISABLE_XET=1 on purpose: this repo IS Xet-backed and huggingface_hub
+  # nags for HF_XET_HIGH_PERFORMANCE, but Xet transfers have HUNG on this
+  # network and a hang costs more than the speedup on a multi-hundred-GiB pull.
+  # HF_HUB_ENABLE_HF_TRANSFER is deliberately unset — a deprecated no-op that
+  # only emits a warning.
+  #
+  # The guard is a PIDFILE, not pgrep: this launcher's own command line contains
+  # "hf download", so every pgrep pattern that matches the job also matches the
+  # shell starting it. That false positive reported "already running" on a node
+  # where nothing was, and skipped the launch entirely (2026-08-06).
+  $SSH_IN "${USER_SP}@${SEED}" "bash -s" <<REMOTE
+set -u
+PIDF=/tmp/stage-\$(echo '$REPO' | tr / _).pid
+LOG=/tmp/stage-\$(echo '$REPO' | tr / _).log
+if [ -f "\$PIDF" ] && kill -0 "\$(cat \$PIDF)" 2>/dev/null; then
+  echo "already running (pid \$(cat \$PIDF))"; exit 0
 fi
-log "pair-head downloads finished (rc=$rc)"
+export PATH=\$HOME/.local/bin:\$PATH HF_HOME=$CACHE HF_HUB_DISABLE_XET=1
+setsid nohup uvx --quiet --from 'huggingface_hub[cli]' \
+  hf download '$REPO' --revision '$REV' --max-workers 8 > "\$LOG" 2>&1 < /dev/null &
+echo \$! > "\$PIDF"
+sleep 5
+kill -0 "\$(cat \$PIDF)" 2>/dev/null && echo "launched pid \$(cat \$PIDF), log \$LOG" \
+  || { echo "FAILED TO START:"; tail -5 "\$LOG"; exit 1; }
+REMOTE
+  log "poll with: stage-model.sh verify $REPO"
+  ;;
 
-# --- 2. fan out intra-pair over the 200G link -------------------------------
-for head in "${PAIR_HEADS[@]}"; do
-  peer_fast="${PEER_FAST[$head]}"
-  log "fan out $head -> $peer_fast (200G)"
-  # -H preserves the hardlink structure of the HF cache (blobs/ <- snapshots/);
-  # without it the copy silently doubles on-disk size.
-  $SSH "${USER_SP}@${head}" \
-    "rsync -aH --info=progress2 --partial \
-       -e 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new' \
-       '$CACHE/hub/$SNAP_DIR' '${USER_SP}@${peer_fast}:$CACHE/hub/'" \
-    2>&1 | tail -2
-done
+fanout)
+  REPO="${2:?repo}"
+  SNAP="models--${REPO//\//--}"
+  # -H preserves the HF cache's hardlinks (snapshots/ -> blobs/). Without it the
+  # copy silently doubles on-disk size.
+  RS="rsync -aH --partial --info=progress2 -e 'ssh -o BatchMode=yes -o StrictHostKeyChecking=accept-new'"
+  log "spark1 -> spark2 (200G) and spark1 -> spark3 (1GbE) in parallel"
+  $SSH "${USER_SP}@${SEED}" "$RS '$CACHE/hub/$SNAP' '${USER_SP}@${FAST_PEER}:$CACHE/hub/'" 2>&1 | tail -2 &
+  p1=$!
+  $SSH "${USER_SP}@${SEED}" "$RS '$CACHE/hub/$SNAP' '${USER_SP}@${CROSS}:$CACHE/hub/'" 2>&1 | tail -2 &
+  p2=$!
+  wait $p1; wait $p2
+  log "spark3 -> spark4 (200G)"
+  $SSH "${USER_SP}@${CROSS}" "$RS '$CACHE/hub/$SNAP' '${USER_SP}@${CROSS_FAST_PEER}:$CACHE/hub/'" 2>&1 | tail -2
+  log "fanout done"
+  ;;
 
-# --- 3. pre-pull the container image on all four ----------------------------
-if [ -n "$IMAGE" ]; then
-  for h in "${PAIR_HEADS[@]}" "${PEER_MGMT[@]}"; do
+image)
+  IMAGE="${2:?image ref, pin by @sha256: digest}"
+  for h in "${ALL[@]}"; do
     log "docker pull on $h"
     $SSH "${USER_SP}@${h}" "docker pull '$IMAGE'" 2>&1 | tail -1
   done
-fi
+  ;;
 
-# --- 4. verify --------------------------------------------------------------
-log "verification"
-printf '%-16s %10s %8s %10s\n' NODE SIZE FILES INCOMPLETE
-for h in "${PAIR_HEADS[@]}" "${PEER_MGMT[@]}"; do
-  read -r sz files incomplete < <($SSH "${USER_SP}@${h}" \
-    "d=$CACHE/hub/$SNAP_DIR; \
-     s=\$(du -sh \$d 2>/dev/null | cut -f1); \
-     f=\$(find \$d -type f 2>/dev/null | wc -l); \
-     i=\$(find \$d -name '*.incomplete' 2>/dev/null | wc -l); \
-     echo \"\${s:-MISSING} \${f:-0} \${i:-0}\"")
-  printf '%-16s %10s %8s %10s\n' "$h" "$sz" "$files" "$incomplete"
-done
-log "done — compare against dgx_sparks/models/<model>/file-inventory.tsv"
+verify)
+  REPO="${2:?repo}"
+  DIR="$CACHE/hub/models--${REPO//\//--}"
+  printf '%-16s %10s %8s %12s %s\n' NODE SIZE FILES INCOMPLETE RUNNING
+  for h in "${ALL[@]}"; do
+    out=$($SSH "${USER_SP}@${h}" \
+      "s=\$(du -sh $DIR 2>/dev/null | cut -f1); \
+       f=\$(find $DIR -type f 2>/dev/null | wc -l); \
+       i=\$(find $DIR -name '*.incomplete' 2>/dev/null | wc -l); \
+       r=\$(ps -eo args | grep -c 'huggingface_hub' ); \
+       echo \"\${s:-MISSING} \${f:-0} \${i:-0} \$r\"")
+    printf '%-16s %10s %8s %12s %s\n' "$h" $out
+  done
+  echo "compare against dgx_sparks/models/<model>/file-inventory.tsv (183 files, 383.72 GiB)"
+  ;;
+
+*) echo "unknown phase '$PHASE'"; exit 2;;
+esac
