@@ -1,0 +1,101 @@
+# Recipe: Chandra-2 OCR VLM on a DGX Spark (single node, tp=1)
+#
+# Sibling of surya-ocr-2-spark.yaml — same publisher (datalab-to), same
+# architecture family (`Qwen3_5ForConditionalGeneration`, model_type qwen3_5),
+# same document-OCR job, but ~7.6x the weights: 9.88 GiB vs 1.30 GiB. Chandra
+# is the heavier/more capable of the pair; surya is the fast one.
+#
+# NOT a fork of an existing local config: chandra has never run anywhere in
+# this lab (the companion lane serves surya only). This recipe is therefore
+# surya-ocr-2-spark.yaml's proven flag set, scaled for the larger model, plus
+# what the chandra model card specifies. Everything that is a GUESS is called
+# out below rather than presented as tuned.
+#
+# FROM THE MODEL CARD
+#   - "With vLLM (recommended)". The package ships a `chandra_vllm` launcher
+#     whose exact flags are NOT published on the card; this recipe does not try
+#     to reproduce them. If chandra_vllm turns out to set something material
+#     (a chat template, a processor kwarg), that is the first place to look
+#     when output quality disappoints.
+#   - Benchmarked on ONE H100 80GB at **96 concurrent sequences**, ~1.44
+#     pages/s on a deliberately hard set, ~2 pages/s estimated real-world.
+#     max_num_seqs 32 here is a deliberate step DOWN from 96: a GB10's memory
+#     bandwidth is far below an H100's, so 96 in-flight pages would queue in
+#     the engine rather than add throughput, and the KV pool for 96 x 16k does
+#     not sit inside a co-resident budget. Raise it after measuring, not before.
+#   - Client calls with `prompt_type="ocr_layout"`, i.e. ordinary /v1 chat
+#     completions with an image — no server-side special casing needed.
+#
+# CARRIED FROM THE PROVEN SURYA CONFIG (same reasoning, see that file)
+#   --limit-mm-per-prompt   one image, video explicitly 0 (the qwen3_5 video
+#                           profile at startup has OOM'd this fleet before).
+#   --mm-processor-kwargs   same pixel bounds; both models read document pages
+#                           and surya's card caps useful width at 2048px.
+#   KV stays bf16           no --kv-cache-dtype fp8. Chandra's card does not
+#                           document a confidence field the way surya's does,
+#                           so this is CONSERVATISM, not a known requirement:
+#                           these two run side by side for the same pipeline
+#                           and should not disagree about logprob fidelity
+#                           until someone measures that it is safe.
+#   --enforce-eager         as with surya, first thing to try removing once
+#                           verified.
+#
+# SIZING
+#   gpu_memory_utilization 0.22 of ~121 GB is ~26.6 GiB for 9.88 GiB of
+#   weights plus a 32x16384 KV pool plus the multimodal profile. Deliberately
+#   small enough to stay a CO-TENANT (invariant 14) rather than a node
+#   monopoliser — chandra + surya together should still leave most of a node
+#   free for a text model.
+#
+# Weights: 9.88 GiB, 17 files, revision pinned below. Staged on all four nodes
+# 2026-08-06 (dgx_sparks/stage-model.sh).
+#
+# STATUS: unverified, and less proven than its surya sibling — that one at
+# least inherits a config that has served real pages on the 3070 Ti; this one
+# has never launched anywhere. Do not promote it in the README table until a
+# real page has been OCR'd through it.
+#
+# container: RELEASE image (local tag, nothing to pull). Verified 2026-08-06 to
+# register Qwen3_5ForConditionalGeneration (vllm 0.23.1rc1.dev1453+g16b2da4c9).
+container: vllm-node
+
+metadata:
+  description: Chandra-2 document OCR VLM (the heavier datalab-to OCR model), single GB10 node
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.22
+  max_model_len: 16384
+  max_num_seqs: 32
+  max_num_batched_tokens: 16384
+  served_model_name: chandra-ocr-2
+  target_model: datalab-to/chandra-ocr-2
+  target_revision: af93b47dba1b47b6640c86ccf487ed2260ab9a09
+
+# Single-brace, literal JSON — see the note in surya-ocr-2-spark.yaml and
+# ../README.md ("Why the local forks exist"). These two are not catalog-tunable.
+command: |
+  exec vllm serve {target_model} \
+      --revision {target_revision} \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --dtype bfloat16 \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enforce-eager \
+      --mm-processor-kwargs '{"min_pixels":3136,"max_pixels":5419008}' \
+      --limit-mm-per-prompt '{"image":1,"video":0}' \
+      --enable-prefix-caching
+
+recipe_version: '1'
+name: chandra-ocr-2-spark
+model: datalab-to/chandra-ocr-2
+model_revision: af93b47dba1b47b6640c86ccf487ed2260ab9a09
+cluster_only: false
+solo_only: false

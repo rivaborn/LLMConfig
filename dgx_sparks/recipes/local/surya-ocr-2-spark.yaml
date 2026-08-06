@@ -1,0 +1,115 @@
+# Recipe: Surya-2 OCR VLM on a DGX Spark (single node, tp=1)
+#
+# The Spark sibling of the PROVEN companion-lane config in
+# deploy/serve-companion.sh (`surya2` case, fitted 2026-07-31 into ~4.5 GiB on
+# the 3070 Ti). Same model, same flags, retuned for a 121 GB GB10 node — the
+# companion build is space-constrained and single-stream; this one is meant to
+# be a THROUGHPUT OCR service on the capacity tier.
+#
+# WHAT CARRIES OVER UNCHANGED, AND WHY (do not "simplify" these away)
+#   --mm-processor-kwargs   pixel bounds are REQUIRED by epubocr's client path.
+#   --limit-mm-per-prompt   one image per prompt; video explicitly 0 — the
+#                           qwen3_5 family runs a video profile at startup
+#                           otherwise, which has OOM'd this fleet before
+#                           (the `gemma4` failure).
+#   KV stays bf16           NO --kv-cache-dtype fp8. Surya's per-block
+#                           `confidence` is the MEAN PER-TOKEN PROBABILITY of
+#                           the decode (model card, "Output format"), and
+#                           epubocr thresholds on it. fp8 KV nudges those
+#                           logprobs, so the quantisation that is free
+#                           elsewhere is not free here.
+#   --enforce-eager         inherited from the proven config. On this node it
+#                           is no longer a memory decision, so it IS the first
+#                           thing to try removing once the recipe is verified —
+#                           CUDA graphs should help decode throughput. Left on
+#                           because graph capture on sm_121a has broken other
+#                           models on this fleet (qwen35-122b marlin
+#                           atomic-add), and an unverified recipe should not
+#                           also be an untested capture path.
+#
+# WHAT CHANGED FOR THE SPARK, AND WHY
+#   max_model_len 12288 -> 16384
+#       The companion sized 12288 around max_pixels 2359296 (~2.3k vision
+#       tokens). This recipe raises max_pixels (below), so the window has to
+#       cover the larger image plus prompt plus surya's ~2,400-output-tokens
+#       -per-page average (model card, throughput section).
+#   max_pixels 2359296 -> 5419008
+#       The card's troubleshooting says to keep page width at or below 2048px;
+#       5419008 is 2048x2646, i.e. a full letter page at that width. The
+#       companion capped lower purely to fit 8 GB.
+#   max_num_seqs / max_num_batched_tokens
+#       The card is explicit that throughput is governed by these ("raise
+#       --max-num-seqs / --max-num-batched-tokens to keep more pages in
+#       flight"), and the client defaults to SURYA_INFERENCE_PARALLEL=8. 32
+#       concurrent pages with a 16384-token batch is a starting point sized to
+#       comfortably absorb the default client concurrency, not a measured
+#       optimum.
+#   gpu_memory_utilization 0.54 -> 0.12
+#       0.54 was 8 GB arithmetic. 0.12 of ~121 GB is ~14.5 GiB for 1.3 GiB of
+#       weights plus KV plus the multimodal profile — deliberately small so
+#       this can sit BESIDE other models (invariant 14: a Spark admits by
+#       summed mem_fraction, and an OCR runner monopolising a node is exactly
+#       the waste that budgeting exists to prevent).
+#
+# NOTE: surya sets SURYA_GUIDED_LAYOUT=true by default, so the layout pass uses
+# JSON-schema-constrained decoding. That is a client-side request parameter and
+# needs no server flag, but it does mean a structured-output backend must be
+# working in this image — worth confirming on the first real layout call, not
+# just an OCR call.
+#
+# Weights: 1.30 GiB, 42 files, revision pinned below. Staged on all four nodes
+# 2026-08-06 (dgx_sparks/stage-model.sh).
+#
+# STATUS: unverified — written from the proven companion config plus the model
+# card; never launched on a Spark. Do not promote it in the README table until
+# a real page has been OCR'd through it.
+#
+# container: the RELEASE image, a purely LOCAL tag with no registry behind it,
+# so a cold load pulls nothing (the qwen35-122b lesson — the nightly tag cost
+# ~7 min of image refresh on every cold load). Verified 2026-08-06 to register
+# Qwen3_5ForConditionalGeneration (vllm 0.23.1rc1.dev1453+g16b2da4c9).
+container: vllm-node
+
+metadata:
+  description: Surya-2 document OCR VLM (layout / OCR / table recognition), throughput-tuned for a GB10 node
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.12
+  max_model_len: 16384
+  max_num_seqs: 32
+  max_num_batched_tokens: 16384
+  served_model_name: surya-ocr-2
+  target_model: datalab-to/surya-ocr-2
+  target_revision: 3b3d4cdf88d6928b0acdc75181b13206ea67c4a3
+
+# JSON arguments are written with SINGLE braces and LITERAL values on purpose:
+# sparkrun renders with vpd arg_substitute, not str.format, so `{{...}}` is two
+# literal braces AND swallows any placeholder inside it (see ../README.md, "Why
+# the local forks exist"). The cost is that these two values are no longer
+# tunable from the catalog — change them here.
+command: |
+  exec vllm serve {target_model} \
+      --revision {target_revision} \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --tensor-parallel-size {tensor_parallel} \
+      --dtype bfloat16 \
+      --max-model-len {max_model_len} \
+      --max-num-seqs {max_num_seqs} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --enforce-eager \
+      --mm-processor-kwargs '{"min_pixels":3136,"max_pixels":5419008}' \
+      --limit-mm-per-prompt '{"image":1,"video":0}' \
+      --enable-prefix-caching
+
+recipe_version: '1'
+name: surya-ocr-2-spark
+model: datalab-to/surya-ocr-2
+model_revision: 3b3d4cdf88d6928b0acdc75181b13206ea67c4a3
+cluster_only: false
+solo_only: false
