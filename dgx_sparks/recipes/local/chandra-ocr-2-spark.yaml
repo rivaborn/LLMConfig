@@ -55,9 +55,13 @@
 # has never launched anywhere. Do not promote it in the README table until a
 # real page has been OCR'd through it.
 #
-# container: RELEASE image (local tag, nothing to pull). Verified 2026-08-06 to
-# register Qwen3_5ForConditionalGeneration (vllm 0.23.1rc1.dev1453+g16b2da4c9).
-container: vllm-node
+# CONTAINER — pinned BY DIGEST; see the fuller note in surya-ocr-2-spark.yaml.
+# Same image as the local `vllm-node` tag (id b3eef044419a, built 2026-07-24,
+# identical on all four nodes), verified 2026-08-06 to register
+# Qwen3_5ForConditionalGeneration — vllm 0.23.1rc1.dev1453+g16b2da4c9.
+# Pre-pulled on all four during staging so the digest resolves locally and a
+# cold load still touches nothing.
+container: eugr/spark-vllm@sha256:4cfcfa3b79d22759dd27e53da164019199ee0b94bf90c1c849a803ceeb76fdaa
 
 metadata:
   description: Chandra-2 document OCR VLM (the heavier datalab-to OCR model), single GB10 node

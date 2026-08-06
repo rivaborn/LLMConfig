@@ -64,11 +64,30 @@
 # card; never launched on a Spark. Do not promote it in the README table until
 # a real page has been OCR'd through it.
 #
-# container: the RELEASE image, a purely LOCAL tag with no registry behind it,
-# so a cold load pulls nothing (the qwen35-122b lesson — the nightly tag cost
-# ~7 min of image refresh on every cold load). Verified 2026-08-06 to register
-# Qwen3_5ForConditionalGeneration (vllm 0.23.1rc1.dev1453+g16b2da4c9).
-container: vllm-node
+# CONTAINER — pinned BY DIGEST rather than named `vllm-node`.
+#
+# Both refer to the SAME image: `vllm-node:latest` is a local retag of this
+# digest, image id b3eef044419a, built 2026-07-24, byte-identical on all four
+# nodes (verified 2026-08-06). Verified the same day to register
+# Qwen3_5ForConditionalGeneration — vllm 0.23.1rc1.dev1453+g16b2da4c9.
+#
+# The trade, stated plainly because it cuts both ways:
+#   `vllm-node`   unqualified LOCAL tag. Nothing can pull it (it would resolve
+#                 to docker.io/library/vllm-node, which is not ours), so a cold
+#                 load never touches the network — but it is also not pinned to
+#                 anything. A local rebuild on one node would silently diverge
+#                 the fleet and no recipe would notice.
+#   this digest   immutable and self-describing: the recipe names exactly which
+#                 build it was verified against, and drift becomes impossible
+#                 rather than merely unlikely.
+#
+# The cost of the digest form is that only spark1 had this RepoDigest recorded
+# (the other three were retagged from a local copy and had none), so they would
+# have resolved it with a registry round-trip on first launch. That is why the
+# digest is PRE-PULLED on all four as part of staging — the layers were already
+# present, so it costs metadata only, and afterwards the reference resolves
+# locally exactly like the bare tag did.
+container: eugr/spark-vllm@sha256:4cfcfa3b79d22759dd27e53da164019199ee0b94bf90c1c849a803ceeb76fdaa
 
 metadata:
   description: Surya-2 document OCR VLM (layout / OCR / table recognition), throughput-tuned for a GB10 node
