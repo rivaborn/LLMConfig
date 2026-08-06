@@ -76,6 +76,39 @@ env:
 # A short prompt hides it completely — "Say OK" and a single tool call both
 # passed validation on 2026-07-31. It takes a few hundred tokens to show.
 #
+# 2026-08-04 -- TWO further faults found here, both fixed in this file. Measured
+# against the live gateway; neither is the 2026-08-02 fault above.
+#
+#   1. reasoning_effort=high made the model NEVER EMIT CONTENT. With
+#      --default-chat-template-kwargs.reasoning_effort=high this build spends the whole
+#      budget in the reasoning channel: a ONE-LINE question returned
+#      finish_reason=length with empty content at max_tokens 2048 / 4000 / 8192
+#      (34k chars of reasoning, zero content), 5 of 5 runs. The flag is absent from the
+#      spark-arena reference recipe. Removed here; thinking=true kept. After: that
+#      question answers in ~206 tokens finish=stop, and an 8-line code review returns a
+#      proper verdict in 895 tokens. Downstream this reads as "reviewer unavailable:
+#      empty content" and FAILS OPEN -- the opencode step-gate silently passed ungated
+#      steps for two days because of it.
+#
+#   2. draft_sample_method=greedy corrupted output ~40% of the time. Same visible
+#      symptom as the 2026-08-02 note (coherent, then multilingual token salad and
+#      place_holder tokens) but NOT the acceptance collapse that note describes:
+#      acceptance was a healthy 36.2% with a normal decay curve throughout, so the
+#      prefix-caching fix was working and this is a SECOND, INDEPENDENT cause. Greedy
+#      drafting breaks the distribution matching that makes speculative decoding
+#      lossless, so accepted tokens can diverge from the target model. Baseline 2 of 5
+#      runs corrupt; after switching to probabilistic, 0 corrupt over 24,000 generated
+#      tokens (the old rate predicted ~8) and acceptance ROSE to 61.3%.
+#
+#   Do NOT copy spark-arena num_speculative_tokens:3 -- this image hard-validates
+#   num_speculative_tokens >= dspark_block_size (5) and refuses to start, saying
+#   "Smaller values produce incorrect output". Arena runs a different image
+#   (ghcr.io/anemll/dspark-vllm-gx10:0.1.1, not staged on any node here). 5 is the
+#   minimum legal value on vllm-node-dspark; this recipe now runs 5 + probabilistic.
+#
+#   Corruption is INTERMITTENT, so a single clean probe proves nothing -- verify with
+#   10+ runs AND force long generations: fixing (1) shortens replies to ~200 tokens,
+#   which hides (2) by shrinking the window it needs to appear.
 # load-format safetensors is inherited from the DSpark fork (instanttensor
 # crashes on this build). Expect a slow first load.
 command: |
@@ -91,7 +124,7 @@ command: |
       --max-num-batched-tokens {max_num_batched_tokens} \
       --gpu-memory-utilization {gpu_memory_utilization} \
       --no-enable-prefix-caching \
-      --speculative-config '{"method":"dspark","num_speculative_tokens":7,"draft_sample_method":"greedy"}' \
+      --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' \
       --tokenizer-mode deepseek_v4 \
       --distributed-executor-backend ray \
       --tool-call-parser deepseek_v4 \
@@ -99,5 +132,4 @@ command: |
       --reasoning-parser deepseek_v4 \
       --reasoning-config '{"reasoning_parser":"deepseek_v4","reasoning_start_str":"","reasoning_end_str":""}' \
       --default-chat-template-kwargs.thinking=true \
-      --default-chat-template-kwargs.reasoning_effort=high \
       --load-format safetensors
