@@ -81,6 +81,55 @@ case "$ALIAS" in
       --limit-mm-per-prompt '{"image":1,"video":0}' \
       --enable-prefix-caching
     ;;
+  paddleocr-vl)
+    # PaddleOCR-VL 1.6 (0.9B) — TOOK OVER surya2's slot on 2026-08-06.
+    #
+    # Same relay port (11438) and same internal PORT (11439) as the surya2 case
+    # above, ON PURPOSE: the socat relay is a pure port forward, so reusing
+    # 11439 means the relay wiring is unchanged. The unit was renamed
+    # (vllm-companion-relay-paddleocr) rather than left saying "surya2", since
+    # a unit whose description lies is a debugging trap.
+    #
+    # ⚠️ surya2 IS STILL DEFINED ABOVE but has NO SLOT — it was removed from
+    # COMPANION_VLLM_SLOTS to make room. Slots are static config; the case is
+    # kept so reverting is a one-line .env change. surya-ocr-2 remains reachable
+    # on the 3090 (serve.sh `surya2`) and on all four Sparks (staged
+    # 2026-08-06), which is what made this swap affordable.
+    #
+    # ⚠️ epubocr pointed SURYA_INFERENCE_URL at :11438 and read surya's
+    # per-token confidence. This port now answers with a DIFFERENT model under
+    # a different name — epubocr must be re-pointed at the 3090 or a Spark.
+    #
+    # 8 GB RETUNE vs the 3090's paddleocr-vl case:
+    #   window 16384 -> 8192   this model reads ONE document region per call,
+    #                          so a short window costs nothing real and buys KV
+    #                          room on a card that has none to spare.
+    #   --enforce-eager        as with every slot here: CUDA-graph memory is
+    #                          overhead this card cannot afford.
+    #   util 0.54              the number proven for THIS 4300 MB slot by the
+    #                          surya2 fit. Note paddle's weights are ~0.4 GiB
+    #                          BIGGER (1.79 vs 1.37 measured), so KV headroom is
+    #                          correspondingly tighter — if it fails the memory
+    #                          profile, cut max-model-len before touching util,
+    #                          which is what the sibling relay's budget depends on.
+    #
+    # NO --mm-processor-kwargs: min_pixels/max_pixels are QWEN kwargs and belong
+    # to the surya2 case above, not here (this model has its own processor).
+    PORT=11439
+    pkill -f "vllm serve.*--port ${PORT}" 2>/dev/null || true
+    exec vllm serve PaddlePaddle/PaddleOCR-VL-1.6 \
+      --revision cdc88f5feff0e4079e75863205053a68358e52f7 \
+      --host "$HOST" \
+      --port "$PORT" \
+      --served-model-name paddleocr-vl-1.6 \
+      --trust-remote-code \
+      --max-model-len 8192 \
+      --dtype bfloat16 \
+      --gpu-memory-utilization 0.54 \
+      --enforce-eager \
+      --mm-processor-cache-gb 0 \
+      --enable-prefix-caching
+    ;;
   qwen25-relay)
     # The opencode /swap echo relay, vLLM-served (replaces the Ollama tag
     # qwen2.5:1.5b — Ollama declares no budget and cannot join a budgeted
