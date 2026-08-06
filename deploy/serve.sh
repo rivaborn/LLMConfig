@@ -360,6 +360,57 @@ case "$ALIAS" in
       --mm-processor-kwargs '{"min_pixels":3136,"max_pixels":6291456}' \
       --enable-prefix-caching
     ;;
+  paddleocr-vl)
+    # PaddleOCR-VL 1.6 (0.9B) — PaddlePaddle's document-parsing VLM. 1.79 GiB
+    # bf16: an 18-layer/1024-hidden LM on a 27-layer/1152 vision tower.
+    #
+    # ⚠️ THIS IS ONLY HALF A DEPLOYMENT, unlike surya2. Surya puts layout, OCR
+    # and table recognition in ONE VLM, so serving it is the whole job.
+    # PaddleOCR keeps a CLASSICAL pipeline (layout detection, orientation,
+    # table structure, reading order) in front and uses this model only for the
+    # RECOGNITION step. The pipeline is a separate client process that must be
+    # pointed here:
+    #
+    #     PaddleOCRVL(pipeline_version="v1.6",
+    #                 vl_rec_backend="vllm-server",
+    #                 vl_rec_server_url="http://192.168.1.40:11437/v1")
+    #
+    # That client needs `paddlepaddle-gpu` and CANNOT run on a DGX Spark —
+    # checked 2026-08-06: zero aarch64 wheels for paddlepaddle-gpu on PyPI, and
+    # Paddle's own index ships cu126 against GB10's sm_121a. It runs here on
+    # x86 or not at all, which is exactly why this model lives on the 3090
+    # rather than on a Spark.
+    #
+    # FLAGS — from vLLM's own recipe (docs.vllm.ai/projects/recipes → PaddleOCR-VL):
+    #   --trust-remote-code      REQUIRED. The repo ships configuration_/
+    #                            modeling_/image_processing_paddleocr_vl.py and
+    #                            declares them via auto_map, so vLLM executes
+    #                            repo code at load.
+    #   --mm-processor-cache-gb 0  vLLM's recipe sets it explicitly; the custom
+    #                            NaViT-style processor does not want the cache.
+    #   NO --mm-processor-kwargs  deliberately absent. min_pixels/max_pixels are
+    #                            QWEN processor kwargs — surya2 above takes them
+    #                            because it IS a Qwen3_5 VLM. This model has its
+    #                            own processor and vLLM's recipe passes none.
+    #                            Do not copy them down from the case above.
+    #
+    # Window: 131072 native, capped to 16384 here on purpose — the model sees
+    # one document region at a time, not a whole book, so the rest is KV we
+    # would never fill.
+    #
+    # The served name is what the client must ask for, by exact string.
+    exec vllm serve PaddlePaddle/PaddleOCR-VL-1.6 \
+      --revision cdc88f5feff0e4079e75863205053a68358e52f7 \
+      --host "$HOST" \
+      --port "$PORT" \
+      --served-model-name paddleocr-vl-1.6 \
+      --trust-remote-code \
+      --max-model-len 16384 \
+      --dtype bfloat16 \
+      --gpu-memory-utilization 0.85 \
+      --mm-processor-cache-gb 0 \
+      --enable-prefix-caching
+    ;;
   ""|-h|--help)
     cat <<USAGE
 serve.sh — start a vLLM OpenAI-compatible server on port \$PORT (default 8000).
@@ -378,6 +429,8 @@ Fits single 3090 (24 GB) no offload:
   q36-27b-abl   Huihui-Qwen3.6-27B-abliterated-AWQ (abliterated hybrid, ~20 GB)
   devstral      Devstral-Small-2507-AWQ        (~13 GB, mistral tokenizer)
   surya2        datalab-to/surya-ocr-2         (OCR VLM for epubocr, ~3 GB bf16)
+  paddleocr-vl  PaddlePaddle/PaddleOCR-VL-1.6  (doc recognition, ~1.8 GB bf16;
+                                                needs the PaddleOCR client pipeline)
 
 Needs CPU offload (slower, uses WSL RAM):
   q36-moe       Qwen3.6-35B-A3B-AWQ            (MoE hybrid, ~24 GB, ~6 GB offload)
