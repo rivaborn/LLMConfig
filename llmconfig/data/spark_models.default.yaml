@@ -269,3 +269,45 @@ models:
       The only single-node 122B; the FP8 build needs 2 nodes.
       Needs -o env.VLLM_MARLIN_USE_ATOMIC_ADD=0 or CUDA-graph capture dies on GB10.
     load_timeout_s: 1800
+
+  # ---- document OCR (datalab-to), added 2026-08-06 -------------------------
+  # Two models, one pipeline: surya is the fast one (1.30 GiB), chandra the
+  # heavier/more capable (9.88 GiB). Same architecture family
+  # (Qwen3_5ForConditionalGeneration), both single-node, both budgeted small
+  # enough to be CO-TENANTS rather than node monopolisers.
+  #
+  # Both are `status: unverified` — neither has launched on a Spark. surya's
+  # recipe at least inherits the flag set proven on the 3070 Ti companion
+  # lane; chandra's has never run anywhere. Promote them only after a real
+  # page has been OCR'd through each.
+  - alias: surya-ocr-2
+    recipe: /mnt/c/Coding/rivaborn/LLMConfig/dgx_sparks/recipes/local/surya-ocr-2-spark.yaml
+    served_name: surya-ocr-2
+    tp: 1
+    status: unverified
+    mem_fraction: 0.12
+    load_timeout_s: 900
+    notes: >-
+      datalab-to/surya-ocr-2 @3b3d4cdf, 1.30 GiB. Layout / OCR / table
+      recognition in ONE VLM. Spark sibling of the proven companion-lane
+      config, retuned from an 8 GB single-stream shape into a throughput
+      service (max_pixels 5419008 = 2048px-wide pages, window 16384, 32
+      concurrent seqs — the card is explicit that max-num-seqs governs
+      throughput). KV is bf16 ON PURPOSE: surya's per-block `confidence` is
+      the mean per-token probability of the decode and epubocr thresholds on
+      it, so fp8 KV would move numbers a downstream consumer reads.
+  - alias: chandra-ocr-2
+    recipe: /mnt/c/Coding/rivaborn/LLMConfig/dgx_sparks/recipes/local/chandra-ocr-2-spark.yaml
+    served_name: chandra-ocr-2
+    tp: 1
+    status: unverified
+    mem_fraction: 0.22
+    load_timeout_s: 900
+    notes: >-
+      datalab-to/chandra-ocr-2 @af93b47d, 9.88 GiB — the heavier datalab OCR
+      model. NEVER run in this lab: the recipe is surya's proven flag set
+      scaled up, so the sizing is a starting point, not a measurement. Card
+      benchmarks 96 concurrent seqs on an H100 80GB; 32 here is a deliberate
+      step down for GB10 memory bandwidth. The chandra-ocr package ships a
+      `chandra_vllm` launcher whose flags are unpublished — look there first
+      if output quality disappoints.
