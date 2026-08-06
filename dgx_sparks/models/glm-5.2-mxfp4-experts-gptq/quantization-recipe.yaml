@@ -1,0 +1,99 @@
+default_stage:
+  default_modifiers:
+    QuantizationModifier:
+      config_groups:
+        attention_shared_experts:
+          targets: ['re:.*self_attn\..*']
+          weights:
+            num_bits: 8
+            type: float
+            symmetric: true
+            group_size: null
+            strategy: block
+            block_structure: [128, 128]
+            dynamic: false
+            actorder: null
+            scale_dtype: null
+            zp_dtype: null
+            observer: memoryless_minmax
+            observer_kwargs: {}
+          input_activations:
+            num_bits: 8
+            type: float
+            symmetric: true
+            group_size: 128
+            strategy: group
+            block_structure: null
+            dynamic: true
+            actorder: null
+            scale_dtype: null
+            zp_dtype: null
+            observer: null
+            observer_kwargs: {}
+          output_activations: null
+          format: null
+        dense_mlp:
+          targets: ['re:.*\.mlp\.(gate_proj|up_proj|down_proj)$']
+          weights:
+            num_bits: 4
+            type: float
+            symmetric: true
+            group_size: 16
+            strategy: tensor_group
+            block_structure: null
+            dynamic: false
+            actorder: null
+            scale_dtype: torch.float8_e4m3fn
+            zp_dtype: null
+            observer: memoryless_minmax
+            observer_kwargs: {}
+          input_activations:
+            num_bits: 4
+            type: float
+            symmetric: true
+            group_size: 16
+            strategy: tensor_group
+            block_structure: null
+            dynamic: local
+            actorder: null
+            scale_dtype: torch.float8_e4m3fn
+            zp_dtype: null
+            observer: static_minmax
+            observer_kwargs: {}
+          output_activations: null
+          format: null
+        # v2: shared experts re-quantized to block-FP8 (from BF16), was NVFP4 in v1
+        shared_experts_fp8:
+          targets: ['re:.*\.mlp\.shared_experts\.(gate_proj|up_proj|down_proj)$']
+          weights:
+            num_bits: 8
+            type: float
+            symmetric: true
+            group_size: null
+            strategy: block
+            block_structure: [128, 128]
+            dynamic: false
+            actorder: null
+            scale_dtype: null
+            zp_dtype: null
+            observer: memoryless_minmax
+            observer_kwargs: {}
+          input_activations:
+            num_bits: 8
+            type: float
+            symmetric: true
+            group_size: 128
+            strategy: group
+            block_structure: null
+            dynamic: true
+            actorder: null
+            scale_dtype: null
+            zp_dtype: null
+            observer: null
+            observer_kwargs: {}
+          output_activations: null
+          format: null
+      targets: [Linear]
+      ignore: ['re:^model\.layers\.[0-2]\..*re:.*mlp\.gate.*', 're:.*indexer\.weights_proj$',
+        lm_head]
+      bypass_divisibility_checks: false

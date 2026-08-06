@@ -1,0 +1,190 @@
+# Recipe: GLM-5.2-MXFP4-Experts-GPTQ-MTP — 4-node tensor-parallel GLM-5.2
+#
+# ⚠️ CANNOT LAUNCH ON THIS CLUSTER YET. This is a `tp=4` recipe and the fabric is
+# still two ISOLATED PAIRS — re-verified live 2026-08-06 by ping matrix, not
+# assumed from the 07-30 note:
+#
+#     .50 <-> .51   OK on 192.168.0.x AND 192.168.2.x   (spark1 + spark2)
+#     .52 <-> .53   OK on 192.168.0.x AND 192.168.2.x   (spark3 + spark4)
+#     .50/.51 <-> .52/.53   NO PATH on either fabric subnet
+#
+# Both 200G subnets are dual-rail WITHIN a pair, not cross-pair links — the
+# second subnet (192.168.2.x) does NOT buy a path between pairs, which is easy
+# to assume from the interface list alone. All four nodes appear in both /24s
+# and look mutually reachable; they are not. A tp job spanning the pairs HANGS
+# in NCCL peer discovery rather than erroring (see CLAUDE.md invariant 18).
+#
+# This file is staged and catalogued NOW so that the day the 200G switch lands
+# the only remaining steps are `SPARK_FABRIC_ENABLED=true`, a fabric-links
+# update, and a launch. Weights are already on all four nodes (see below).
+#
+# PROVENANCE
+#   Base checkpoint            : GLM-5.2 (upstream authors)
+#   MXFP4 expert re-quantization, GPTQ calibration, hybrid assembly, container
+#                              : Aidendle94
+#   4x DGX Spark deployment integration + benchmark
+#                              : Mike Pfaffenberger (NOT the model author)
+#   Recipe body below is VERBATIM as supplied — only this header is ours.
+#   Quantization recipe, config.json and the file inventory are preserved under
+#   dgx_sparks/models/glm-5.2-mxfp4-experts-gptq/.
+#
+# VERIFIED 2026-08-06 (against the live HF repo, before staging)
+#   - Repo exists, public, ungated; HEAD sha == the pinned revision
+#     46537e0e16fcd156627800139b41b9c497fc7ee2 — `target_revision`,
+#     `model_revision` and the `mtp_config` snapshot path all agree.
+#   - 186 entries, 383.7 GiB total. Layout is per-layer: L3..L77.safetensors
+#     (75 files, no gaps) plus 3 `hybrid-ct-*.safetensors` for the first three
+#     (full-attention) layers. `mtp-draft/` exists (4 files, 5.6 GiB), so the
+#     `mtp_config.model` path resolves once staged. Also `vllm_overlay/` (2).
+#   - config.json: model_type `glm_moe_dsa`, arch `GlmMoeDsaForCausalLM`,
+#     num_hidden_layers **78**, quant_method `hybrid_mxfp4_ct`.
+#   - `index_topk_pattern` in `hf_overrides` is **78 chars** (21 F / 57 S) and
+#     therefore matches num_hidden_layers exactly. The F/S split lines up with
+#     the file layout: FFF for the three hybrid-ct layers, then the sparse
+#     pattern across L3..L77. config.json ships `index_topk_pattern: null`, so
+#     this override is LOAD-BEARING — drop it and the sparse indexer has no
+#     pattern.
+#   - `max_position_embeddings` is 1048576, so `max_model_len: 262144` sits well
+#     inside the trained window. `VLLM_ALLOW_LONG_MAX_MODEL_LEN=1` is therefore
+#     NOT masking an over-length request here (it is inherited from the DS4
+#     lineage). Do not read the flag as evidence 262144 is unsafe.
+#
+# STILL UNVERIFIED — check these before/at first launch
+#   1. **PORT.** `defaults.port: 8210`, but LLMConfig launches through
+#      `SPARK_RUN_CMD` which passes `--port {port}` = the GROUP's api_port
+#      (8000 by default) and then polls THAT port for readiness. If 8210 wins,
+#      the deployment comes up perfectly and LLMConfig still times out at
+#      `load_timeout_s`, records a launch failure, and the placement blocklist
+#      latches. Settle it with `sparkrun run --dry-run` before trusting a load.
+#   2. **PREFIX CACHING.** This recipe passes `--enable-prefix-caching`. The
+#      sibling DS4 fork on this same container family runs
+#      `--no-enable-prefix-caching` because prefix caching + spec-decode
+#      silently CORRUPTS generation on that stack (per-position acceptance
+#      collapses; replies degenerate into token salad — see
+#      deepseek-v4-flash-0731.yaml). Different model, same B12X/DSV4 kernels.
+#      Verify with a SEVERAL-HUNDRED-TOKEN generation; a short probe cannot
+#      expose it.
+#   3. **`num_speculative_tokens: 4`.** The DS4 image hard-validates
+#      `num_speculative_tokens >= dspark_block_size` (5) and refuses to start
+#      below it. This recipe uses `method: mtp`, not `dspark`, so the check may
+#      not apply — but it is the same image family. Confirm at launch.
+#   4. **JSON placeholder rendering.** The three JSON args are passed as
+#      single-brace PLACEHOLDERS (`{hf_overrides}`, `{mtp_config}`,
+#      `{compilation_config}`) whose values live in `defaults:`. That is a
+#      third form not covered by the render-rule table in ../README.md, which
+#      only characterises literal-inline JSON vs `{{...}}`. sparkrun renders
+#      with vpd `arg_substitute` (regex `\{(.*?)\}`, single pass), so a
+#      substituted value containing braces should NOT be re-scanned — but
+#      confirm with `--dry-run` that the JSON arrives intact rather than
+#      half-substituted.
+#
+# OPERATIONAL NOTES
+#   - `cluster_only: true` and it claims ALL FOUR nodes. Launching it evicts
+#     every other Spark model (DS4 on spark1+2, qwen35-122b on spark3, the
+#     pooling pair on spark4). Drive it from a cookbook state, not from
+#     auto-placement, unless that fleet-wide teardown is the intent.
+#   - `max_num_seqs: 3` + `max_num_batched_tokens: 2048` is a SINGLE-USER
+#     latency posture, not a serving one: a full 262144-token prompt is ~128
+#     sequential prefill chunks and there is no batch to amortise into. That is
+#     at odds with the Spark tier's role as the capacity/concurrency tier, so
+#     bulk traffic routed here by workload tiering will crawl.
+#   - `container:` is pinned BY DIGEST, which is correct and also skips the pull
+#     entirely (measured 2026-08-05: a digest in `container:` resolves with no
+#     `docker pull` process at all). Keep `SPARK_IMAGE` empty in `.env` — a
+#     global `--image` override clobbers this and lands the model on the wrong
+#     runtime, which is exactly how DS4 died in warmup on 2026-08-05.
+#   - Weights STAGED on all four nodes 2026-08-06 via dgx_sparks/stage-model.sh
+#     (downloaded once per fabric pair, fanned out intra-pair over 200G).
+#     The container image is pre-pulled on all four for the same reason.
+#   - Serving `glm-5.2` at 262144 obliges an `opencode.json` re-sync in
+#     rivaborn/opencode-config (`limit.context + limit.output == 262144`).
+#     Model ids match by exact string — a renamed `served_model_name` is a
+#     silent 404 at /model time, not a config error.
+#
+# ---------------------------------------------------------------------------
+# Body below: VERBATIM as supplied by the deployment integrator. Do not edit
+# without adding a note above saying what changed and why (house rule).
+# ---------------------------------------------------------------------------
+description: Original model checkpoint, GPTQ-calibrated MXFP4 re-quantization, hybrid assembly, and container by Aidendle94; 4x DGX Spark deployment integration and benchmark operated by Mike Pfaffenberger, who is not the model author
+model: aidendle94/GLM-5.2-MXFP4-Experts-GPTQ
+container: aidendle94/sparkrun-vllm-ds4-gb10@sha256:93824a946f1f0ad0867132a2c3809e0e7d8bec6ab38e7d0ef9fc3046e11bc8c7
+defaults:
+  port: 8210
+  host: 0.0.0.0
+  tensor_parallel: 4
+  gpu_memory_utilization: 0.89
+  max_model_len: 262144
+  max_num_batched_tokens: 2048
+  max_num_seqs: 3
+  served_model_name: glm-5.2
+  decode_context_parallel: 4
+  num_speculative_tokens: 4
+  kv_cache_memory_bytes: 5500000000
+  target_model: aidendle94/GLM-5.2-MXFP4-Experts-GPTQ
+  target_revision: 46537e0e16fcd156627800139b41b9c497fc7ee2
+  hf_overrides: '{"index_topk_pattern":"FFFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSSFSSS"}'
+  mtp_config: '{"model":"/cache/huggingface/hub/models--aidendle94--GLM-5.2-MXFP4-Experts-GPTQ/snapshots/46537e0e16fcd156627800139b41b9c497fc7ee2/mtp-draft","method":"mtp","num_speculative_tokens":4,"draft_attention_backend":"B12X_MLA_SPARSE","adaptive_speculative_tokens_window":32}'
+  compilation_config: '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"],"cudagraph_capture_sizes":[1,2,3,4,5,6,8]}'
+env:
+  VLLM_USE_V2_MODEL_RUNNER: '1'
+  VLLM_USE_B12X_MOE: '1'
+  VLLM_USE_B12X_SPARSE_INDEXER: '1'
+  VLLM_DCP_SHARD_DRAFT: '1'
+  VLLM_DCP_GLOBAL_TOPK: '1'
+  VLLM_DSV4_INDEXER_SP: '1'
+  VLLM_B12X_MLA_CKV_GATHER: '1'
+  VLLM_B12X_MLA_CKV_GATHER_MAX_TOKENS: '262144'
+  VLLM_B12X_MLA_DECODE_SPARSE_GATHER: '1'
+  VLLM_B12X_MLA_DECODE_GATHER_V2: '1'
+  VLLM_ADAPTIVE_SPEC_DEPTHS: 2,4
+  VLLM_NVFP4_MLA_PER_TOKEN_SCALE: '1'
+  VLLM_ENGINE_READY_TIMEOUT_S: '3600'
+  VLLM_EXECUTE_MODEL_TIMEOUT_SECONDS: '1800'
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: '1'
+  CUTE_DSL_ARCH: sm_121a
+  TORCH_CUDA_ARCH_LIST: 12.1a
+  NCCL_NET: IB
+  NCCL_IB_DISABLE: '0'
+  NCCL_IB_GID_INDEX: '0'
+  NCCL_MAX_NCHANNELS: '4'
+  NCCL_MIN_NCHANNELS: '4'
+  NCCL_CUMEM_ENABLE: '0'
+command: |
+  unset VLLM_PREFIX_CACHE_RETENTION_INTERVAL
+  HEADLESS_ARG=""
+  if [ "$RANK" -gt 0 ]; then HEADLESS_ARG="--headless"; fi
+  exec vllm serve {target_model} $HEADLESS_ARG \
+      --revision {target_revision} \
+      --served-model-name {served_model_name} \
+      --host {host} \
+      --port {port} \
+      --trust-remote-code \
+      --reasoning-parser glm45 \
+      --tool-call-parser glm47 \
+      --enable-auto-tool-choice \
+      --enable-prefix-caching \
+      --tensor-parallel-size {tensor_parallel} \
+      --decode-context-parallel-size {decode_context_parallel} \
+      --dcp-comm-backend ag_rs \
+      --attention-backend B12X_MLA_SPARSE \
+      --hf-overrides '{hf_overrides}' \
+      --kv-cache-dtype nvfp4_ds_mla \
+      --kv-cache-memory-bytes {kv_cache_memory_bytes} \
+      --max-model-len {max_model_len} \
+      --max-num-batched-tokens {max_num_batched_tokens} \
+      --max-num-seqs {max_num_seqs} \
+      --gpu-memory-utilization {gpu_memory_utilization} \
+      --speculative-config '{mtp_config}' \
+      --compilation-config '{compilation_config}' \
+      --distributed-timeout-seconds 3600 \
+      --cpu-distributed-timeout-seconds 3600 \
+      --distributed-executor-backend mp \
+      --nnodes 4 \
+      --node-rank $RANK \
+      --master-addr $HEAD_IP \
+      --master-port 29501
+recipe_version: '1'
+name: GLM-5.2-MXFP4-Experts-GPTQ-MTP
+cluster_only: true
+model_revision: 46537e0e16fcd156627800139b41b9c497fc7ee2
+solo_only: false

@@ -82,3 +82,33 @@ models:
       needs two, not a speed upgrade ("fewest nodes that fit" still favors the
       INT4 single-node build for throughput).
     load_timeout_s: 3600
+
+  # FOUR-NODE ONLY, and the fabric cannot carry it yet — the two CX7 pairs have
+  # no cross-pair wire (re-verified by ping matrix 2026-08-06). Catalogued now
+  # because the WEIGHTS ARE STAGED on all four nodes and the container image is
+  # pre-pulled, so switch day is: cable, SPARK_FABRIC_LINKS, launch.
+  - alias: glm-5.2
+    recipe: "/mnt/c/Coding/rivaborn/LLMConfig/dgx_sparks/recipes/local/glm-5.2-mxfp4-experts-gptq-mtp.yaml"
+    served_name: glm-5.2
+    tp: 4
+    min_nodes: 4
+    max_nodes: 4
+    status: unverified
+    notes: >-
+      aidendle94/GLM-5.2-MXFP4-Experts-GPTQ @46537e0e (hybrid MXFP4 experts +
+      compressed-tensors linear), 383.7 GiB / 183 files, 78 layers, MTP draft
+      head. Staged fleet-wide 2026-08-06 via dgx_sparks/stage-model.sh; image
+      pinned by digest and pre-pulled. VERIFIED before staging: repo HEAD sha ==
+      the pinned revision, and the recipe's index_topk_pattern is exactly 78
+      chars = num_hidden_layers (config.json ships it as null, so the override
+      is load-bearing). max_position_embeddings is 1048576, so 262144 is well
+      inside the trained window. THREE THINGS UNSETTLED, all in the recipe
+      header: (1) defaults.port 8210 vs the --port LLMConfig passes — if 8210
+      wins, readiness polls the wrong port and a healthy launch reads as a
+      failure; (2) --enable-prefix-caching here vs --no-enable-prefix-caching on
+      the DS4 fork sharing this container family, where the combination silently
+      corrupts long generations; (3) num_speculative_tokens 4 vs the image's
+      minimum. Claims ALL FOUR nodes, so a launch evicts every other Spark
+      model — drive it from a cookbook state, not auto-placement. max_num_seqs 3
+      is a single-user latency posture, not a serving one.
+    load_timeout_s: 3600
