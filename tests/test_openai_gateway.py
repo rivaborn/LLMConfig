@@ -387,6 +387,24 @@ async def test_lease_for_a_different_unit_is_refused(monkeypatch, tmp_path):
     assert r.status_code == 409 and r.json()["error"]["code"] == "lease_wrong_unit"
 
 
+async def test_revoked_lease_beats_wrong_unit_after_a_replace(monkeypatch, tmp_path):
+    """A lease revoked by an eviction, presented against ANOTHER unit (the
+    holder's traffic was re-placed), must answer lease_revoked — who took it
+    and why — not a confusing wrong-unit complaint about a dead claim."""
+    app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
+    await _load_ollama_tag(world, orch)
+    orch.units["companion"] = orch.units["primary"]  # a 2nd unit id
+    lease = _claim(app, unit="companion", holder="batchapp")
+    app.state.leases.revoke_for_eviction("companion", "", by="opencode")
+    async with _client(app) as c:
+        r = await c.post("/v1/chat/completions", json=_chat(),
+                         headers={"X-LLM-Lease": lease.id})
+    assert r.status_code == 409
+    err = r.json()["error"]
+    assert err["code"] == "lease_revoked" and "opencode" in err["message"]
+    assert err["lease"]["revoked_reason"] == "preempted_by_placement"
+
+
 async def test_expired_lease_still_serves_its_holder_inside_the_grace_window(monkeypatch, tmp_path):
     app, orch, jobs, world, captured = _build(monkeypatch, tmp_path)
     await _load_ollama_tag(world, orch)
@@ -829,6 +847,9 @@ async def test_hold_header_claims_and_renews_a_preemptible_lease(monkeypatch, tm
     assert held is not None and held.holder == "opencode"
     assert held.preemptible is True, "must not 409 other callers' traffic"
     assert held.model == "a", "scoped to the model, folded to the catalog alias"
+    s = Settings(_env_file=None)
+    assert held.priority == s.placement_priority_interactive, \
+        "the hold carries the request's classified priority"
     first_deadline = held._deadline
 
     # A second request RENEWS in place rather than fragmenting into two leases.
@@ -855,25 +876,34 @@ async def test_hold_never_steals_another_holders_lease(monkeypatch, tmp_path):
     assert not any(l.holder == "opencode" for l in leases.active_all("spark1"))
 
 
-async def test_hold_shields_the_model_from_placement_eviction(monkeypatch, tmp_path):
-    """The whole point: a held model is not an eviction candidate."""
+async def test_hold_shields_the_model_only_from_the_reaper_not_placement(monkeypatch, tmp_path):
+    """The redesigned contract: a preemptible auto-hold stops the idle reaper,
+    but an IDLE held model is a legal placement victim — the hold's value is
+    the revocation notification. A NON-preemptible lease still shields."""
     from llmconfig.placement import ResidentFact, rank
     s = Settings(_env_file=None)
     from llmconfig.placement import CandidateFacts
     st = _spark_status(("model-a", 8000))
 
-    def cand(uid, leased, order):
+    def cand(uid, order, *, leased=False, preemptible=None):
         return CandidateFacts(
             unit_id=uid, kind="spark", status=st, usage="idle", server="spark",
             load_arg="target",
             residents=[ResidentFact(model="model-a", alias="a", budget=0.9,
-                                    idle_s=99999, leased=leased)],
+                                    idle_s=99999, leased=leased,
+                                    lease_preemptible=preemptible)],
             committed=0.9, want=0.3, order=order)
 
-    free = rank("target", [cand("s1", False, 0), cand("s2", True, 1)], s)
+    free = rank("target", [cand("s1", 0),
+                           cand("s2", 1, leased=True, preemptible=False)], s)
     assert free.unit_id == "s1" and free.victims == ["a"], "unleased model is evictable"
-    both_held = rank("target", [cand("s1", True, 0), cand("s2", True, 1)], s)
-    assert both_held.outcome == "no_capacity", "a held model is never a victim"
+    held = rank("target", [cand("s1", 0, leased=True, preemptible=True),
+                           cand("s2", 1, leased=True, preemptible=False)], s)
+    assert held.unit_id == "s1" and held.victims == ["a"], \
+        "idle + preemptible hold no longer shields against placement"
+    hard = rank("target", [cand("s1", 0, leased=True, preemptible=False),
+                           cand("s2", 1, leased=True, preemptible=False)], s)
+    assert hard.outcome == "no_capacity", "a non-preemptible lease still shields"
 
 
 async def test_hold_gives_session_affinity_across_requests(monkeypatch, tmp_path):

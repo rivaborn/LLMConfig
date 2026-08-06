@@ -29,7 +29,7 @@ from .config import Settings
 from .jobs import JobManager
 from .lane import Lane
 from .orchestrator import Orchestrator, Unit
-from .placement import classify_workload, wants_auto
+from .placement import classify_workload, wants_auto, workload_priority
 from .schemas import LeaseClaimRequest, LoadRequest
 from .spark_unit import SparkUnit
 
@@ -55,7 +55,8 @@ class OpenAIGateway:
 
     def __init__(self, orch: Orchestrator, jobs: JobManager, settings: Settings,
                  leases: "LeaseManager | None" = None,
-                 placer: "Placer | None" = None):
+                 placer: "Placer | None" = None,
+                 stats=None):
         self.orch = orch
         self.jobs = jobs
         self.s = settings
@@ -63,6 +64,7 @@ class OpenAIGateway:
         # None (or AUTO_PLACE_ENABLED=false) disables auto-placement: a request
         # without X-LLM-Lane then falls back to "primary" exactly as before.
         self.placer = placer
+        self.stats = stats   # UsageStats — one note_request per routed request
         self._http: httpx.AsyncClient | None = None
 
     # ---- forwarding client (no read timeout: chat generations can run long) ----
@@ -201,6 +203,17 @@ class OpenAIGateway:
             return ("lease_revoked",
                     f"lease {lease_id} is not known to this server ({reason}) — re-claim and retry",
                     None)
+        # Terminal states FIRST: a lease revoked by an eviction and then re-placed
+        # onto another unit must answer `lease_revoked` (who took it and why),
+        # not a confusing `lease_wrong_unit` about a claim that no longer exists.
+        if lease.state == "revoked":
+            who = f" by '{lease.revoked_by}'" if lease.revoked_by else ""
+            why = f" ({lease.revoked_reason})" if lease.revoked_reason else ""
+            return ("lease_revoked",
+                    f"lease {lease.id} was revoked{who}{why} — re-claim before retrying", lease)
+        if lease.state == "released":
+            return ("lease_released",
+                    f"lease {lease.id} was released — claim a new one", lease)
         if lease.unit != unit_id:
             return ("lease_wrong_unit",
                     f"lease {lease_id} is for unit '{lease.unit}', not '{unit_id}'", lease)
@@ -216,14 +229,6 @@ class OpenAIGateway:
                 now_mono, self.s.lease_expiry_grace_s):
             self.leases.note_request(lease.id)
             return None
-        if lease.state == "revoked":
-            who = f" by '{lease.revoked_by}'" if lease.revoked_by else ""
-            why = f" ({lease.revoked_reason})" if lease.revoked_reason else ""
-            return ("lease_revoked",
-                    f"lease {lease.id} was revoked{who}{why} — re-claim before retrying", lease)
-        if lease.state == "released":
-            return ("lease_released",
-                    f"lease {lease.id} was released — claim a new one", lease)
         return ("lease_expired",
                 f"lease {lease.id} expired — renew sooner or claim a new one", lease)
 
@@ -257,9 +262,20 @@ class OpenAIGateway:
 
     async def _choose(self, request: Request, model: str, *, is_chat: bool,
                       stream: bool, body: dict | None = None):
-        """Pick the unit for this request. Returns (lane, victims, lease_id) or an
-        error Response. The ONE place auto-placement is wired, shared by the chat
-        and pooling handlers so the two cannot drift.
+        """Pick the unit for this request. Returns
+        (lane, victims, group_victims, lease_id, priority) or an error Response.
+        The ONE place auto-placement is wired, shared by the chat and pooling
+        handlers so the two cannot drift.
+
+        `priority` is the request's classified placement priority for a "place"
+        decision, else None: an explicit header, a lease pin, and a sole-
+        candidate PIN all keep the unit's own load semantics (a lane's
+        last-writer-wins eviction included), so their loads carry no priority
+        and skip the unit-side active-preemption re-validation.
+        `group_victims` is executed by the caller via
+        `placer.evict_group_victims` BEFORE the load job (a group teardown
+        needs the target member's lock — running it inside the load would
+        deadlock).
 
         Explicit `X-LLM-Lane: <unit>` pins, exactly as before. Absent/empty/`auto`
         auto-places — unless a valid `X-LLM-Lease` names a unit, in which case the
@@ -286,7 +302,7 @@ class OpenAIGateway:
             reject = self._lease_gate(lane.cfg.id, lease_id, model)
             if reject is not None:
                 return self._lease_reject(*reject, is_chat=is_chat, stream=stream)
-            return lane, [], lease_id
+            return lane, [], [], lease_id, None
 
         if lease_id and self.leases is not None:
             lease = self.leases.get(lease_id)
@@ -301,7 +317,7 @@ class OpenAIGateway:
                 reject = self._lease_gate(lane.cfg.id, lease_id, model)
                 if reject is not None:
                     return self._lease_reject(*reject, is_chat=is_chat, stream=stream)
-                return lane, [], lease_id
+                return lane, [], [], lease_id, None
 
         # Session affinity: go back to the unit this holder already holds for this
         # model, so consecutive requests stay on one warm prefix cache.
@@ -312,7 +328,7 @@ class OpenAIGateway:
                 lane = self.lane(uid)
                 reject = self._lease_gate(lane.cfg.id, lease_id, model)
                 if reject is None:
-                    return lane, [], lease_id
+                    return lane, [], [], lease_id, None
 
         exclude: frozenset[str] = frozenset()
         for attempt in range(2):
@@ -336,7 +352,10 @@ class OpenAIGateway:
             lane = self.lane(decision.unit_id)
             reject = self._lease_gate(lane.cfg.id, lease_id, model)
             if reject is None:
-                return lane, list(decision.victims), lease_id
+                prio = (workload_priority(workload, self.s)
+                        if decision.outcome == "place" else None)
+                return (lane, list(decision.victims),
+                        list(decision.group_victims), lease_id, prio)
             if attempt == 0:
                 exclude = frozenset({decision.unit_id})
                 continue
@@ -360,20 +379,38 @@ class OpenAIGateway:
                     return lease.unit
         return None
 
-    def _auto_hold(self, lane: "Unit", model: str, request: Request) -> None:
+    def _requester(self, request: Request) -> str:
+        """Who to name in `revoked_by` when this request's load displaces someone:
+        the X-LLM-Hold holder, else the holder of a known X-LLM-Lease, else
+        'placement'. Sync dict reads only."""
+        holder = (request.headers.get("x-llm-hold") or "").strip()[:64]
+        if holder:
+            return holder
+        lease_id = (request.headers.get("x-llm-lease") or "").strip()
+        if lease_id and self.leases is not None:
+            lease = self.leases.get(lease_id)
+            if lease is not None and lease.holder:
+                return lease.holder
+        return "placement"
+
+    def _auto_hold(self, lane: "Unit", model: str, request: Request,
+                   priority: int | None = None) -> None:
         """Honour `X-LLM-Hold: <holder>` — claim/renew this holder's lease on the
         model it is actually using.
 
         A static client config cannot carry a lease id (one does not exist until
         claimed), so this is how a config-only client gets a lease at all. The
-        claim is **preemptible**: it stops the idle reaper and auto-placement from
-        evicting this model, which is what "don't displace my session" means,
-        without refusing anybody else's traffic the way a non-preemptible hold
-        does (that escalation stays manual, via /api/leases).
+        claim is **preemptible** and carries the request's classified placement
+        priority: it stops the idle reaper, and against auto-placement it yields
+        once idle (or, while active, to strictly higher-priority traffic — see
+        `_victim_eligible`), with the revocation telling the holder why. That is
+        what "don't displace my session" now means; refusing other traffic
+        outright stays a manual, non-preemptible /api/leases claim.
 
         Best-effort and never raises into the request: a hold is a convenience,
-        not the point of the call. Never preempts — if someone else already holds
-        this model, we leave it alone; their claim is at least as strong as ours.
+        not the point of the call. Never preempts AT CLAIM TIME — if someone
+        else already holds this model, we leave it alone; their claim is at
+        least as strong as ours.
         """
         holder = (request.headers.get("x-llm-hold") or "").strip()[:64]
         if not holder or self.leases is None:
@@ -381,12 +418,19 @@ class OpenAIGateway:
         if not (self.s.lease_enabled and self.s.auto_hold_enabled):
             return
         try:
-            existing = self.leases.active_for(lane.cfg.id, model)
+            # Fold to the canonical alias before the never-steal check: leases
+            # store canonical names, and the raw served-name miss used to be
+            # masked only by claim()'s equal-priority refusal — with classified
+            # priorities on the claim it would actually steal.
+            existing = self.leases.active_for(
+                lane.cfg.id, self.leases._canon(lane.cfg.id, model))
             if existing is not None and existing.holder != holder:
                 return
             self.leases.claim(LeaseClaimRequest(
                 unit=lane.cfg.id, holder=holder, model=model,
                 preemptible=True, ttl_s=self.s.auto_hold_ttl_s,
+                priority=(priority if priority is not None
+                          else self.s.placement_priority_neutral),
                 note="auto-hold (X-LLM-Hold)",
             ))
         except Exception:  # noqa: BLE001 — a failed hold must never fail the request
@@ -399,7 +443,8 @@ class OpenAIGateway:
         return {"x-llm-unit": lane.cfg.id}
 
     def _ensure_load_job(self, lane: Lane, status, target_kind: str, server: str,
-                         load_arg: str, stream: bool, evict: list[str] | None = None):
+                         load_arg: str, stream: bool, evict: list[str] | None = None,
+                         priority: int | None = None, requested_by: str = ""):
         """Return (job_or_None, short_circuit). Coalesces onto an identical in-flight
         load; for a *different* in-flight load, queues ours (stream) or signals a
         short-circuit (non-stream, so title-gen doesn't block for minutes).
@@ -424,7 +469,8 @@ class OpenAIGateway:
             # stream, or a Spark (co-residency makes the other load irrelevant):
             # queue ours behind the unit lock (shows "waiting…")
         job = self.orch.load(LoadRequest(server=server, model=load_arg, lane=lane.cfg.id,
-                                         evict=list(evict or [])))
+                                         evict=list(evict or []),
+                                         priority=priority, requested_by=requested_by))
         # A load just committed: drop the placer's cached sweep, so a burst's
         # next auto request re-sweeps and sees this in-flight job instead of
         # double-placing onto the same unit off the stale snapshot.
@@ -623,7 +669,8 @@ class OpenAIGateway:
                                     body=body)
         if isinstance(chosen, Response):
             return chosen
-        lane, victims, _lease_id = chosen
+        lane, victims, group_victims, _lease_id, priority = chosen
+        requested_by = self._requester(request)
 
         resolved = await self.resolve(lane, model)
         if resolved is None:
@@ -634,7 +681,34 @@ class OpenAIGateway:
             )
         server, load_arg, backend = resolved
         lane.touch(model=model)  # inference traffic — reset this model's idle-unload window
-        self._auto_hold(lane, model, request)
+        # The hold claims at the request's CLASSIFIED priority (independent of
+        # which placement tier fired) so later contention reflects the traffic.
+        wl = classify_workload(body or {}, request.headers.get("x-llm-workload"),
+                               self.s)
+        if self.stats is not None:   # once per request, not per touch
+            self.stats.note_request(lane.cfg.id, model, wl.cls if wl else "")
+        self._auto_hold(lane, model, request,
+                        priority=workload_priority(wl, self.s))
+
+        # Group victims first — the teardown holds the target member's lock, so
+        # it must run BEFORE the load job, from up here (see _choose). A
+        # conflict means the world moved: one re-place (non-stream), else 503.
+        if group_victims:
+            try:
+                await self.placer.evict_group_victims(
+                    group_victims, priority=priority, requested_by=requested_by)
+            except RuntimeError as e:
+                if not stream and any(m in str(e) for m in self._CONFLICT_MARKERS):
+                    retry = await self._retry_elsewhere(request, model, str(e), lane,
+                                                        sub_path, body, is_chat=is_chat)
+                    if retry is not None:
+                        return retry
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": {"message": f"could not free the nodes for "
+                                                  f"'{model}': {e}",
+                                        "type": "server_error", "code": "no_capacity"}},
+                )
 
         # Fast path: this model is ALREADY resident → forward, no load. Membership
         # over loaded_models, not equality against the unit's primary occupant: on a
@@ -658,7 +732,9 @@ class OpenAIGateway:
         # Need to load (cold / wrong model). Coalesce onto an identical in-flight load.
         target_kind = f"load:{lane.cfg.id}:{server}:{load_arg}"
         job, short_circuit = self._ensure_load_job(lane, status, target_kind, server, load_arg,
-                                                   stream, evict=victims)
+                                                   stream, evict=victims,
+                                                   priority=priority,
+                                                   requested_by=requested_by)
 
         if stream:
             reroute = (self._reroute(lane, server, model, backend)
@@ -726,10 +802,10 @@ class OpenAIGateway:
             return None
         if not any(m in (err or "") for m in self._CONFLICT_MARKERS):
             return None
+        workload = classify_workload(body or {},
+                                     request.headers.get("x-llm-workload"), self.s)
         decision = await self.placer.place(
-            model, exclude=frozenset({failed_lane.cfg.id}),
-            workload=classify_workload(body or {},
-                                       request.headers.get("x-llm-workload"), self.s))
+            model, exclude=frozenset({failed_lane.cfg.id}), workload=workload)
         if decision.outcome not in ("place", "pin"):
             return None
         lane = self.lane(decision.unit_id)
@@ -739,6 +815,18 @@ class OpenAIGateway:
         lease_id = (request.headers.get("x-llm-lease") or "").strip()
         if self._lease_gate(lane.cfg.id, lease_id, model) is not None:
             return None   # fall through to the original 503
+        priority = (workload_priority(workload, self.s)
+                    if decision.outcome == "place" else None)
+        requested_by = self._requester(request)
+        if decision.group_victims:
+            # This IS the one re-place — a conflict here just falls through to
+            # the caller's original 503, never a second retry.
+            try:
+                await self.placer.evict_group_victims(
+                    decision.group_victims, priority=priority,
+                    requested_by=requested_by)
+            except RuntimeError:
+                return None
         status = await lane.status()
         server, load_arg = decision.server, decision.load_arg
         backend = self._route(lane, server, model, status,
@@ -749,7 +837,9 @@ class OpenAIGateway:
         if not any(m.server == server and m.model == model for m in status.loaded_models):
             target_kind = f"load:{lane.cfg.id}:{server}:{load_arg}"
             job, short = self._ensure_load_job(lane, status, target_kind, server, load_arg,
-                                               stream=False, evict=decision.victims)
+                                               stream=False, evict=decision.victims,
+                                               priority=priority,
+                                               requested_by=requested_by)
             if short or job is None:
                 return None
             entry = lane.registry.get(load_arg)
@@ -793,7 +883,8 @@ class OpenAIGateway:
                                     body=body)
         if isinstance(chosen, Response):
             return chosen
-        lane, victims, _lease_id = chosen
+        lane, victims, group_victims, _lease_id, priority = chosen
+        requested_by = self._requester(request)
 
         resolved = await self.resolve(lane, model)
         if resolved is None:
@@ -815,7 +906,30 @@ class OpenAIGateway:
             )
 
         lane.touch(model=model)
-        self._auto_hold(lane, model, request)
+        wl = classify_workload(body or {}, request.headers.get("x-llm-workload"),
+                               self.s)
+        if self.stats is not None:   # once per request, not per touch
+            self.stats.note_request(lane.cfg.id, model, wl.cls if wl else "")
+        self._auto_hold(lane, model, request,
+                        priority=workload_priority(wl, self.s))
+
+        # Group victims first — same protocol as the chat path (see _choose).
+        if group_victims:
+            try:
+                await self.placer.evict_group_victims(
+                    group_victims, priority=priority, requested_by=requested_by)
+            except RuntimeError as e:
+                if any(m in str(e) for m in self._CONFLICT_MARKERS):
+                    retry = await self._retry_elsewhere(request, model, str(e), lane,
+                                                        sub_path, body, is_chat=False)
+                    if retry is not None:
+                        return retry
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": {"message": f"could not free the nodes for "
+                                                  f"'{model}': {e}",
+                                        "type": "server_error", "code": "no_capacity"}},
+                )
 
         status = await lane.status()
         backend = self._route(lane, server, model, status, backend)
@@ -827,7 +941,9 @@ class OpenAIGateway:
 
         target_kind = f"load:{lane.cfg.id}:{server}:{load_arg}"
         job, short_circuit = self._ensure_load_job(lane, status, target_kind, server, load_arg,
-                                                   stream=False, evict=victims)
+                                                   stream=False, evict=victims,
+                                                   priority=priority,
+                                                   requested_by=requested_by)
         if short_circuit or job is None:
             # A *different* model is mid-load. Never answer with an empty vector.
             return JSONResponse(

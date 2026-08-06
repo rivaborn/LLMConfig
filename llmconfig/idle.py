@@ -77,13 +77,14 @@ def classify_usage(st: LaneStatus, current_util_pct: float | None,
 
 class IdleReaper:
     def __init__(self, settings: Settings, orch: "Orchestrator", monitor: "Monitor",
-                 leases: "LeaseManager"):
+                 leases: "LeaseManager", stats=None):
         self.s = settings
         self.orch = orch
         self.monitor = monitor
         # Required, not optional: a None default would let a future call site
         # silently lose lease-awareness and reap a unit somebody had claimed.
         self.leases = leases
+        self.stats = stats   # UsageStats — records each reap (best-effort)
         self.interval = max(5.0, float(settings.idle_unload_check_interval_s))
         self.timeout_s = max(60.0, float(settings.idle_unload_after_min) * 60.0)
         self._task: Optional[asyncio.Task] = None
@@ -202,7 +203,9 @@ class IdleReaper:
             # (a stop on one rank wedges the rest), so choosing it as the
             # victim would just raise on every tick AND shadow a genuinely
             # reapable neighbour (the claimed row has no clock of its own here,
-            # so it reads as the stalest). Teardown is /api/cluster/unload only.
+            # so it reads as the stalest). The REAPER never touches groups;
+            # placement may (SparkGroup.placement_evict, ranked last), and
+            # manual teardown stays /api/cluster/unload.
             if getattr(m, "group", ""):
                 continue
             idle = idle_of(m.model) if idle_of else (time.time() - lane.last_activity)
@@ -229,6 +232,9 @@ class IdleReaper:
         await lane.unload(UnloadRequest(server=None, lane=lane.cfg.id, model=victim.model))
         # Restart both windows so a slow VRAM drain isn't re-reaped every tick.
         lane.touch(model=victim.model)
+        if self.stats is not None:
+            self.stats.note_eviction(unit=lane.cfg.id, model=victim.model,
+                                     reason="idle_reaper", evicted_by="idle_reaper")
         return victim.server == "vllm"
 
     async def _maybe_release_keepalive(self) -> None:

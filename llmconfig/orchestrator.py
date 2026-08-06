@@ -270,14 +270,21 @@ class Orchestrator:
             u.load_times = load_times
 
     def attach_leases(self, leases) -> None:
-        """Hand every Spark unit the LeaseManager for under-lock victim checks.
+        """Hand every unit the LeaseManager for under-lock victim checks.
 
         Called from create_app AFTER the LeaseManager exists (it is constructed
         with the orchestrator, so the reference cannot be a constructor arg).
+        Every unit kind now re-validates leases inside its own eviction path —
+        Sparks in `_evict_victim`, groups in `placement_evict`, lanes in
+        `_preempt_occupant_leases` — so the fanout is unconditional.
         """
         for u in self.units.values():
-            if hasattr(u, "declared_budgets"):     # duck-typed: only Sparks
-                u.leases = leases
+            u.leases = leases
+
+    def attach_stats(self, stats) -> None:
+        """Hand every unit the UsageStats recorder (same fanout as attach_leases)."""
+        for u in self.units.values():
+            u.stats = stats
 
     async def aclose(self) -> None:
         """Close every unit's pooled HTTP clients (call on app shutdown)."""

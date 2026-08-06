@@ -349,11 +349,18 @@ async def test_overlapping_group_loads_do_not_deadlock(tmp_path, calls, state):
     gs = GroupState()
     jobs = JobManager()
     placements = GroupPlacements(tmp_path / "p.yaml")
+    # A wider lock timeout than the module default: a group load takes ~1.6s of
+    # wall clock even against instant fakes (probe/poll overhead), so the
+    # loser's wait at 2.0s had ~0.4s of margin and flaked under full-suite
+    # load. The scenario under test is queue-then-conflict, not the timeout.
+    s_wide = Settings(_env_file=None, spark_fabric_enabled=True,
+                      swap_wait_timeout_s=10.0)
     g12, m12, _, _ = make_group(tmp_path, ["spark1", "spark2"], gs=gs,
-                                placements=placements, jobs=jobs)
+                                placements=placements, jobs=jobs,
+                                settings=s_wide)
     # g23 reuses spark2's unit so the LOCK is genuinely shared.
     shared = m12[1]
-    m3 = make_member(tmp_path, "spark3")
+    m3 = make_member(tmp_path, "spark3", settings=s_wide)
     m3.group_state = gs
     creg = g12.registry
     from llmconfig.config import SparkGroupConfig
@@ -361,7 +368,7 @@ async def test_overlapping_group_loads_do_not_deadlock(tmp_path, calls, state):
                              member_ids=("spark2", "spark3"),
                              head_host=HOSTS["spark2"], api_port=PORT,
                              load_timeout_s=5)
-    g23 = SparkGroup(S, cfg23, [shared, m3], creg, gs, placements, jobs)
+    g23 = SparkGroup(s_wide, cfg23, [shared, m3], creg, gs, placements, jobs)
     _routes(state, ["spark1", "spark2", "spark3"])
 
     j1 = g12.load(LoadRequest(server="spark", model="ds4", lane=g12.cfg.id))
@@ -650,6 +657,124 @@ async def test_placer_group_facts_union_and_claim_shielding(tmp_path, calls, sta
     claimed = [r for r in facts.residents if r.model == "other-served"]
     assert claimed and claimed[0].leased is True
     assert facts.member_count == 2 and facts.whole_node is True
+
+
+@respx.mock
+async def test_facts_for_reports_group_rows_with_span_and_group_id(tmp_path, calls, state):
+    """A group-claimed row on a MEMBER carries the group's span/id/lease facts,
+    so rank() can choose the whole group as a (last-resort) victim and hand the
+    caller `Decision.group_victims`."""
+    gs = GroupState()
+    group, members, _, _ = make_group(tmp_path, ["spark1", "spark2"], gs=gs)
+    _routes(state, ["spark1", "spark2"])
+    gs.claim(group.cfg.id, "ds4-served", "ds4", ("spark1", "spark2"), PORT)
+    state[(HOSTS["spark1"], PORT)] = "ds4-served"
+    group.last_activity = time.time() - 999            # the group model is idle
+
+    orch = SimpleNamespace(units={m.cfg.id: m for m in members} | {group.cfg.id: group},
+                           jobs=SimpleNamespace(get=lambda _id: None))
+    leases = SimpleNamespace(active_for=lambda *a, **k: None,
+                             blocks_unleased=lambda *a, **k: None)
+    monitor = SimpleNamespace(util_for=lambda uuid: None)
+    placer = Placer(S, orch, leases, monitor)
+
+    head = members[0]
+    st = await head.status()
+    assert st.loaded_models and st.loaded_models[0].group == group.cfg.id
+    facts = placer._facts_for(head, st, "spark", "spark1-m", None, 0, "spark1-served")
+    row = facts.residents[0]
+    assert row.group_id == group.cfg.id and row.span == 2
+    assert row.leased is True and row.lease_preemptible is None, \
+        "no lease on the group — only the group-row marker"
+    assert row.idle_s > S.usage_active_window_s
+
+    # rank() on those facts: the whole group becomes the victim, by unit id.
+    blocked = CandidateFacts(
+        unit_id="s9", kind="spark",
+        status=LaneStatus(id="s9", name="s9", kind="spark", owner="spark",
+                          ollama_up=False, vllm_up=False),
+        usage="idle", server="spark", load_arg="spark1-m",
+        residents=[ResidentFact(model="x", alias="x", budget=0.9, idle_s=9999,
+                                leased=True, lease_preemptible=False)],
+        committed=0.9, want=0.3, order=1)
+    facts.want = 0.3
+    d = rank("spark1-served", [facts, blocked], S)
+    assert d.outcome == "place" and d.unit_id == "spark1"
+    assert d.victims == [] and d.group_victims == [group.cfg.id]
+
+
+@respx.mock
+async def test_placement_evict_tears_down_an_idle_group(tmp_path, calls, state):
+    """Happy path: idle, unleased group → stopped cluster-wide, claim released,
+    and the funnel raises placement_conflict for an unknown group id."""
+    from llmconfig.leases import LeaseManager
+    gs = GroupState()
+    group, members, _, _ = make_group(tmp_path, ["spark1", "spark2"], gs=gs)
+    _routes(state, ["spark1", "spark2"])
+    gs.claim(group.cfg.id, "ds4-served", "ds4", ("spark1", "spark2"), PORT)
+    state[(HOSTS["spark1"], PORT)] = "ds4-served"
+    group.last_activity = time.time() - 999
+    group.leases = None
+
+    orch = SimpleNamespace(units={m.cfg.id: m for m in members} | {group.cfg.id: group},
+                           jobs=SimpleNamespace(get=lambda _id: None))
+    leases = SimpleNamespace(active_for=lambda *a, **k: None,
+                             blocks_unleased=lambda *a, **k: None)
+    monitor = SimpleNamespace(util_for=lambda uuid: None)
+    placer = Placer(S, orch, leases, monitor)
+
+    await placer.evict_group_victims([group.cfg.id], priority=None,
+                                     requested_by="tester")
+    assert gs.get(group.cfg.id) is None, "claim released"
+    assert not state, "every rank stopped"
+    assert not group._lock.locked() and not any(m._lock.locked() for m in members)
+
+    with pytest.raises(RuntimeError, match="placement_conflict"):
+        await placer.evict_group_victims(["no_such_group"], priority=None,
+                                         requested_by="tester")
+
+
+@respx.mock
+async def test_placement_evict_re_validates_activity_lease_and_priority(tmp_path, calls, state):
+    from llmconfig.leases import LeaseManager
+    from llmconfig.schemas import LeaseClaimRequest
+
+    def build(gs):
+        group, members, _, _ = make_group(tmp_path, ["spark1", "spark2"], gs=gs)
+        gs.claim(group.cfg.id, "ds4-served", "ds4", ("spark1", "spark2"), PORT)
+        state[(HOSTS["spark1"], PORT)] = "ds4-served"
+        orch = SimpleNamespace(units={m.cfg.id: m for m in members}
+                               | {group.cfg.id: group})
+        group.leases = LeaseManager(S, orch)
+        return group
+
+    _routes(state, ["spark1", "spark2"])
+
+    # ACTIVE + no priority (explicit / neutral-REST) → conflict.
+    group = build(GroupState())
+    group.touch(model="ds4")
+    with pytest.raises(RuntimeError, match="active"):
+        await group.placement_evict(priority=None, requested_by="t")
+    assert state, "nothing stopped"
+
+    # Idle but NON-preemptibly leased → conflict.
+    group = build(GroupState())
+    group.last_activity = time.time() - 999
+    group.leases.claim(LeaseClaimRequest(unit=group.cfg.id, holder="alice",
+                                         preemptible=False))
+    with pytest.raises(RuntimeError, match="non-preemptible"):
+        await group.placement_evict(priority=None, requested_by="t")
+
+    # ACTIVE + preemptible prio 20 vs incoming 60 → torn down, lease revoked.
+    group = build(GroupState())
+    group.touch(model="ds4")
+    held, _ = group.leases.claim(LeaseClaimRequest(unit=group.cfg.id,
+                                                   holder="batchapp", priority=20))
+    await group.placement_evict(priority=60, requested_by="interactive-app")
+    assert not state, "the active lower-priority group was torn down"
+    lease = group.leases.get(held.id)
+    assert lease.state == "revoked" and lease.revoked_by == "interactive-app"
+    assert lease.revoked_reason == "preempted_by_placement"
 
 
 @respx.mock

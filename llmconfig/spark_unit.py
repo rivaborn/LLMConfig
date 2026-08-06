@@ -305,7 +305,9 @@ class SparkUnit:
         # raises `placement_conflict:` so the gateway can re-place instead of
         # reporting the model itself as broken.
         for victim in dict.fromkeys(req.evict or []):
-            await self._evict_victim(job, victim, slots, resident)
+            await self._evict_victim(job, victim, slots, resident,
+                                     priority=req.priority,
+                                     requested_by=req.requested_by)
 
         # Fast path: already serving what was asked for, on whichever slot.
         if not req.force and target in resident:
@@ -560,14 +562,22 @@ class SparkUnit:
         ).model_dump()
 
     async def _evict_victim(self, job: Job, victim: str, slots: dict,
-                            resident: dict) -> None:
+                            resident: dict, *, priority: int | None = None,
+                            requested_by: str = "") -> None:
         """Stop one placement-chosen co-tenant, re-validated under the lock.
 
         Sync checks between validation and the stop (invariant 11 style): still
-        resident, no live lease (any lease shields, matching the idle reaper's
-        convention), and per-model idle beyond the active window. `slots` and
-        `resident` are mutated so the admission sum that follows sees the node
-        as it will be, not as it was.
+        resident, and displaceable under the SAME rules as placement's
+        `_victim_eligible` — a non-preemptible lease shields fully; an unleased
+        model must be idle beyond the active window; a preemptible lease yields
+        once idle, or while active to a strictly higher `priority` (None = an
+        explicit, non-placement load, which keeps the idle-only rule). Note the
+        deliberate divergence from the idle reaper, whose stricter ANY-lease
+        shield stands: the reaper is a power optimisation, an eviction is a
+        competing request. A preemptible lease on the victim is REVOKED —
+        synchronously, before the stop is issued — so the displaced holder
+        learns why via poll/409. `slots` and `resident` are mutated so the
+        admission sum that follows sees the node as it will be, not as it was.
         """
         entry = self.registry.get(victim) or self.registry.find_by_served_name(victim)
         if entry is None:
@@ -575,20 +585,52 @@ class SparkUnit:
         served = entry.served_name or entry.alias
         if served not in resident:
             return  # already gone — someone else freed it; nothing to do
-        if self.leases is not None and self.leases.active_for(self.cfg.id, entry.alias) is not None:
-            raise RuntimeError(
-                f"placement_conflict: '{victim}' gained a lease since placement"
-            )
-        if self.idle_for(entry.alias) <= self.s.usage_active_window_s:
-            raise RuntimeError(
-                f"placement_conflict: '{victim}' became active since placement"
-            )
+        lease = (self.leases.active_for(self.cfg.id, entry.alias)
+                 if self.leases is not None else None)
+        idle_ok = self.idle_for(entry.alias) > self.s.usage_active_window_s
+        if lease is None:
+            if not idle_ok:
+                raise RuntimeError(
+                    f"placement_conflict: '{victim}' became active since placement"
+                )
+        else:
+            if not lease.preemptible:
+                raise RuntimeError(
+                    f"placement_conflict: '{victim}' gained a non-preemptible "
+                    f"lease since placement"
+                )
+            if idle_ok:
+                if not self.s.placement_preempt_leased_idle_enabled:
+                    raise RuntimeError(
+                        f"placement_conflict: '{victim}' is held by a lease"
+                    )
+            elif (priority is None or lease.priority >= priority
+                  or not self.s.placement_preempt_active_enabled):
+                raise RuntimeError(
+                    f"placement_conflict: '{victim}' is active and held at "
+                    f"equal/higher priority"
+                )
+            # Sync revocation between the checks above and the stop below —
+            # no await in between (invariant 11).
+            self.leases.revoke_for_eviction(self.cfg.id, entry.alias,
+                                            by=requested_by or "placement")
+            self.jobs.log(job, f"revoked {lease.holder}'s lease on {entry.alias} "
+                               f"(preempted_by_placement)")
         port = resident[served]
-        self.jobs.log(job, f"stopping idle {served} on port {port} to make room…")
+        self.jobs.log(job, f"stopping {served} on port {port} to make room…")
         await self.spark.stop(recipe=entry.recipe or entry.alias)
         resident.pop(served, None)
         slots.pop(port, None)
         self.model_activity.pop(entry.alias, None)
+        stats = getattr(self, "stats", None)
+        if stats is not None:
+            stats.note_eviction(
+                unit=self.cfg.id, model=served, alias=entry.alias,
+                reason=("active_preempt" if (lease is not None and not idle_ok)
+                        else "idle_preempt" if lease is not None
+                        else "displaced_idle"),
+                evicted_by=requested_by, incoming_priority=priority,
+                holder=lease.holder if lease is not None else "")
 
     def declared_budgets(self, names) -> dict[str, float]:
         """Served-name → declared `mem_fraction` for each named model (0.0 = unset,

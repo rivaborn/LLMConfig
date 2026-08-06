@@ -1171,19 +1171,93 @@ async def test_evict_refuses_a_victim_that_became_active(cfg, monkeypatch):
 
 
 @respx.mock
-async def test_evict_refuses_a_victim_that_gained_a_lease(cfg, monkeypatch):
+async def test_evict_refuses_a_victim_under_a_nonpreemptible_lease(cfg, monkeypatch):
     unit = two_model_unit(cfg, f1=0.5, f2=0.5)
     state, _ = stateful_node(monkeypatch, cfg, {8000: "served-1"})
     unit.model_activity = {"m1": time.time() - 999}
     orch = SimpleNamespace(units={"spark1": unit})
     unit.leases = LeaseManager(Settings(_env_file=None), orch)
-    unit.leases.claim(LeaseClaimRequest(unit="spark1", holder="alice", model="m1"))
+    unit.leases.claim(LeaseClaimRequest(unit="spark1", holder="alice", model="m1",
+                                        preemptible=False))
 
     job = await wait_job(unit.load(LoadRequest(server="spark", model="m2",
                                                lane="spark1", evict=["m1"])))
 
-    assert job.state == "failed" and "gained a lease" in (job.error or "")
+    assert job.state == "failed" and "non-preemptible" in (job.error or "")
     assert state == {8000: "served-1"}
+
+
+@respx.mock
+async def test_evict_of_an_idle_preemptibly_leased_victim_revokes_then_stops(cfg, monkeypatch):
+    """Rule 1: a preemptible lease no longer shields an idle victim — the
+    eviction revokes it (holder learns via poll/409) and proceeds. The
+    revocation must land BEFORE the stop is issued."""
+    unit = two_model_unit(cfg, f1=0.5, f2=0.5)
+    state, calls = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+    unit.model_activity = {"m1": time.time() - 999}      # victim is idle
+    orch = SimpleNamespace(units={"spark1": unit})
+    unit.leases = LeaseManager(Settings(_env_file=None), orch)
+    held, _ = unit.leases.claim(LeaseClaimRequest(unit="spark1", holder="alice",
+                                                  model="m1"))
+    state_at_revocation: dict = {}
+    orig_terminate = unit.leases._terminate
+
+    def spy_terminate(lease, *a, **kw):
+        state_at_revocation.update(dict(state))
+        return orig_terminate(lease, *a, **kw)
+    unit.leases._terminate = spy_terminate
+
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2",
+                                               lane="spark1", evict=["m1"],
+                                               requested_by="opencode")))
+
+    assert job.state == "succeeded", job.error
+    assert "served-1" not in state.values() and "served-2" in state.values()
+    lease = unit.leases.get(held.id)
+    assert lease.state == "revoked"
+    assert lease.revoked_reason == "preempted_by_placement"
+    assert lease.revoked_by == "opencode"
+    assert state_at_revocation == {8000: "served-1"}, \
+        "the lease was revoked before the stop was issued"
+    assert any("revoked" in l for l in job.log)
+
+
+@respx.mock
+async def test_evict_active_preemptible_victim_needs_higher_priority(cfg, monkeypatch):
+    """Rule 2: an ACTIVE victim under a preemptible lease yields only to a load
+    carrying strictly higher priority; an explicit load (priority=None) keeps
+    the idle-only rule."""
+    def build():
+        u = two_model_unit(cfg, f1=0.5, f2=0.5)
+        u.touch(model="m1")                              # active NOW
+        orch = SimpleNamespace(units={"spark1": u})
+        u.leases = LeaseManager(Settings(_env_file=None), orch)
+        u.leases.claim(LeaseClaimRequest(unit="spark1", holder="batchapp",
+                                         model="m1", priority=20))
+        return u
+
+    unit = build()
+    state, _ = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2",
+                                               lane="spark1", evict=["m1"])))
+    assert job.state == "failed" and "placement_conflict" in (job.error or "")
+    assert state == {8000: "served-1"}, "an explicit load never active-preempts"
+
+    unit = build()
+    state, _ = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2",
+                                               lane="spark1", evict=["m1"],
+                                               priority=20)))
+    assert job.state == "failed", "equal priority never preempts an active holder"
+
+    unit = build()
+    state, _ = stateful_node(monkeypatch, cfg, {8000: "served-1"})
+    job = await wait_job(unit.load(LoadRequest(server="spark", model="m2",
+                                               lane="spark1", evict=["m1"],
+                                               priority=60,
+                                               requested_by="interactive-app")))
+    assert job.state == "succeeded", job.error
+    assert "served-1" not in state.values() and "served-2" in state.values()
 
 
 @respx.mock

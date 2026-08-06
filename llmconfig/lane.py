@@ -210,7 +210,11 @@ class Lane:
                 self.jobs.log(job, f"{req.model} already loaded on Ollama")
                 return await self._verify_ollama(job, req, remediate=False)
 
-        await self._evict_all(job)
+        reason = await self._preempt_occupant_leases(job, req)
+        displaced = await self._evict_all(job)
+        if vllm_served:
+            displaced = [vllm_served, *displaced]
+        self._note_evictions(req, reason, displaced)
 
         self.jobs.log(job, "ensuring Ollama service is running…")
         if not await self.ollama.ensure_running():
@@ -258,9 +262,12 @@ class Lane:
             raise RuntimeError(f"alias '{alias}' is blocked: {entry.notes}. Re-issue with force=true to try anyway.")
 
         served_target = entry.served_name or alias
-        if not req.force and (await self.vllm.served()) == served_target:
+        cur_served = await self.vllm.served()
+        if not req.force and cur_served == served_target:
             self.jobs.log(job, f"vLLM already serving {served_target}")
             return self._vllm_result(served_target, await self._gpu())
+
+        reason = await self._preempt_occupant_leases(job, req)
 
         # Hold WSL open before starting vLLM: otherwise the distro idle-shuts-down
         # seconds after this load returns and takes the model (and relay) with it.
@@ -282,6 +289,10 @@ class Lane:
         if names:
             self.jobs.log(job, f"unloaded Ollama: {', '.join(names)}")
         await self._wait_vram_free(job)
+        self._note_evictions(
+            req, reason,
+            [n for n in ([cur_served] if cur_served else []) + names
+             if n != served_target])
 
         # Load-time clock: after eviction + VRAM drain, from serve.sh start to ready.
         launch_started = time.monotonic()
@@ -391,8 +402,107 @@ class Lane:
     # ------------------------------------------------------------------ #
     # Internals
     # ------------------------------------------------------------------ #
-    async def _evict_all(self, job: Job) -> None:
-        """Clear this lane's GPU: stop vLLM, unload all Ollama models, confirm freed."""
+    async def _occupied(self) -> bool:
+        """Anything resident on this lane? (vLLM probe skipped on an
+        Ollama-only lane — invariant 5.)"""
+        if self.cfg.vllm_enabled and (await self.vllm.served()) is not None:
+            return True
+        return bool(await self.ollama.loaded_names())
+
+    async def _preempt_occupant_leases(self, job: Job, req: LoadRequest) -> str:
+        """Lease gate + revocation before this lane's eviction.
+
+        Runs under the lane lock, just before the evict that displaces the
+        occupant. Two halves:
+
+        * A live NON-preemptible lease held by someone else refuses the load
+          (`placement_conflict:`) — the endpoint gate refuses up front, this
+          closes the claim-race window under the lock.
+        * A placement-driven load (`req.priority is not None`) re-validates the
+          occupant the same way `_victim_eligible` ranked it: an ACTIVE
+          occupant must be preemptibly held below the incoming priority; an
+          idle preemptibly-held one needs the rule-1 switch on. An explicit
+          load (priority None — operator REST, boot autoload, cookbook) keeps
+          the lane's last-writer-wins semantics and skips this half.
+
+        Then every preemptible lease on the unit is REVOKED (the whole card is
+        being taken; a model-scoped lease must not survive its model), sparing
+        the requester's own — reason `preempted_by_placement` for placement
+        loads, `displaced_by_load` for explicit ones, so displaced holders
+        always learn via poll/409. The lease reads, checks, and revocation are
+        sync with no await in between (invariant 11); the occupancy probe
+        deliberately comes first.
+
+        Returns the eviction-stats reason label for whatever this load
+        displaces (the caller records it once the occupants are known).
+        """
+        reason = ("displaced_idle" if req.priority is not None
+                  else "displaced_by_load")
+        leases = getattr(self, "leases", None)
+        if leases is None or not self.s.lease_enabled:
+            return reason
+        blocker = leases.blocks_unleased(self.cfg.id)
+        if blocker is not None and blocker.holder != req.requested_by:
+            raise RuntimeError(
+                f"placement_conflict: {self.cfg.id} is held by {blocker.holder}'s "
+                f"non-preemptible lease"
+            )
+        if req.priority is not None and await self._occupied():
+            lease = leases.active_for(self.cfg.id)
+            active = (time.time() - self.last_activity) \
+                <= self.s.usage_active_window_s
+            if active:
+                if lease is None:
+                    raise RuntimeError(
+                        f"placement_conflict: {self.cfg.id}'s occupant became "
+                        f"active since placement"
+                    )
+                if (not lease.preemptible or lease.priority >= req.priority
+                        or not self.s.placement_preempt_active_enabled):
+                    raise RuntimeError(
+                        f"placement_conflict: {self.cfg.id}'s occupant is active "
+                        f"and held at equal/higher priority"
+                    )
+                reason = "active_preempt"
+            elif lease is not None and lease.preemptible \
+                    and lease.holder != req.requested_by:
+                if not self.s.placement_preempt_leased_idle_enabled:
+                    raise RuntimeError(
+                        f"placement_conflict: {self.cfg.id} is held by a lease"
+                    )
+                reason = "idle_preempt"
+        revoked = leases.revoke_for_eviction(
+            self.cfg.id, "",
+            by=req.requested_by or ("placement" if req.priority is not None
+                                    else "load"),
+            reason=("preempted_by_placement" if req.priority is not None
+                    else "displaced_by_load"),
+            spare_holder=req.requested_by,
+        )
+        for l in revoked:
+            self.jobs.log(job, f"revoked {l.holder}'s lease on {self.cfg.id} "
+                               f"({l.revoked_reason})")
+        return reason
+
+    def _note_evictions(self, req: LoadRequest, reason: str,
+                        displaced: list[str]) -> None:
+        """Record what this load displaced (usage stats; reload targets are
+        filtered — swapping a model out for itself is not an eviction)."""
+        stats = getattr(self, "stats", None)
+        if stats is None:
+            return
+        for name in displaced:
+            if not name or name == req.model:
+                continue
+            stats.note_eviction(
+                unit=self.cfg.id, model=name, reason=reason,
+                evicted_by=req.requested_by, incoming_model=req.model,
+                incoming_priority=req.priority)
+
+    async def _evict_all(self, job: Job) -> list[str]:
+        """Clear this lane's GPU: stop vLLM, unload all Ollama models, confirm
+        freed. Returns the Ollama tags it unloaded (for the eviction stats —
+        the vLLM occupant, if any, is known only to the caller's probe)."""
         # Unconditional stop — see unload(): the relay probe must not gate it.
         # (Skipped on an Ollama-only lane: two WSL round-trips for a unit that
         # does not exist, on every load.)
@@ -403,6 +513,7 @@ class Lane:
         if names:
             self.jobs.log(job, f"unloaded Ollama: {', '.join(names)}")
         await self._wait_vram_free(job)
+        return names
 
     async def _wait_vram_free(self, job: Optional[Job]) -> bool:
         """Block until this lane's card is back to driver baseline (the 100%-VRAM gate).

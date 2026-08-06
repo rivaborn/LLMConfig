@@ -370,10 +370,19 @@ class LoadRequest(BaseModel):
     keep_alive: int = -1       # Ollama keep_alive; -1 = pin until swapped
     # Spark co-tenants the auto-placer chose to displace so this load fits
     # (canonical aliases). The unit RE-VALIDATES each under its own lock — still
-    # resident, unleased, idle — and refuses with `placement_conflict:` if the
+    # resident, idle (or preemptibly held below `priority`), never
+    # non-preemptibly leased — and refuses with `placement_conflict:` if the
     # world moved; placement is advisory, the unit is the gate. Lanes ignore it
     # (their load path evicts inherently).
     evict: list[str] = Field(default_factory=list)
+    # Placement priority of the request driving this load (PLACEMENT_PRIORITY_*).
+    # None = not a placement-classified request (explicit operator load, boot
+    # autoload, cookbook): preemptible leases on victims are still revoked so
+    # holders learn, but the active-preemption re-validation is skipped — an
+    # explicit load keeps the "the owner said so" semantics.
+    priority: Optional[int] = None
+    # Who asked — fills `revoked_by` on any lease this load's eviction revokes.
+    requested_by: str = ""
 
 
 class UnloadRequest(BaseModel):
@@ -402,6 +411,9 @@ class ClusterLoadRequest(BaseModel):
     # Placement-chosen victims (canonical aliases) to displace across the members,
     # re-validated under each member's lock exactly like LoadRequest.evict.
     evict: list[str] = Field(default_factory=list)
+    # Same semantics as LoadRequest.priority / LoadRequest.requested_by.
+    priority: Optional[int] = None
+    requested_by: str = ""
 
 
 class ClusterUnloadRequest(BaseModel):

@@ -30,6 +30,8 @@ env/
 /data/spark_cluster_models.yaml
 # Monitor-tab telemetry history (SQLite + WAL sidecars).
 /data/monitor*.db*
+# Usage stats — request/eviction accounting (SQLite + WAL sidecars).
+/data/stats*.db*
 
 # Editor / OS
 .vscode/

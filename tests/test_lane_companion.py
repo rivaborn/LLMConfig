@@ -530,3 +530,122 @@ async def test_ollama_only_lane_load_and_unload_never_probe_the_relay(tmp_path, 
     # Targeted unload of a non-resident — _occupied_by used to probe too.
     st = await lane.unload(UnloadRequest(server=None, lane="companion", model="ghost:1"))
     assert st.owner == "ollama"
+
+
+# --------------------------------------------------------------------------- #
+# Lane-side lease preemption (invariant 15's under-lock re-validation, lanes)
+# --------------------------------------------------------------------------- #
+def _with_leases(s, orch):
+    from llmconfig.leases import LeaseManager
+    leases = LeaseManager(s, orch)
+    orch.attach_leases(leases)
+    return leases
+
+
+async def test_lane_load_revokes_preemptible_leases_on_displacement(monkeypatch, tmp_path):
+    """Rule 1 on a lane: an idle preemptibly-held occupant is displaced and the
+    lease is revoked so the holder learns via poll/409."""
+    from llmconfig.schemas import LeaseClaimRequest
+    s, orch, jobs, wp, _ = _make(monkeypatch, tmp_path)
+    leases = _with_leases(s, orch)
+    lane = orch.primary
+    wp.ollama = {"held:1": (2 * GiB, 2 * GiB)}
+    lane.last_activity = time.time() - 999                   # idle
+    held, _d = leases.claim(LeaseClaimRequest(unit="primary", holder="batchapp",
+                                              model="held:1"))
+    recorded = []
+    lane.stats = type("S", (), {"note_eviction":
+                                staticmethod(lambda **kw: recorded.append(kw))})()
+
+    job = await _run(orch, jobs, "primary",
+                     LoadRequest(server="ollama", model="new:1", lane="primary",
+                                 priority=60, requested_by="opencode"))
+
+    assert job.state == "succeeded", job.error
+    lease = leases.get(held.id)
+    assert lease.state == "revoked"
+    assert lease.revoked_by == "opencode"
+    assert lease.revoked_reason == "preempted_by_placement"
+    assert recorded and recorded[0]["model"] == "held:1"
+    assert recorded[0]["reason"] == "idle_preempt"
+
+
+async def test_lane_placement_load_respects_active_holder_priority(monkeypatch, tmp_path):
+    """Rule 2 on a lane: an ACTIVE occupant under a preemptible lease yields
+    only to strictly higher priority; equal/lower gets placement_conflict so
+    the gateway re-places."""
+    from llmconfig.schemas import LeaseClaimRequest
+    s, orch, jobs, wp, _ = _make(monkeypatch, tmp_path)
+    leases = _with_leases(s, orch)
+    lane = orch.primary
+    wp.ollama = {"held:1": (2 * GiB, 2 * GiB)}
+    lane.touch()                                             # active NOW
+    leases.claim(LeaseClaimRequest(unit="primary", holder="batchapp",
+                                   model="held:1", priority=40))
+
+    job = await _run(orch, jobs, "primary",
+                     LoadRequest(server="ollama", model="new:1", lane="primary",
+                                 priority=40, requested_by="other"))
+    assert job.state == "failed" and "placement_conflict" in (job.error or "")
+    assert "held:1" in wp.ollama, "equal priority: the active holder keeps the lane"
+
+    job2 = await _run(orch, jobs, "primary",
+                      LoadRequest(server="ollama", model="new:1", lane="primary",
+                                  priority=60, requested_by="opencode"))
+    assert job2.state == "succeeded", job2.error
+    assert "new:1" in wp.ollama and "held:1" not in wp.ollama
+
+
+async def test_lane_explicit_load_keeps_last_writer_wins_but_notifies(monkeypatch, tmp_path):
+    """An explicit load (priority None) keeps the lane's last-writer-wins
+    semantics even over an ACTIVE occupant — but a preemptible lease is still
+    revoked (displaced_by_load) so its holder finds out."""
+    from llmconfig.schemas import LeaseClaimRequest
+    s, orch, jobs, wp, _ = _make(monkeypatch, tmp_path)
+    leases = _with_leases(s, orch)
+    lane = orch.primary
+    wp.ollama = {"held:1": (2 * GiB, 2 * GiB)}
+    lane.touch()                                             # active NOW
+    held, _d = leases.claim(LeaseClaimRequest(unit="primary", holder="batchapp",
+                                              model="held:1"))
+
+    job = await _run(orch, jobs, "primary",
+                     LoadRequest(server="ollama", model="new:1", lane="primary"))
+    assert job.state == "succeeded", job.error
+    assert "new:1" in wp.ollama
+    lease = leases.get(held.id)
+    assert lease.state == "revoked" and lease.revoked_reason == "displaced_by_load"
+
+
+async def test_lane_load_refuses_a_foreign_nonpreemptible_lease(monkeypatch, tmp_path):
+    from llmconfig.schemas import LeaseClaimRequest
+    s, orch, jobs, wp, _ = _make(monkeypatch, tmp_path)
+    leases = _with_leases(s, orch)
+    wp.ollama = {"held:1": (2 * GiB, 2 * GiB)}
+    orch.primary.last_activity = time.time() - 999
+    held, _d = leases.claim(LeaseClaimRequest(unit="primary", holder="nightly",
+                                              preemptible=False))
+
+    job = await _run(orch, jobs, "primary",
+                     LoadRequest(server="ollama", model="new:1", lane="primary",
+                                 requested_by="other"))
+    assert job.state == "failed" and "non-preemptible" in (job.error or "")
+    assert "held:1" in wp.ollama, "the held occupant survives"
+    assert leases.get(held.id).state == "active"
+
+
+async def test_lane_same_holder_reload_spares_its_own_lease(monkeypatch, tmp_path):
+    from llmconfig.schemas import LeaseClaimRequest
+    s, orch, jobs, wp, _ = _make(monkeypatch, tmp_path)
+    leases = _with_leases(s, orch)
+    wp.ollama = {"held:1": (2 * GiB, 2 * GiB)}
+    orch.primary.last_activity = time.time() - 999
+    held, _d = leases.claim(LeaseClaimRequest(unit="primary", holder="opencode",
+                                              model="held:1"))
+
+    job = await _run(orch, jobs, "primary",
+                     LoadRequest(server="ollama", model="held:1", lane="primary",
+                                 force=True, priority=60, requested_by="opencode"))
+    assert job.state == "succeeded", job.error
+    assert leases.get(held.id).state == "active", \
+        "a same-holder reload must not revoke its own hold"

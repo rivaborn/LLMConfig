@@ -25,6 +25,7 @@ from .leases import LeaseConflict, LeaseError, LeaseManager, LeaseNotActive, Lea
 from .cookbook import Cookbook
 from .load_times import LoadTimes
 from .monitor import Monitor
+from .stats import UsageStats
 from .openai_gateway import OpenAIGateway, build_gateway_router
 from .orchestrator import Orchestrator
 from .placement import Placer
@@ -75,11 +76,13 @@ def create_app() -> FastAPI:
     monitor = Monitor(settings, orch)
     load_times = LoadTimes()
     orch.attach_load_times(load_times)   # units record real launch durations
+    stats = UsageStats(settings)
+    orch.attach_stats(stats)             # units record what their evictions displace
     cookbook = Cookbook(settings, orch, jobs, leases)
     placer = Placer(settings, orch, leases, monitor, load_times)
-    gateway = OpenAIGateway(orch, jobs, settings, leases, placer)
-    reaper = IdleReaper(settings, orch, monitor, leases)
-    sweeper = LeaseSweeper(settings, orch, leases)
+    gateway = OpenAIGateway(orch, jobs, settings, leases, placer, stats=stats)
+    reaper = IdleReaper(settings, orch, monitor, leases, stats=stats)
+    sweeper = LeaseSweeper(settings, orch, leases, stats=stats)
 
     recovery = WslRecovery(settings)
     # Make the ladder reachable at RUNTIME, not only from the boot gate below.
@@ -147,12 +150,14 @@ def create_app() -> FastAPI:
         # gated on WSL readiness — see _gated_autoload.
         boot_autoload = asyncio.create_task(_gated_autoload())
         monitor.start()  # begin sampling GPU/LLM telemetry for the Monitor tab
+        stats.start()    # request/eviction accounting (background flush)
         reaper.start()   # idle auto-unload policy (reads the monitor's util samples)
         sweeper.start()  # lease expiry + deferred preemption frees
         yield
         boot_autoload.cancel()
         await sweeper.stop()
         await reaper.stop()  # before the monitor: the reaper reads its samples
+        await stats.stop()   # final flush of unpersisted buckets/events
         await monitor.stop()
         # Release the WSL keepalive so the distro can idle-shut-down cleanly when
         # the control app stops (an already-loaded vLLM model goes with it).
@@ -173,6 +178,7 @@ def create_app() -> FastAPI:
     app.state.sweeper = sweeper
     app.state.placer = placer
     app.state.load_times = load_times
+    app.state.stats = stats
 
     async def require_key(x_api_key: Optional[str] = Header(default=None)) -> None:
         if settings.auth_enabled and x_api_key != settings.llmconfig_api_key:
@@ -500,6 +506,24 @@ def create_app() -> FastAPI:
         surface: 'why did that land on spark3?' is answered here, not in logs."""
         return {"decisions": placer.decisions()}
 
+    @app.get("/api/stats/models")
+    async def api_stats_models(days: int = 30) -> dict:
+        """Per-model usage over the trailing window (default 30 days, capped at
+        the retention): request count + fleet share, per-unit and per-workload
+        splits, last-used, and evictions suffered by reason. Most-requested
+        first — the data for deciding which models deserve preferential
+        eviction (record-only: placement ranking does not read it)."""
+        days = max(1, min(int(days), settings.stats_retention_days))
+        return {"days": days, "models": stats.models(days=days)}
+
+    @app.get("/api/stats/evictions")
+    async def api_stats_evictions(limit: int = 50) -> dict:
+        """Recent eviction/preemption events, newest first: who was displaced,
+        from where, spanning how many nodes, by whom, and why (`reason`:
+        idle_preempt | active_preempt | displaced_idle | displaced_by_load |
+        group_preempt | idle_reaper | lease_free)."""
+        return {"evictions": stats.evictions(limit=max(1, min(int(limit), 500)))}
+
     @app.get("/api/lanes")
     async def api_lanes() -> list[dict]:
         """Every LLM unit, in display order — what the UI turns into tabs/cards."""
@@ -583,6 +607,11 @@ def create_app() -> FastAPI:
     # ------------------------------------------------------------------ #
     # Write endpoints (X-API-Key when configured)
     # ------------------------------------------------------------------ #
+    def _holder_of(x_llm_lease: Optional[str]) -> str:
+        """The holder behind an X-LLM-Lease header, for `revoked_by` attribution."""
+        lease = leases.get((x_llm_lease or "").strip()) if x_llm_lease else None
+        return lease.holder if lease is not None else ""
+
     def _require_lease_ok(unit_id: str, x_llm_lease: Optional[str],
                           model: str = "") -> None:
         """Honour a non-preemptible lease on the load/unload endpoints too.
@@ -630,6 +659,22 @@ def create_app() -> FastAPI:
             req.lane = decision.unit_id
             req.model = decision.load_arg
             req.evict = decision.victims
+            # REST stays NEUTRAL priority (invariant 15: no fabricated
+            # Workload): priority is left None, so units keep the idle-only
+            # eviction rule and explicit-load semantics for this request.
+            req.requested_by = req.requested_by or (
+                _holder_of(x_llm_lease) or "api")
+            if decision.group_victims:
+                # Tear the group(s) down BEFORE the load job — the teardown
+                # needs the target member's lock (see Placer.evict_group_victims).
+                try:
+                    await placer.evict_group_victims(
+                        decision.group_victims, priority=None,
+                        requested_by=req.requested_by)
+                except RuntimeError as e:
+                    raise HTTPException(
+                        status_code=503,
+                        detail=f"could not free the nodes for '{req.model}': {e}")
         unit = _lane(req.lane)
         # Catch the kind mismatch here — otherwise server="spark" on a GPU lane
         # falls into the vLLM path and fails with a misleading "unknown alias".

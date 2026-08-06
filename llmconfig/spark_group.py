@@ -297,7 +297,9 @@ class SparkGroup:
                 self.jobs.log(job, f"freeing {m.cfg.id} "
                                    f"({', '.join(sorted(resident))})…")
                 for victim in victims:
-                    await m._evict_victim(job, victim, slots, resident)
+                    await m._evict_victim(job, victim, slots, resident,
+                                          priority=req.priority,
+                                          requested_by=req.requested_by)
                 if resident:
                     raise RuntimeError(
                         f"placement_conflict: {m.cfg.id} still holds "
@@ -423,6 +425,80 @@ class SparkGroup:
                 m._lock.release()
             self._lock.release()
         return await self.status()
+
+    async def placement_evict(self, *, priority: int | None,
+                              requested_by: str) -> None:
+        """Tear this group's model down because placement chose it as a victim.
+
+        The group counterpart of `SparkUnit._evict_victim`, executed by the
+        CALLER (`Placer.evict_group_victims`) before the target unit's load job
+        — never from inside a member's own load, whose lock this needs. Group
+        lock + ordered bounded member locks (invariant 18), then a SYNC
+        re-validation mirroring `_victim_eligible` — claim still exists; no
+        non-preemptible lease; unleased must be idle; a preemptible lease
+        yields once idle, or while active to a strictly higher `priority` —
+        refusing with `placement_conflict:` when the world moved. A preemptible
+        lease is revoked (no await between the checks and the revocation) so
+        the displaced holder learns via poll/409, then the sparkrun job is
+        stopped cluster-wide under the held locks.
+
+        A sync lease claim CAN still land during the `await` of the stop —
+        same exposure as every eviction path: leases are advisory and the
+        409/poll protocol absorbs it.
+        """
+        await self._acquire_swap_lock("placement eviction")
+        held: list[SparkUnit] = []
+        try:
+            for m in self.members:
+                await m._acquire_swap_lock("group placement eviction")
+                held.append(m)
+            claim = self.group_state.get(self.cfg.id)
+            if claim is None:
+                return   # already gone — someone else freed it; nothing to do
+            if not self.s.placement_group_eviction_enabled:
+                raise RuntimeError(
+                    "placement_conflict: group eviction is disabled "
+                    "(PLACEMENT_GROUP_EVICTION_ENABLED=false)")
+            lease = (self.leases.active_for(self.cfg.id)
+                     if self.leases is not None else None)
+            idle_ok = self.idle_for(claim.model or claim.alias) \
+                > self.s.usage_active_window_s
+            if lease is not None and not lease.preemptible:
+                raise RuntimeError(
+                    f"placement_conflict: {self.cfg.id} gained a non-preemptible "
+                    f"lease since placement")
+            if idle_ok:
+                if lease is not None \
+                        and not self.s.placement_preempt_leased_idle_enabled:
+                    raise RuntimeError(
+                        f"placement_conflict: {self.cfg.id} is held by a lease")
+            else:
+                if lease is None:
+                    raise RuntimeError(
+                        f"placement_conflict: {claim.alias or claim.model} "
+                        f"became active since placement")
+                if (priority is None or lease.priority >= priority
+                        or not self.s.placement_preempt_active_enabled):
+                    raise RuntimeError(
+                        f"placement_conflict: {claim.alias or claim.model} is "
+                        f"active and held at equal/higher priority")
+            if self.leases is not None:
+                # Sync, between the final checks above and the stop below.
+                self.leases.revoke_for_eviction(
+                    self.cfg.id, "", by=requested_by or "placement")
+            await self._stop_current(None, claim.alias)
+            self.model_activity.clear()
+            stats = getattr(self, "stats", None)
+            if stats is not None:
+                stats.note_eviction(
+                    unit=self.cfg.id, model=claim.model, alias=claim.alias,
+                    span=len(self.members), reason="group_preempt",
+                    evicted_by=requested_by, incoming_priority=priority,
+                    holder=lease.holder if lease is not None else "")
+        finally:
+            for m in reversed(held):
+                m._lock.release()
+            self._lock.release()
 
     async def _stop_current(self, job: Optional[Job], alias: Optional[str],
                             verify_gone: bool = False) -> None:

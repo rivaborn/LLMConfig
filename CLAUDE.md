@@ -139,6 +139,13 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 - `monitor.py` — `Monitor`: background asyncio sampler → rolling in-memory deques +
   **best-effort SQLite** persistence (`data/monitor.db`) so history survives a restart.
   Backs the Monitor tab and `/api/monitor*`.
+- `stats.py` — `UsageStats`: request/eviction accounting behind `/api/stats/*`
+  (hourly request buckets per unit/model/workload + raw eviction events with a
+  `reason`), same best-effort SQLite contract as the Monitor (`data/stats.db`).
+  **Record-only**: nothing in placement ranking reads it (yet) — it exists to
+  tune eviction preferences. Recorders are sync and I/O-free (a background task
+  flushes), so they are safe to call from eviction paths; they still sit AFTER
+  the stop/unload, never inside a no-await window.
 - `idle.py` — `IdleReaper`: background idle auto-unload policy. Reaps a lane after
   `idle_unload_after_min` of no activity (gateway request / load completion / Monitor
   util spike) so the card drops to P8, and releases the WSL keepalive when no lane
@@ -221,9 +228,11 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 3. **The eviction-wait gate is the contract.** Any new load path must evict + confirm
    VRAM freed (`_wait_vram_free`) before loading. Don't add a load that skips it.
    Likewise any policy that unloads (the idle reaper, the lease sweeper, placement
-   eviction) goes **only** through `Unit.unload` or the unit's OWN load path under its
+   eviction) goes **only** through `Unit.unload`, the unit's OWN load path under its
    own lock (`SparkUnit._load` stops a reload target, a tp>1 sweep, and placement
-   victims there — each re-validated under the lock) — never a private unload path.
+   victims there — each re-validated under the lock), or the unit's own
+   `placement_evict` (SparkGroup — group + member locks held, re-validated) —
+   never a private unload path.
    Only release the WSL keepalive when no lane serves vLLM and no lane lock is held.
 4. **Hold WSL open around vLLM.** WSL2 idle-shuts-down the whole distro ~seconds after
    the last `wsl.exe` exits, killing a just-loaded vLLM model *and* the relay — even
@@ -320,11 +329,19 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 16. **`X-LLM-Hold` claims a PREEMPTIBLE lease, deliberately.** A static-config client
    (opencode) cannot send a lease id — none exists until claimed — so the header asks
    the gateway to claim/renew one for it. It is preemptible because the goal is
-   "don't displace my model automatically" (idle reaper, placement eviction), NOT
-   "refuse everyone else" — a non-preemptible auto-hold would 409 every other client
-   the moment opencode touched a shared model. It never preempts an existing holder,
-   never raises into the request, and lapses `AUTO_HOLD_TTL_S` after the last request.
-   Non-preemptible exclusivity stays a deliberate, manual `/api/leases` claim.
+   "notify me when displaced", NOT "refuse everyone else" — a non-preemptible
+   auto-hold would 409 every other client the moment opencode touched a shared
+   model. It never preempts an existing holder AT CLAIM TIME, never raises into
+   the request, and lapses `AUTO_HOLD_TTL_S` after the last request; the claim
+   carries the request's classified placement priority (`PLACEMENT_PRIORITY_*`).
+   Preemption happens at **placement/eviction time** instead (2026-08-05
+   redesign): an IDLE model under a preemptible lease is a legal placement
+   victim, and an ACTIVELY-serving one yields to strictly higher-priority
+   traffic — the eviction revokes the lease (`preempted_by_placement`,
+   `revoked_by` = the incoming holder) so the displaced app learns via poll/409
+   and waits; the long-running apps this fleet serves are DESIGNED for that
+   hard interruption. Non-preemptible exclusivity stays a deliberate, manual
+   `/api/leases` claim and shields fully.
 
 12. **A lease is additive on the API, never a fourth `usage` value.** `LaneUsage`
    stays `free|idle|active` because off-box consumers switch on it (see invariant 8);
@@ -334,6 +351,14 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    A non-preemptible lease gates `/v1` **and** `POST /api/load`/`/api/unload` (the
    holder authorizes itself via `X-LLM-Lease`) — guarding only `/v1` would let anyone
    swap the model over the held unit through the REST path.
+   A *preemptible* lease is likewise advisory against placement: it stops the
+   idle reaper (that shield is unchanged — ANY live lease blocks the reaper),
+   but it no longer shields an idle model — nor a lower-priority active one —
+   from placement eviction; its value to the holder is the revocation
+   *notification*, not tenure. Mind the default: manual `/api/leases` claims
+   default to `priority 0` and therefore rank below ALL classified traffic
+   (interactive 60 / neutral 40 / batch 20) — claim higher, or non-preemptible,
+   to actually shield.
 13. **Adding a vLLM model needs a `serve.sh` case, not just a registry row.** The
    registry's `launch_args` / `managed_by: registry` fields are currently **unwired** —
    `_load_vllm` always launches via `vllm@<alias>` → `serve.sh <alias>`, whose hardcoded
@@ -341,13 +366,27 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    add the alias row. If you wire up `managed_by: registry`, update `lane.py` + doctor.
 15. **Auto-placement is advisory; the gates are elsewhere.** A `/v1` request without
    `X-LLM-Lane` (or with `X-LLM-Lane: auto`) lets `placement.py` pick the unit:
-   resident first, then free capacity, then eviction of idle+unleased models — but
-   the ranking runs on a snapshot, so nothing may TRUST it. Admission (`_admit`),
+   resident first, then free capacity, then eviction of models that are not
+   shielded — a victim must not be non-preemptibly leased, and must be idle OR
+   preemptibly held below the request's classified priority (`workload_priority`:
+   interactive > neutral > batch; REST paths rank at neutral; an unleased ACTIVE
+   model is never a victim — no holder to notify). Single-node victims come
+   before groups, groups ascending by node count (`ResidentFact.span`,
+   `Decision.group_victims` → `SparkGroup.placement_evict`). But the ranking
+   runs on a snapshot, so nothing may TRUST it. Admission (`_admit`),
    the unit lock, the lease gate, and the under-lock re-validation of eviction
-   victims (`_evict_victim`, refusing with `placement_conflict:`) are the real
-   gates; the gateway answers a conflict with ONE re-place, never a loop. A model
+   victims (`_evict_victim` / `Lane._preempt_occupant_leases` /
+   `placement_evict`, refusing with `placement_conflict:`) are the real gates —
+   re-validation re-checks preemptibility and priority, not mere lease
+   existence, and REVOKES the displaced preemptible lease (sync, before the
+   stop) so the holder learns; the gateway answers a conflict with ONE
+   re-place, never a loop. A model
    resolving on exactly one unit bypasses ranking entirely (sole-candidate pin), so
-   a single-unit deployment behaves exactly as an explicit header would.
+   a single-unit deployment behaves exactly as an explicit header would — pins
+   (and explicit loads) carry `priority=None`, keeping the unit's own load
+   semantics including a lane's last-writer-wins eviction.
+   `PLACEMENT_PREEMPT_LEASED_IDLE_ENABLED` / `PLACEMENT_PREEMPT_ACTIVE_ENABLED` /
+   `PLACEMENT_GROUP_EVICTION_ENABLED` each restore the pre-redesign shield.
    `AUTO_PLACE_ENABLED=false` restores the implicit-primary default byte-for-byte.
    The id `auto` is reserved and can never name a unit.
    **The proven-load gate** (`PLACEMENT_REQUIRE_PROVEN`, 2026-07-28) and the
@@ -520,15 +559,26 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
     and `::test_group_config_refuses_uncabled_node_set` pin this.
 
     **A group-claimed row on a member is not that member's model to touch.**
-    `LoadedModel.group` marks it, and three places must skip it — every one of
-    them was a real bug (review 2026-07-29): the idle reaper (it has no
+    `LoadedModel.group` marks it, and the reaper and cookbook must skip it —
+    both were real bugs (review 2026-07-29): the idle reaper (it has no
     per-model clock on the member, so it reads as the STALEST occupant and
     would be chosen every tick, only for `unload()` to refuse it and for the
-    genuinely reapable neighbour to be shadowed), the cookbook snapshot (the
-    model lives in the cluster catalog, so a state recording it under a member
-    id can never be applied), and single-node placement's victim selection
-    (already handled: the row reports `leased=True`). Anything new that
-    enumerates `st.loaded_models` and then acts on a row needs the same check.
+    genuinely reapable neighbour to be shadowed — the reaper still NEVER
+    touches group rows), and the cookbook snapshot (the model lives in the
+    cluster catalog, so a state recording it under a member id can never be
+    applied). Single-node placement handles the row differently since the
+    2026-08-05 redesign: it may choose the GROUP as a victim — the row carries
+    the group's span/id/lease facts, and an eligible one lands in
+    `Decision.group_victims` (group unit ids, ranked LAST by node count).
+    Teardown goes through `SparkGroup.placement_evict` — group + ordered
+    member locks, sync re-validation (claim/lease/idle/priority), lease
+    revocation, then `_stop_current` — executed by the CALLER
+    (`Placer.evict_group_victims`) BEFORE the member load job, never under the
+    member's own lock (deadlock). A group row whose group unit cannot be
+    resolved stays fully shielded, and group-evicts-group stays out of scope
+    (overlapping claims still fast-fail `placement_conflict`). Anything new
+    that enumerates `st.loaded_models` and then acts on a row needs the same
+    group-awareness.
     Symmetrically, anything that asks "does this unit take `server='spark'`?"
     must accept a group too — `/api/load`'s `isinstance(SparkUnit)` check 400'd
     placement's own group decision.

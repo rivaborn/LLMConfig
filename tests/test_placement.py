@@ -13,6 +13,7 @@ from llmconfig.placement import (
     classify_workload,
     rank,
     wants_auto,
+    workload_priority,
 )
 from llmconfig.schemas import GpuOut, LaneStatus, LoadedModel
 
@@ -47,9 +48,11 @@ def spark(unit, *, residents=(), committed=None, want=0.3, whole=False,
 
 
 def gpu_lane(unit, *, usage, occupant=None, leased=False, refused=False,
-             order=0, vram=0.0):
+             order=0, vram=0.0, preemptible=True, lease_priority=0):
     res = ([ResidentFact(model=occupant, alias=occupant, budget=0.0,
-                         idle_s=IDLE if usage == "idle" else 1.0, leased=leased)]
+                         idle_s=IDLE if usage == "idle" else 1.0, leased=leased,
+                         lease_preemptible=(preemptible if leased else None),
+                         lease_priority=lease_priority)]
            if occupant else [])
     return CandidateFacts(
         unit_id=unit, kind="gpu",
@@ -60,9 +63,13 @@ def gpu_lane(unit, *, usage, occupant=None, leased=False, refused=False,
     )
 
 
-def R(model, *, budget=0.3, idle=IDLE, leased=False, alias=None):
+def R(model, *, budget=0.3, idle=IDLE, leased=False, alias=None,
+      preemptible=True, lease_priority=0, span=1, group_id=""):
     return ResidentFact(model=model, alias=alias or model, budget=budget,
-                        idle_s=idle, leased=leased)
+                        idle_s=idle, leased=leased,
+                        lease_preemptible=(preemptible if leased else None),
+                        lease_priority=lease_priority, span=span,
+                        group_id=group_id)
 
 
 # --------------------------------------------------------------------------- #
@@ -71,6 +78,17 @@ def R(model, *, budget=0.3, idle=IDLE, leased=False, alias=None):
 def test_wants_auto_on_absent_empty_or_sentinel():
     assert wants_auto(None) and wants_auto("") and wants_auto("auto") and wants_auto(" AUTO ")
     assert not wants_auto("primary") and not wants_auto("spark1")
+
+
+def test_workload_priority_mapping():
+    """interactive > neutral > batch; None (REST, kill switch) is NEUTRAL —
+    the absence of a workload maps to the middle of the scale, it is never
+    fabricated into one."""
+    assert workload_priority(Workload(cls="interactive"), S) == S.placement_priority_interactive
+    assert workload_priority(Workload(cls="batch"), S) == S.placement_priority_batch
+    assert workload_priority(None, S) == S.placement_priority_neutral
+    assert (S.placement_priority_interactive > S.placement_priority_neutral
+            > S.placement_priority_batch)
 
 
 # --------------------------------------------------------------------------- #
@@ -170,26 +188,116 @@ def test_spark_eviction_picks_fewest_then_stalest_victims():
     assert d.victims == ["b"], "one victim suffices; the stalest goes"
 
 
-def test_leased_and_active_residents_are_never_victims():
-    leased = spark("s1", residents=[R("a", budget=0.8, leased=True)],
-                   committed=0.8, want=0.3)
+def test_nonpreemptible_and_unleased_active_residents_are_never_victims():
+    """The two shields that survive the redesign: a NON-preemptible lease, and
+    an unleased ACTIVE model (no holder to notify)."""
+    hard_held = spark("s1", residents=[R("a", budget=0.8, leased=True,
+                                         preemptible=False)],
+                      committed=0.8, want=0.3)
     active = spark("s2", residents=[R("b", budget=0.8, idle=1.0)],
                    committed=0.8, want=0.3, order=1)
-    d = rank("target", [leased, active], S)
+    d = rank("target", [hard_held, active], S)
     assert d.outcome == "no_capacity"
-    assert "lease" in d.reasons["s1"] or "no idle" in d.reasons["s1"]
 
 
-def test_lane_displacement_idle_unleased_only():
+def test_idle_preemptibly_leased_resident_is_a_victim():
+    """Rule 1: a preemptible lease buys a revocation notification, not tenure —
+    once the model idles past the window, any request may displace it."""
+    held = spark("s1", residents=[R("a", budget=0.8, leased=True,
+                                    preemptible=True)],
+                 committed=0.8, want=0.3)
+    # A sole candidate would pin; a hard-blocked second unit makes tier 4 decide.
+    blocked = spark("s2", residents=[R("x", budget=0.8, leased=True,
+                                       preemptible=False)],
+                    committed=0.8, want=0.3, order=1)
+    d = rank("target", [held, blocked], S)
+    assert d.outcome == "place" and d.unit_id == "s1" and d.victims == ["a"]
+
+
+def test_active_preemptible_yields_only_to_higher_priority():
+    """Rule 2: an ACTIVELY-serving model under a preemptible lease yields to
+    strictly higher-priority traffic (interactive 60 > batch 20), never to
+    equal or lower."""
+    held = spark("s1", residents=[R("a", budget=0.8, idle=1.0, leased=True,
+                                    preemptible=True, lease_priority=20)],
+                 committed=0.8, want=0.3)
+    blocked = spark("s2", residents=[R("x", budget=0.8, leased=True,
+                                       preemptible=False)],
+                    committed=0.8, want=0.3, order=1)
+    interactive = Workload(cls="interactive")
+    batch = Workload(cls="batch")
+    d_hi = rank("target", [held, blocked], S, workload=interactive)
+    assert d_hi.outcome == "place" and d_hi.victims == ["a"]
+    d_eq = rank("target", [held, blocked], S, workload=batch)
+    assert d_eq.outcome == "no_capacity", "equal priority never preempts an active holder"
+
+
+def test_lane_displacement_rules():
     idle_lane = gpu_lane("primary", usage="idle", occupant="old", order=0)
     active_lane = gpu_lane("companion", usage="active", occupant="busy", order=1)
     d = rank("target", [idle_lane, active_lane], S)
     assert d.outcome == "place" and d.unit_id == "primary"
     assert d.victims == [], "Lane.load evicts on its own — no explicit victims"
 
-    leased_lane = gpu_lane("primary", usage="idle", occupant="old", leased=True)
+    # An idle PREEMPTIBLY-leased lane occupant is displaceable (rule 1)…
+    leased_lane = gpu_lane("primary", usage="idle", occupant="old", leased=True,
+                           preemptible=True)
     d2 = rank("target", [leased_lane, active_lane], S)
-    assert d2.outcome == "no_capacity"
+    assert d2.outcome == "place" and d2.unit_id == "primary"
+
+    # …a non-preemptible one is not.
+    hard_lane = gpu_lane("primary", usage="idle", occupant="old", leased=True,
+                         preemptible=False)
+    d3 = rank("target", [hard_lane, active_lane], S)
+    assert d3.outcome == "no_capacity"
+
+    # An ACTIVE occupant under a low-priority preemptible lease yields to
+    # interactive traffic and to nothing at or below its own priority.
+    busy_held = gpu_lane("primary", usage="active", occupant="old", leased=True,
+                         preemptible=True, lease_priority=20)
+    d4 = rank("target", [busy_held, active_lane], S, workload=Workload(cls="interactive"))
+    assert d4.outcome == "place" and d4.unit_id == "primary"
+    d5 = rank("target", [busy_held, active_lane], S, workload=Workload(cls="batch"))
+    assert d5.outcome == "no_capacity"
+
+
+def test_preemption_kill_switches_restore_the_old_shields():
+    held_idle = spark("s1", residents=[R("a", budget=0.8, leased=True,
+                                         preemptible=True)],
+                      committed=0.8, want=0.3)
+    blocked = spark("s2", residents=[R("x", budget=0.8, leased=True,
+                                       preemptible=False)],
+                    committed=0.8, want=0.3, order=1)
+    off1 = Settings(_env_file=None, placement_preempt_leased_idle_enabled=False)
+    assert rank("target", [held_idle, blocked], off1).outcome == "no_capacity"
+
+    held_active = spark("s1", residents=[R("a", budget=0.8, idle=1.0, leased=True,
+                                           preemptible=True, lease_priority=20)],
+                        committed=0.8, want=0.3)
+    off2 = Settings(_env_file=None, placement_preempt_active_enabled=False)
+    assert rank("target", [held_active, blocked], off2,
+                workload=Workload(cls="interactive")).outcome == "no_capacity"
+
+
+def test_group_victim_ordering_single_node_first_then_ascending_span():
+    """Single-node victims beat group teardowns; a 2-node group beats a 4-node
+    one. `group_victims` carries the group unit ids, `victims` stays empty for
+    a pure group teardown."""
+    single = spark("s1", residents=[R("a", budget=0.8)], committed=0.8, want=0.3)
+    two_node = spark("s2", residents=[R("g2m", budget=0.0, span=2, group_id="g2")],
+                     committed=0.0, want=0.3, order=1)
+    four_node = spark("s3", residents=[R("g4m", budget=0.0, span=4, group_id="g4")],
+                      committed=0.0, want=0.3, order=2)
+    d = rank("target", [single, two_node, four_node], S)
+    assert d.unit_id == "s1" and d.victims == ["a"] and d.group_victims == []
+
+    d2 = rank("target", [two_node, four_node], S)
+    assert d2.unit_id == "s2" and d2.victims == [] and d2.group_victims == ["g2"]
+
+    off = Settings(_env_file=None, placement_group_eviction_enabled=False)
+    d3 = rank("target", [two_node, four_node], off)
+    assert d3.outcome == "no_capacity", "kill switch restores un-evictable groups"
+    assert "group" in d3.reasons["s2"]
 
 
 def test_whole_node_claim_needs_every_resident_evictable():

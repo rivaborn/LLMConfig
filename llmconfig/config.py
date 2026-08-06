@@ -383,6 +383,21 @@ class Settings(BaseSettings):
     placement_workload_enabled: bool = True
     placement_interactive_max_prompt_chars: int = 16000   # ~4k tokens at 4 chars/tok
     placement_interactive_max_new_tokens: int = 2048
+    # --- placement priorities (preemption by classified traffic) ---
+    # /v1 traffic ranks by its classified workload; REST paths and unclassified
+    # requests rank at neutral. A PREEMPTIBLE lease held below the incoming
+    # priority no longer shields an ACTIVE model, and no preemptible lease
+    # shields an IDLE one — the eviction revokes the lease so the holder learns
+    # via poll/409. Manual /api/leases claims default to priority 0 (schemas),
+    # so a plain preemptible claim yields to ALL classified traffic; claim
+    # higher (or non-preemptible) to shield. Interactive > neutral > batch.
+    placement_priority_interactive: int = 60
+    placement_priority_neutral: int = 40
+    placement_priority_batch: int = 20
+    # Kill switches — False restores the pre-redesign behavior for that rule.
+    placement_preempt_active_enabled: bool = True       # active + lower priority evictable
+    placement_preempt_leased_idle_enabled: bool = True  # idle + preemptible evictable
+    placement_group_eviction_enabled: bool = True       # groups as placement victims
 
     spark_max_models: int = 4
     # Total share of a node's pool that may be committed at once. Loads are refused
@@ -521,6 +536,18 @@ class Settings(BaseSettings):
     # When false, history is in-memory only (lost on restart, as before).
     monitor_persist: bool = True
     monitor_db_path: Path = REPO_ROOT / "data" / "monitor.db"
+
+    # --- usage stats (request/eviction accounting behind /api/stats/*) ---
+    # Record-only: which models are actually used and how often preemption or
+    # eviction fires — the data for tuning eviction preferences. Requests are
+    # aggregated into hourly buckets per (unit, model, workload); evictions are
+    # kept as raw events (they're rare). Best-effort SQLite, same contract as
+    # the Monitor: a DB failure disables persistence, collection continues
+    # in-memory. Nothing in placement ranking reads this (yet).
+    stats_enabled: bool = True
+    stats_db_path: Path = REPO_ROOT / "data" / "stats.db"
+    stats_retention_days: int = 90
+    stats_flush_interval_s: float = 60.0
 
     # --- idle auto-unload (power: reap an idle lane so the card drops to P8) ---
     # A resident model pins the card in P0 (~117 W on the 3090); unloading lets it

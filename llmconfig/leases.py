@@ -517,6 +517,40 @@ class LeaseManager:
             self._pending_free[(lease.unit, lease.model)] = PendingFree("", time.time(), reason, lease.model)
         return lease
 
+    def revoke_for_eviction(self, unit_id: str, model: str = "", *,
+                            by: str = "placement",
+                            reason: str = "preempted_by_placement",
+                            spare_holder: str = "") -> list[Lease]:
+        """Terminate the PREEMPTIBLE lease(s) governing (unit, model) because an
+        eviction is displacing the model. Sync, no I/O — callable between an
+        under-lock final check and the unload (invariant 11). Returns the leases
+        it revoked (possibly empty).
+
+        NEVER touches a non-preemptible lease: callers must have refused the
+        eviction already; skipping one here (rather than raising) keeps the
+        helper safe to call after that check without re-deriving it.
+
+        `model=""` is the whole-unit form — every live preemptible lease on the
+        unit goes, model-scoped ones included, because a lane eviction takes the
+        whole card and a model-scoped lease must not survive its model.
+        `spare_holder` exempts the requester's own lease (a same-holder reload
+        must not revoke its own hold).
+        """
+        if model:
+            targets = [l for l in (self.active_for(unit_id, self._canon(unit_id, model)),)
+                       if l is not None]
+        else:
+            targets = self.active_all(unit_id)
+        revoked: list[Lease] = []
+        for lease in targets:
+            if not lease.preemptible:
+                continue
+            if spare_holder and lease.holder == spare_holder:
+                continue
+            self._terminate(lease, "revoked", by=by or "placement", reason=reason)
+            revoked.append(lease)
+        return revoked
+
     def note_request(self, lease_id: str) -> None:
         """Record that the holder actually used its lease (observability + the
         `unused` dead-holder detector). Deliberately does NOT extend the deadline."""
@@ -565,10 +599,12 @@ class LeaseSweeper:
     and deferred frees — never correctness.
     """
 
-    def __init__(self, settings: Settings, orch: "Orchestrator", leases: LeaseManager):
+    def __init__(self, settings: Settings, orch: "Orchestrator", leases: LeaseManager,
+                 stats=None):
         self.s = settings
         self.orch = orch
         self.leases = leases
+        self.stats = stats   # UsageStats — records each deferred free (best-effort)
         self.interval = max(1.0, float(settings.lease_sweep_interval_s))
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
@@ -711,3 +747,6 @@ class LeaseSweeper:
         # invariant 3 — always through Unit.unload
         await unit.unload(UnloadRequest(server=None, lane=unit.cfg.id, model=pf.model or None))
         unit.touch(model=pf.model or None)  # restart the idle window, as the reaper does
+        if self.stats is not None:
+            self.stats.note_eviction(unit=unit.cfg.id, model=pf.model or "",
+                                     reason="lease_free", evicted_by=pf.reason)

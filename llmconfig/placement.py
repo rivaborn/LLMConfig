@@ -39,16 +39,27 @@ answer with one re-place (`exclude=` the failed unit).
    measured load first (bucketed to the minute, from `LoadTimes`), then
    emptiest — a fresh load should go where it comes up quickest, but minute-
    level ties fall back to balance.
-4. **Fits with displacement** of idle+unleased models only:
-   - a lane whose occupant is idle and unleased — victims stay EMPTY, because
+4. **Fits with displacement** of models that are not shielded:
+   - a lane whose occupant is displaceable — victims stay EMPTY, because
      `Lane.load` evicts its occupant itself (that *is* its load semantics);
-   - a Spark where stopping the stalest idle unleased co-tenants frees enough
-     declared budget — fewest victims, then stalest. A `tp > 1` or
+   - a Spark where stopping the stalest displaceable co-tenants frees enough
+     declared budget — single-node victims before groups (ascending node
+     count), then fewest victims, then stalest. A `tp > 1` or
      `mem_fraction 0.0` entry claims the whole node: only an empty node, or one
      where EVERY resident is an eligible victim, qualifies.
-   Active models and models with ANY live lease are never victims (matching the
-   idle reaper's convention — even a preemptible lease shields, because
-   placement is an optimisation, not a competing claimant).
+   Who is displaceable (`_victim_eligible`): a NON-preemptible lease shields
+   fully; an UNLEASED model is a victim iff idle (active-and-unleased stays
+   protected — there is no holder to notify); a PREEMPTIBLE lease yields once
+   its model is idle, and while active it yields to strictly higher-priority
+   traffic (`workload_priority`: interactive > neutral > batch — REST paths
+   rank at neutral). Evicting a leased victim REVOKES the lease
+   (`preempted_by_placement`), so the displaced holder learns via poll/409.
+   A multi-node group model is a victim too — ranked LAST via its node span —
+   and its eviction is a whole-group teardown carried in
+   `Decision.group_victims`, executed by the caller through
+   `SparkGroup.placement_evict` BEFORE the target unit's load.
+   The idle reaper keeps its stricter convention (ANY lease shields it):
+   the reaper is a power optimisation, placement is a competing request.
 5. Nothing admissible → `NoCapacity`, one reason per unit, so the 503 explains
    itself. A model in no catalog at all → `NotFound` (the gateway's existing
    404 — never collapsed into a 503).
@@ -198,6 +209,22 @@ def classify_workload(body: dict, header: Optional[str],
                     prompt_chars=chars, max_tokens=max_tokens)
 
 
+def workload_priority(workload: Optional[Workload], settings: Settings) -> int:
+    """Placement priority of an incoming request (PLACEMENT_PRIORITY_*).
+
+    None (REST paths, workload kill switch) is NEUTRAL — this does not
+    fabricate a Workload (invariant 15), it maps its absence onto the middle of
+    the scale so unclassified traffic neither bullies batch holders nor yields
+    to them."""
+    if workload is None:
+        return settings.placement_priority_neutral
+    if workload.cls == "interactive":
+        return settings.placement_priority_interactive
+    if workload.cls == "batch":
+        return settings.placement_priority_batch
+    return settings.placement_priority_neutral
+
+
 # --------------------------------------------------------------------------- #
 # Facts
 # --------------------------------------------------------------------------- #
@@ -210,6 +237,16 @@ class ResidentFact:
     budget: float         # declared mem_fraction (0.0 = unbudgeted/whole-node)
     idle_s: float         # per-model idle clock (unit clock for lanes)
     leased: bool          # ANY live lease (unit-wide or naming this model)
+    # The lease's disposition, for `_victim_eligible`. None = no live lease;
+    # False here is the full shield (also used as a sentinel for rows placement
+    # must never touch, e.g. a group row whose group unit can't be resolved).
+    lease_preemptible: Optional[bool] = None
+    lease_priority: int = 0
+    # Nodes this ROW spans: 1 for a normal resident, K for a group-claimed row.
+    # Victim ordering prefers the smallest span — tearing down a 2-node model
+    # to place a 1-node one is a last resort, a 4-node one more so.
+    span: int = 1
+    group_id: str = ""    # owning SparkGroup unit id for a group row ("" otherwise)
 
 
 @dataclass
@@ -252,6 +289,11 @@ class Decision:
     server: str = ""
     load_arg: str = ""
     victims: list[str] = field(default_factory=list)   # canonical aliases to evict
+    # SparkGroup unit ids whose model must be torn down first. Separate from
+    # `victims` because a group teardown is a cross-unit operation the CALLER
+    # executes (Placer.evict_group_victims → SparkGroup.placement_evict) before
+    # the target unit's load job — the target's own lock can't do it.
+    group_victims: list[str] = field(default_factory=list)
     reasons: dict[str, str] = field(default_factory=dict)  # unit -> why not (no_capacity)
     tier: str = ""                         # which tier fired: pin|resident|fits|displace
                                            # ("" on refusals) — for the decision log
@@ -269,13 +311,34 @@ def _fits_without_displacement(c: CandidateFacts, headroom: float) -> bool:
     return c.committed + c.want <= headroom + 1e-9
 
 
-def _victims_for(c: CandidateFacts, headroom: float,
-                 active_window_s: float) -> Optional[list[ResidentFact]]:
+def _victim_eligible(r: ResidentFact, incoming_priority: int,
+                     active_window_s: float, settings: Settings) -> bool:
+    """May placement displace this resident? (See the module docstring, tier 4.)
+
+    The asymmetries are deliberate: an UNLEASED active model is never a victim
+    (there is no holder to notify), while a PREEMPTIBLE lease buys its holder a
+    *notification*, not tenure — idle it yields to anyone, active it yields to
+    strictly higher priority. A non-preemptible lease shields fully."""
+    if r.lease_preemptible is False:                  # non-preemptible: full shield
+        return False
+    if r.group_id and not settings.placement_group_eviction_enabled:
+        return False
+    idle = r.idle_s > active_window_s
+    if r.lease_preemptible is None:                   # unleased: today's rule
+        return idle
+    if idle:                                          # preemptible + idle
+        return settings.placement_preempt_leased_idle_enabled
+    return (settings.placement_preempt_active_enabled  # preemptible + active
+            and r.lease_priority < incoming_priority)
+
+
+def _victims_for(c: CandidateFacts, headroom: float, active_window_s: float,
+                 incoming_priority: int, settings: Settings) -> Optional[list[ResidentFact]]:
     """Cheapest eligible eviction set that makes the model fit, or None."""
     eligible = sorted(
         (r for r in c.residents
-         if not r.leased and r.idle_s > active_window_s),
-        key=lambda r: -r.idle_s,           # stalest first
+         if _victim_eligible(r, incoming_priority, active_window_s, settings)),
+        key=lambda r: (r.span, -r.idle_s),  # smallest span, then stalest first
     )
     if c.whole_node:
         # Whole-node claim: every resident must go, and every one must be eligible.
@@ -316,14 +379,31 @@ def _victims_for(c: CandidateFacts, headroom: float,
     return victims if fits() else None
 
 
-def _lane_evictable(c: CandidateFacts, active_window_s: float) -> bool:
-    """A lane candidate whose occupant may be displaced (Lane.load does the evicting)."""
+def _lane_evictable(c: CandidateFacts, active_window_s: float,
+                    incoming_priority: int, settings: Settings) -> bool:
+    """A lane candidate whose occupant may be displaced (Lane.load does the evicting).
+
+    The lane flavour of `_victim_eligible`, keyed off `c.usage` rather than the
+    occupant's `idle_s` — usage folds in the Monitor's util signal (a client
+    hitting Ollama or the relay directly) and a swap in progress, which the
+    unit-level idle clock alone can miss."""
     if c.kind == "spark":
         return False
     if c.usage == "free":
         return True
     occ = c.residents[0] if c.residents else None
-    return c.usage == "idle" and occ is not None and not occ.leased
+    if occ is None or occ.lease_preemptible is False:
+        return False
+    if c.usage == "idle":
+        # Idle: unleased yields to anyone (today's rule); a preemptible lease
+        # yields unless the rule-1 kill switch restored the old shield.
+        return (occ.lease_preemptible is None
+                or settings.placement_preempt_leased_idle_enabled)
+    # Active: only a preemptible lease held below the incoming priority yields;
+    # an unleased active occupant has no holder to notify and stays protected.
+    return (occ.lease_preemptible is True
+            and settings.placement_preempt_active_enabled
+            and occ.lease_priority < incoming_priority)
 
 
 def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
@@ -376,6 +456,7 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
 
     headroom = settings.spark_mem_headroom
     window = settings.usage_active_window_s
+    prio = workload_priority(workload, settings)
 
     def fresh_ok(c: CandidateFacts) -> bool:
         """May this unit take a FRESH load? (The gate — tiers 3/4 only.)"""
@@ -420,27 +501,32 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
         return Decision(outcome="place", unit_id=c.unit_id, server=c.server,
                         load_arg=c.load_arg, tier="fits")
 
-    # Tier 4 — fits by displacing idle + unleased models only.
+    # Tier 4 — fits by displacing eligible victims (see _victim_eligible).
     displaceable: list[tuple[CandidateFacts, list[ResidentFact]]] = []
     for c in cands:
         if c.lease_refused or not fresh_ok(c):
             continue
         if c.kind == "spark":
-            v = _victims_for(c, headroom, window)
+            v = _victims_for(c, headroom, window, prio, settings)
             if v is not None:
                 displaceable.append((c, v))
-        elif _lane_evictable(c, window):
+        elif _lane_evictable(c, window, prio, settings):
             displaceable.append((c, []))   # Lane.load evicts on its own
     if displaceable:
-        # Fewest nodes leads (see CandidateFacts.member_count — only groups
-        # differ), then fewest victims, then stalest.
+        # Fewest nodes on the TARGET leads (see CandidateFacts.member_count —
+        # only groups differ), then the cheapest VICTIMS: single-node victims
+        # before groups, ascending by node span, then fewest, then stalest.
         displaceable.sort(key=lambda cv: (cv[0].member_count,
+                                          max((r.span for r in cv[1]), default=1),
                                           len(cv[1]),
                                           -(cv[1][0].idle_s if cv[1] else 1e18),
                                           *order_key(cv[0])))
         c, victims = displaceable[0]
         return Decision(outcome="place", unit_id=c.unit_id, server=c.server,
-                        load_arg=c.load_arg, victims=[r.alias for r in victims],
+                        load_arg=c.load_arg,
+                        victims=[r.alias for r in victims if not r.group_id],
+                        group_victims=list(dict.fromkeys(
+                            r.group_id for r in victims if r.group_id)),
                         tier="displace")
 
     # Tier 5 — nothing admissible: say why, per unit.
@@ -457,16 +543,27 @@ def rank(model: str, candidates: list[CandidateFacts], settings: Settings,
                                   "explicitly to prove it")
         elif c.kind == "spark" and not c.free_slot:
             reasons[c.unit_id] = "all slots in use"
+        elif c.kind == "spark" and any(
+                r.group_id and not _victim_eligible(r, prio, window, settings)
+                for r in c.residents):
+            # Before the unbudgeted-resident reason: a group row is unbudgeted
+            # by construction, and "groups are evicted last" is the useful part.
+            reasons[c.unit_id] = ("a multi-node group model holds this node and "
+                                  "is active, shielded, or held at equal/higher "
+                                  "priority — groups are evicted last")
         elif c.kind == "spark" and any(r.budget <= 0.0 for r in c.residents):
             reasons[c.unit_id] = "an unbudgeted resident claims the whole node"
         elif c.kind == "spark" and c.whole_node:
             reasons[c.unit_id] = ("whole-node recipe (tp>1 or unbudgeted) — "
-                                  "residents are active or leased")
+                                  "a resident is active, non-preemptibly leased, "
+                                  "or held at equal/higher priority")
         elif c.kind == "spark":
             reasons[c.unit_id] = (f"committed {c.committed:.2f} + {c.want:.2f} "
-                                  f"exceeds {headroom:.2f}; no idle unleased co-tenant frees enough")
+                                  f"exceeds {headroom:.2f}; no displaceable "
+                                  f"co-tenant frees enough")
         else:
-            reasons[c.unit_id] = "occupant is active or leased"
+            reasons[c.unit_id] = ("occupant is active, non-preemptibly leased, "
+                                  "or held at equal/higher priority")
     return Decision(outcome="no_capacity", reasons=reasons)
 
 
@@ -652,17 +749,44 @@ class Placer:
             budgets = unit.declared_budgets([m.model for m in st.loaded_models])
             for m in st.loaded_models:
                 alias = unit.canonical_model(m.model)
+                if m.group:
+                    # A multi-node claim: the row belongs to its GROUP, not this
+                    # member — clocks and leases live on the group unit, and
+                    # eviction is a whole-group teardown (Decision.group_victims
+                    # → SparkGroup.placement_evict), never a slot stop here. An
+                    # unresolvable group (stale claim, fabric flipped off) stays
+                    # fully shielded — never evict what we can't tear down.
+                    grp = self.orch.units.get(m.group)
+                    if grp is None or not hasattr(grp, "placement_evict"):
+                        residents.append(ResidentFact(
+                            model=m.model, alias=alias, budget=0.0,
+                            idle_s=0.0, leased=True, lease_preemptible=False,
+                            span=1, group_id=m.group))
+                        continue
+                    g_alias = grp.canonical_model(m.model)
+                    g_lease = self.leases.active_for(m.group, g_alias)
+                    residents.append(ResidentFact(
+                        model=m.model,
+                        alias=g_alias,
+                        budget=0.0,
+                        idle_s=grp.idle_for(m.model),
+                        leased=True,
+                        lease_preemptible=(g_lease.preemptible
+                                           if g_lease is not None else None),
+                        lease_priority=g_lease.priority if g_lease is not None else 0,
+                        span=len(grp.cfg.member_ids),
+                        group_id=m.group,
+                    ))
+                    continue
+                lease = self.leases.active_for(uid, alias)
                 residents.append(ResidentFact(
                     model=m.model,
                     alias=alias,
                     budget=budgets.get(m.model, 0.0),
                     idle_s=unit.idle_for(m.model),
-                    # A multi-node claim (m.group) is shielded like a lease: it can
-                    # never be a single-node eviction victim — its containers span
-                    # OTHER nodes, and teardown is a group operation
-                    # (/api/cluster/unload), not a slot stop on this one.
-                    leased=(bool(m.group)
-                            or self.leases.active_for(uid, alias) is not None),
+                    leased=lease is not None,
+                    lease_preemptible=lease.preemptible if lease is not None else None,
+                    lease_priority=lease.priority if lease is not None else 0,
                 ))
         else:
             for m in st.loaded_models:
@@ -671,10 +795,13 @@ class Placer:
                 # gate's residency-proof broken for GPU lanes (the 2026-07-28
                 # alias fix was only half-applied; review 2026-07-29).
                 e = unit.registry.find_by_served_name(m.model)
+                lease = self.leases.active_for(uid)
                 residents.append(ResidentFact(
                     model=m.model, alias=(e.alias if e else m.model), budget=0.0,
                     idle_s=st.idle_s or 0.0,
-                    leased=self.leases.active_for(uid) is not None,
+                    leased=lease is not None,
+                    lease_preemptible=lease.preemptible if lease is not None else None,
+                    lease_priority=lease.priority if lease is not None else 0,
                 ))
         committed = sum(r.budget for r in residents) + self._inflight_budget(unit, st)
         want = entry.mem_fraction if entry is not None else 0.0
@@ -720,28 +847,44 @@ class Placer:
             budgets = m_unit.declared_budgets([lm.model for lm in m_st.loaded_models])
             for lm in m_st.loaded_models:
                 alias = m_unit.canonical_model(lm.model)
+                if lm.group:
+                    # ANY group's claim on a member is untouchable from a group
+                    # candidate — group-evicts-group is out of scope (the load
+                    # path fast-fails such overlaps with placement_conflict),
+                    # so the row keeps the full shield here.
+                    residents.append(ResidentFact(
+                        model=lm.model, alias=alias, budget=0.0,
+                        idle_s=m_unit.idle_for(lm.model),
+                        leased=True, lease_preemptible=False,
+                        group_id=lm.group))
+                    continue
+                lease = self.leases.active_for(mid, alias)
                 residents.append(ResidentFact(
                     model=lm.model,
                     alias=alias,
                     budget=budgets.get(lm.model, 0.0),
                     idle_s=m_unit.idle_for(lm.model),
-                    # Another group's claim on a member is untouchable here —
-                    # same shielding as in _facts_for.
-                    leased=(bool(lm.group)
-                            or self.leases.active_for(mid, alias) is not None),
+                    leased=lease is not None,
+                    lease_preemptible=lease.preemptible if lease is not None else None,
+                    lease_priority=lease.priority if lease is not None else 0,
                 ))
         # The group's own residency (its model on the head) rides on top so
         # tier 2 can route a request for the RESIDENT group model here.
+        k = len(group.cfg.member_ids)
         for lm in st.loaded_models:
+            g_lease = self.leases.active_for(group.cfg.id)
             residents.append(ResidentFact(
                 model=lm.model,
                 alias=group.canonical_model(lm.model),
                 budget=0.0,
                 idle_s=group.idle_for(lm.model),
-                leased=self.leases.active_for(group.cfg.id) is not None,
+                leased=g_lease is not None,
+                lease_preemptible=g_lease.preemptible if g_lease is not None else None,
+                lease_priority=g_lease.priority if g_lease is not None else 0,
+                span=k,
+                group_id=group.cfg.id,
             ))
         usage = classify_usage(st, self.monitor.util_for(group.cfg.gpu_uuid), self.s)
-        k = len(group.cfg.member_ids)
         # Gate facts, group flavour. `proven` cannot come from residency here (a
         # multi-node cold start is the expensive case the gate exists for), so the
         # proof is the PERSISTED RECORD: this alias has launched on THIS node set
@@ -826,7 +969,8 @@ class Placer:
                 decision: Decision, workload: Optional[Workload] = None) -> None:
         """Append to the ring buffer (see __init__ for the dedupe rationale)."""
         boring = (decision.outcome in ("place", "pin")
-                  and not decision.victims and not exclude)
+                  and not decision.victims and not decision.group_victims
+                  and not exclude)
         if boring and self._decisions:
             last = self._decisions[-1]
             if (last.get("_boring")
@@ -846,7 +990,9 @@ class Placer:
             "unit": decision.unit_id,
             "tier": decision.tier,
             "workload": workload.cls if workload else "",
+            "priority": workload_priority(workload, self.s),
             "victims": list(decision.victims),
+            "group_victims": list(decision.group_victims),
             "server_constraint": server or "",
             "exclude": sorted(exclude),
             "reasons": dict(decision.reasons),
@@ -873,3 +1019,27 @@ class Placer:
         """Newest-first copy of the log, without the internal dedupe marker."""
         return [{k: v for k, v in d.items() if not k.startswith("_")}
                 for d in reversed(self._decisions)]
+
+    # ---- group-victim execution ----
+    async def evict_group_victims(self, group_victims: list[str], *,
+                                  priority: Optional[int],
+                                  requested_by: str) -> None:
+        """Execute a Decision's `group_victims` — tear each group's model down
+        via `SparkGroup.placement_evict` BEFORE the target unit's load job runs.
+
+        The single funnel for every call site (gateway chat/pooling, the one
+        re-place, REST /api/load auto): the teardown holds the group's and every
+        member's lock, so it can never run inside the target member's own load
+        (deadlock) — it happens here, first. Raises
+        `RuntimeError("placement_conflict: …")` when re-validation under those
+        locks refuses (the world moved); callers route that into the existing
+        single-re-place machinery. No-op for an empty list."""
+        if not group_victims:
+            return
+        for gid in group_victims:
+            unit = self.orch.units.get(gid)
+            if unit is None or not hasattr(unit, "placement_evict"):
+                raise RuntimeError(
+                    f"placement_conflict: group victim '{gid}' no longer exists")
+            await unit.placement_evict(priority=priority, requested_by=requested_by)
+        self.invalidate()
