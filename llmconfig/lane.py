@@ -53,8 +53,15 @@ class Lane:
         )
         self._lock = asyncio.Lock()
         self._active_job_id: Optional[str] = None
-        # Set by Orchestrator.attach_load_times(); None = don't record.
+        # Set by Orchestrator.attach_load_times() / attach_leases() /
+        # attach_stats(); None = don't record / no lease awareness.
         self.load_times = None
+        self.leases = None
+        self.stats = None
+        # Holders whose leases the in-flight load revoked, handed from
+        # _preempt_occupant_leases to _note_evictions (the lease is terminal by
+        # the time the eviction itself completes).
+        self._displaced_holders: list[str] = []
         # Idle-reaper input: wall-clock of the last observed activity (gateway
         # request, load completion, or a Monitor util spike). Construction time =
         # app start, so an autoloaded default gets a full idle window before reaping.
@@ -482,6 +489,10 @@ class Lane:
         for l in revoked:
             self.jobs.log(job, f"revoked {l.holder}'s lease on {self.cfg.id} "
                                f"({l.revoked_reason})")
+        # Whose claim this displaced, for the eviction stats. The lane's own
+        # revocation is the only place that knows it — by the time _evict_all
+        # returns the lease is already terminal.
+        self._displaced_holders = [l.holder for l in revoked if l.holder]
         return reason
 
     def _note_evictions(self, req: LoadRequest, reason: str,
@@ -489,6 +500,8 @@ class Lane:
         """Record what this load displaced (usage stats; reload targets are
         filtered — swapping a model out for itself is not an eviction)."""
         stats = getattr(self, "stats", None)
+        holders = getattr(self, "_displaced_holders", []) or []
+        self._displaced_holders = []
         if stats is None:
             return
         for name in displaced:
@@ -497,7 +510,8 @@ class Lane:
             stats.note_eviction(
                 unit=self.cfg.id, model=name, reason=reason,
                 evicted_by=req.requested_by, incoming_model=req.model,
-                incoming_priority=req.priority)
+                incoming_priority=req.priority,
+                holder=", ".join(holders))
 
     async def _evict_all(self, job: Job) -> list[str]:
         """Clear this lane's GPU: stop vLLM, unload all Ollama models, confirm

@@ -568,6 +568,9 @@ async def test_lane_load_revokes_preemptible_leases_on_displacement(monkeypatch,
     assert lease.revoked_reason == "preempted_by_placement"
     assert recorded and recorded[0]["model"] == "held:1"
     assert recorded[0]["reason"] == "idle_preempt"
+    assert recorded[0]["holder"] == "batchapp", \
+        "the stats row must name whose claim this displaced"
+    assert recorded[0]["evicted_by"] == "opencode"
 
 
 async def test_lane_placement_load_respects_active_holder_priority(monkeypatch, tmp_path):

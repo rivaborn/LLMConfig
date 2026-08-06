@@ -10,8 +10,9 @@
 > | Beyond the spec                | What shipped                                                                                  |
 > | ------------------------------ | --------------------------------------------------------------------------------------------- |
 > | **More lanes**                 | the spec knew `primary` + `companion`; there are now also `spark1`–`spark4` (remote DGX nodes) |
-> | **`X-LLM-Lane: auto`**         | `placement.py` picks the unit — resident → free capacity → evict idle+unleased. `auto` is a reserved id. Advisory by design (hard invariant 15) |
-> | **`X-LLM-Hold`**               | the gateway claims/renews a **preemptible** lease per request so a static config can protect its model without a lease id (hard invariant 16) |
+> | **`X-LLM-Lane: auto`**         | `placement.py` picks the unit — resident → free capacity → displace an unshielded model (single-node victims before multi-node groups). `auto` is a reserved id. Advisory by design (hard invariant 15) |
+> | **`X-LLM-Hold`**               | the gateway claims/renews a **preemptible** lease per request so a static config gets session affinity + displacement *notifications* without a lease id (hard invariant 16) |
+> | **Priority preemption**        | an opencode turn (interactive, priority 60) displaces a running batch job (20); the batch app's lease is revoked with `preempted_by_placement` and it retries. `--no-preempt` is still the hard shield (2026-08-05) |
 > | **`X-LLM-Workload`**           | interactive-vs-batch tiering — 3090 = speed tier, Sparks = capacity tier (hard invariant 15)   |
 > | **Pooling endpoints**          | `POST /v1/embeddings`, `/v1/rerank`, `/v1/score` — not in this spec at all                     |
 >

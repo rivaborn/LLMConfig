@@ -384,7 +384,17 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
    resolving on exactly one unit bypasses ranking entirely (sole-candidate pin), so
    a single-unit deployment behaves exactly as an explicit header would — pins
    (and explicit loads) carry `priority=None`, keeping the unit's own load
-   semantics including a lane's last-writer-wins eviction.
+   semantics. **Mind what `priority=None` means per unit kind, because the two
+   differ on purpose**: a Lane SKIPS the active-occupant re-validation entirely
+   (last-writer-wins — a card that holds one model has no other reading of "load
+   X here"), while `SparkUnit`/`SparkGroup` still REFUSE to displace an
+   actively-serving victim (`placement_conflict`), because naming one co-tenant
+   of four is a different act from taking the whole card. So `X-LLM-Lane`, a
+   lease pin, a sole-candidate pin, `POST /api/load`, the cookbook and the boot
+   autoload are all outside the priority ladder — they are "the operator said
+   so", not tier-4 traffic. Only the non-preemptible lease gate refuses them
+   all. Preemptible leases are still revoked on that path
+   (`displaced_by_load`), so a holder always learns.
    `PLACEMENT_PREEMPT_LEASED_IDLE_ENABLED` / `PLACEMENT_PREEMPT_ACTIVE_ENABLED` /
    `PLACEMENT_GROUP_EVICTION_ENABLED` each restore the pre-redesign shield.
    `AUTO_PLACE_ENABLED=false` restores the implicit-primary default byte-for-byte.

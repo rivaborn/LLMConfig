@@ -75,6 +75,53 @@ powershell -ExecutionPolicy Bypass -File deploy\install-service.ps1
 
 UI: `http://192.168.1.40:11430/` · API docs: `…/docs`
 
+## 4b. Upgrading a running install
+
+Two different operations, and picking the wrong one is the usual way a deploy
+"succeeds" while serving stale code:
+
+| Changed                                                                           | Do this            |
+| --------------------------------------------------------------------------------- | ------------------ |
+| A `data/*.yaml` catalog (Spark recipe, cluster model, alias, an `extra_args` cap) | `llmconfig reload` |
+| Python code, `.env`, anything structural (lanes, GPU UUIDs, ports)                | Restart the task   |
+
+`llmconfig reload` (`POST /api/reload`) re-reads every disk-backed catalog in place —
+no dropped gateway, no boot reclaim, no re-fired autoload — and *names* any `.env`
+field that changed but is structural, so you know when a restart is unavoidable.
+
+The restart itself must be **clean**: `Stop-ScheduledTask` can leave the old uvicorn
+child holding `:11430`, and the new instance then wedges.
+
+```powershell
+git -C C:\Coding\rivaborn\LLMConfig pull
+Stop-ScheduledTask -TaskName LLMConfig
+Start-Sleep 2
+Get-CimInstance Win32_Process |
+  Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -match 'uvicorn|llmconfig' } |
+  ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Start-ScheduledTask -TaskName LLMConfig
+```
+
+Then verify — **each step separately**, because a half-applied deploy looks fine:
+
+```powershell
+git -C C:\Coding\rivaborn\LLMConfig log -1 --oneline     # the box is on the commit you think
+curl.exe -s http://127.0.0.1:11430/api/status            # it answers
+curl.exe -s http://127.0.0.1:11430/api/stats/models      # a NEW endpoint answers (not 404)
+```
+
+Resident models survive the bounce — the app re-discovers what each unit is serving
+(Spark slots are probed over HTTP, group claims re-established at boot), so a restart
+mid-inference costs the in-flight request, not the loaded fleet. Everything reads
+`active` for the first minute afterwards because the idle clocks restart; that decays
+on its own.
+
+> Doing this over SSH from another machine? Remote **state-changing** commands are the
+> ones that get denied or half-run. Run each step as its own command and check its
+> output before the next; the box's `git` also cannot push over HTTPS from a
+> non-interactive session (no credential prompt), so commit box-side edits by copying
+> them back to a workstation.
+
 ## 5. (Optional) Companion lane — the RTX 3070 Ti
 
 A second, independent lane that runs its own small model on the 3070 Ti (8 GB) while
@@ -228,6 +275,31 @@ existing `/api/load`, so no extra setup — but the running app must be **restar
 to pick up a new gateway build (the always-on service: re-run `install-service.ps1`
 or restart the scheduled task). The opencode provider rewire lives in
 `rivaborn/opencode-config`.
+
+## Sharing the fleet between callers (priority preemption)
+
+On by default, no setup: `/v1` traffic is classified interactive (priority 60) /
+neutral (40) / batch (20), and a request may displace a model that is idle, or one
+actively serving a *lower*-priority holder. The displaced holder's lease is revoked
+(`preempted_by_placement`) so it can poll and retry — the long-running apps here are
+built for that. A `--no-preempt` lease is the hard shield; the Home-card pin is **not**
+(it only stops the idle reaper). Full rules in the [README](../README.md#priority-preemption--how-batch-and-interactive-work-share-the-fleet).
+
+For an operator this means three things:
+
+- **Nothing new to install** — the defaults ship on; `PLACEMENT_PREEMPT_ACTIVE_ENABLED`,
+  `PLACEMENT_PREEMPT_LEASED_IDLE_ENABLED` and `PLACEMENT_GROUP_EVICTION_ENABLED` each
+  turn one rule back off if a workload turns out to need the old behaviour.
+- **Multi-node deployments are now evictable** (ranked last, after every single-node
+  candidate). If a tp job must survive unattended, hold a `--no-preempt` lease on the
+  group — otherwise a `/v1` request that can only fit on those nodes will tear it
+  down and the members come back as free capacity. The group id is its member ids
+  sorted and joined with `_` (`llmconfig lease claim --unit spark1_spark2
+  --holder nightly-eval --no-preempt`); `GET /api/cluster/placements` lists the node
+  sets that have actually run.
+- **`data/stats.db` is a new file** (gitignored, best-effort, 90-day retention) behind
+  `/api/stats/models` and `/api/stats/evictions` — the first place to look when
+  someone asks *"what evicted my model?"*.
 
 ## Notes
 - If `LLMCONFIG_API_KEY` is set in `.env`, write ops require the `X-API-Key` header (the UI has a field; the CLI reads `$LLMCONFIG_API_KEY`).

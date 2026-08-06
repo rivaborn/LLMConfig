@@ -202,7 +202,8 @@ class UsageStats:
     # ---- reads (endpoint-facing; DB + unflushed buffer merged) ----
     def models(self, days: int = 30) -> list[dict]:
         """Per-model usage over the trailing window, most-requested first."""
-        since = time.time() - max(1, days) * 86400
+        now = time.time()
+        since = now - max(1, days) * 86400
         since_hour = int(since // 3600) * 3600
         agg: dict[str, dict] = {}
 
@@ -215,7 +216,10 @@ class UsageStats:
             m["units"][unit] = m["units"].get(unit, 0) + n
             wl = workload or "unclassified"
             m["workloads"][wl] = m["workloads"].get(wl, 0) + n
-            end = hour_ts + 3600
+            # Buckets are hourly, so the best "last used" this can offer is the
+            # END of the newest bucket holding a request — clamped to now, or
+            # the model in use right now would report up to 59 min in the FUTURE.
+            end = min(hour_ts + 3600, now)
             if m["last_used_ts"] is None or end > m["last_used_ts"]:
                 m["last_used_ts"] = end
 

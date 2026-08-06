@@ -29,7 +29,11 @@ def test_requests_aggregate_into_hourly_buckets(tmp_path):
     assert by_model["gemma"]["workloads"] == {"unclassified": 1}
     assert out[0]["model"] == "qwen3:4b", "most-requested first"
     assert by_model["qwen3:4b"]["share_pct"] == 80.0
-    assert by_model["qwen3:4b"]["last_used_ts"] is not None
+    # Hour-resolution, but never in the future: the bucket a live request lands
+    # in ends up to 59 min from now, and reporting that as "last used" would
+    # read as a timestamp that hasn't happened yet.
+    assert by_model["qwen3:4b"]["last_used_ts"] <= time.time() + 1e-6
+    assert by_model["qwen3:4b"]["last_used_ts"] > time.time() - 3600
 
 
 def test_evictions_record_reason_span_and_holder(tmp_path):

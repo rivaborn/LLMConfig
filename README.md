@@ -39,18 +39,24 @@ so it packs 100 % of VRAM before any CPU spill.
   `num_gpu` to fill VRAM first.
 - **Leases** — a real claim on a unit: who holds it, whether their work may be
   interrupted, how long they need it, and an in-band answer when they get displaced.
+- **Priority preemption.** Long-running batch work and interactive sessions share the
+  fleet without a queue: an idle model yields to anyone, an actively-serving one yields
+  to higher-priority traffic, and the displaced holder is *told* (revoked lease → poll
+  or in-band `409`) so it can wait and come back.
 - **OpenAI `/v1` gateway** with **auto-load on first request**, so a client's `/model`
   picker switches models with no manual swap. `X-LLM-Lane` pins a unit; a request
   **without** the header is **auto-placed** — LLMConfig picks the unit (resident first,
-  then free capacity, then evicting an idle unleased model) and answers with
+  then free capacity, then displacing a model that isn't shielded) and answers with
   `X-LLM-Unit` saying where it ran.
+- **Usage stats** — which models are actually used, how often, and every eviction with
+  the reason it happened (`/api/stats/models`, `/api/stats/evictions`).
 - **Served context window** surfaced per unit — the window a prompt budget must
   actually respect, not the model's architectural maximum.
 - **Independent units.** The 3090 can serve a big vLLM model while the 3070 Ti serves a
   small one and all four Sparks serve their own — no cross-unit eviction.
 - **Monitor:** live thermals (core + hotspot + GDDR6X junction), power, memory and the
   Ollama GPU/CPU split, with rolling history persisted across restarts.
-- **Idle auto-unload** so an unused card drops to P8 (~115 W → ~30 W measured).
+- **Idle auto-unload** so an unused card drops to P8 (~117 W → ~25 W measured).
 - **Model management:** pull/delete Ollama models, edit the vLLM and Spark catalogs,
   trigger HuggingFace downloads — all as streamed jobs.
 - **Cookbook:** save the current fleet arrangement (which models run where) under a
@@ -65,24 +71,24 @@ so it packs 100 % of VRAM before any CPU spill.
 
 ## Topology
 
-|            | Ollama              | vLLM                                   | DGX Spark                          |
-| ---------- | ------------------- | -------------------------------------- | ---------------------------------- |
-| Runs in    | Windows 11 native   | WSL2 Ubuntu 24.04                      | the remote GB10 node (Docker)      |
-| Reach      | `127.0.0.1:11434`   | `127.0.0.1:11437` (socat relay)        | `http://192.168.1.5x:8000`         |
-| Model swap | REST `keep_alive`   | one model/process — `serve.sh <alias>` | per-model `sparkrun stop/run`, slot ports 8000-8003 |
-| State via  | `/api/ps`           | relay `/v1/models`                     | the node's own `/v1/models`        |
-| Catalog    | `ollama list` tags  | `data/vllm_models.yaml`                | `data/spark_models_<unit>.yaml`    |
+|            | Ollama             | vLLM                                   | DGX Spark                                           |
+| ---------- | ------------------ | -------------------------------------- | --------------------------------------------------- |
+| Runs in    | Windows 11 native  | WSL2 Ubuntu 24.04                      | the remote GB10 node (Docker)                       |
+| Reach      | `127.0.0.1:11434`  | `127.0.0.1:11437` (socat relay)        | `http://192.168.1.5x:8000`                          |
+| Model swap | REST `keep_alive`  | one model/process — `serve.sh <alias>` | per-model `sparkrun stop/run`, slot ports 8000-8003 |
+| State via  | `/api/ps`          | relay `/v1/models`                     | the node's own `/v1/models`                         |
+| Catalog    | `ollama list` tags | `data/vllm_models.yaml`                | `data/spark_models_<unit>.yaml`                     |
 
 The control app listens on **`:11430`** (UI + REST + `/v1`). Everything is **LAN-only**
 with no auth unless you set `LLMCONFIG_API_KEY`.
 
 ### The units
 
-| Unit id                 | Hardware                     | Arbitration                                 | Telemetry                        |
-| ----------------------- | ---------------------------- | ------------------------------------------- | -------------------------------- |
-| `primary`               | RTX 3090, 24 GB              | eviction-wait gate, Ollama **XOR** vLLM     | local `nvidia-smi` by UUID       |
-| `companion`             | RTX 3070 Ti, 8 GB (opt-in)   | same, fully independent of `primary`        | local `nvidia-smi` by UUID       |
-| `spark1`…`spark4`       | DGX Spark GB10, 128 GB       | up to 4 co-resident models, one per port; admission by summed `mem_fraction` | remote `nvidia-smi` over SSH     |
+| Unit id           | Hardware                   | Arbitration                                                                  | Telemetry                    |
+| ----------------- | -------------------------- | ---------------------------------------------------------------------------- | ---------------------------- |
+| `primary`         | RTX 3090, 24 GB            | eviction-wait gate, Ollama **XOR** vLLM                                      | local `nvidia-smi` by UUID   |
+| `companion`       | RTX 3070 Ti, 8 GB (opt-in) | same, fully independent of `primary`                                         | local `nvidia-smi` by UUID   |
+| `spark1`…`spark4` | DGX Spark GB10, 128 GB     | up to 4 co-resident models, one per port; admission by summed `mem_fraction` | remote `nvidia-smi` over SSH |
 
 `settings.units()` = `lanes()` + `sparks()`. Sparks are **off by default**
 (`SPARK_ENABLED=true` to enable). Both kinds satisfy the same duck-typed contract, so
@@ -100,7 +106,7 @@ the UI, CLI, gateway and idle reaper treat them through one code path.
                                 │
                     FastAPI (Windows-native, :11430)
                                 │
-                 Orchestrator  ·  LeaseManager  ·  IdleReaper
+      Orchestrator · Placer · LeaseManager · IdleReaper · UsageStats
         ┌───────────────────────┼───────────────────────────┐
         │                       │                           │
   Lane: primary          Lane: companion            SparkUnit ×4
@@ -196,6 +202,24 @@ have sane defaults for `.40` in `llmconfig/config.py`.
 | `MONITOR_RETENTION_H`      | `24`                        | History window (in-memory + on-disk)                |
 | `MONITOR_PERSIST`          | `true`                      | Persist samples to SQLite (survives restart)        |
 
+Sharing and preemption ([full section](#priority-preemption--how-batch-and-interactive-work-share-the-fleet)):
+
+| Setting                                 | Default        | Meaning                                                                                 |
+| --------------------------------------- | -------------- | --------------------------------------------------------------------------------------- |
+| `LEASE_ENABLED`                         | `true`         | The whole lease subsystem                                                               |
+| `AUTO_HOLD_ENABLED` / `AUTO_HOLD_TTL_S` | `true` / `600` | Honour `X-LLM-Hold`; silence before it lapses                                           |
+| `LEASE_BLOCK_UNLEASED`                  | `true`         | A non-preemptible lease 409s un-leased traffic (`false` also drops its eviction shield) |
+| `LEASE_BLOCKS_IDLE_UNLOAD`              | `true`         | Any live lease stops the idle reaper                                                    |
+| `PLACEMENT_PRIORITY_INTERACTIVE`        | `60`           | Priority of an interactive request                                                      |
+| `PLACEMENT_PRIORITY_NEUTRAL`            | `40`           | REST paths / unclassified traffic                                                       |
+| `PLACEMENT_PRIORITY_BATCH`              | `20`           | Long-prompt, bulk and pooling traffic                                                   |
+| `PLACEMENT_PREEMPT_LEASED_IDLE_ENABLED` | `true`         | Idle + preemptibly-held models are evictable                                            |
+| `PLACEMENT_PREEMPT_ACTIVE_ENABLED`      | `true`         | Active models yield to higher priority                                                  |
+| `PLACEMENT_GROUP_EVICTION_ENABLED`      | `true`         | Multi-node groups can be evicted (ranked last)                                          |
+| `USAGE_ACTIVE_WINDOW_S`                 | `60`           | Seconds since traffic that still counts as "active"                                     |
+| `STATS_ENABLED`                         | `true`         | Record request/eviction stats                                                           |
+| `STATS_RETENTION_DAYS`                  | `90`           | How long buckets and eviction events are kept                                           |
+
 Timeouts (`EVICT_TIMEOUT_S`, `POLL_INTERVAL_S`, `DEFAULT_VLLM_LOAD_TIMEOUT_S`,
 `VLLM_PROBE_TIMEOUT_S`, …) also live in `config.py` and are overridable via env.
 
@@ -205,32 +229,34 @@ Interactive docs at `/docs`. Read/inference endpoints are open; **write** endpoi
 require `X-API-Key` only when `LLMCONFIG_API_KEY` is set. Read endpoints take
 `?lane=primary|companion` (default `primary`); load/unload take `lane` in the body.
 
-| Method & path                           | Purpose                                                       |
-| --------------------------------------- | ------------------------------------------------------------- |
-| `GET /api/status`                       | Every lane under `lanes[]`: owner, loaded model, VRAM, swap   |
-| `GET /api/usage?lane=`                  | Compact tri-state per lane: `free` / `idle` / `active` + model|
-| `GET /api/lanes`                        | Configured lanes (id, name, enabled, current default)         |
-| `GET /api/models?lane=`                 | That lane's Ollama tags + vLLM alias catalog (loaded flagged) |
-| `GET /api/gpu?lane=`                    | Parsed `nvidia-smi` for that lane's GPU (by UUID)             |
-| `GET /api/monitor`                      | Latest thermals/power/VRAM + Ollama split                     |
-| `GET /api/monitor/history?window=`      | Bucketed telemetry history over the last `window` seconds     |
-| `GET /api/doctor`                       | On-box recon report (per-lane checks)                         |
-| `GET /api/jobs/{id}`                    | Progress + log for a long load/pull/download                  |
-| `GET /api/load-times`                   | Measured launch durations, every key (`{key: {est_s, n}}`)    |
-| `GET /api/load-times/{model}`           | One model's expected load time per unit (+ residency/failures)|
-| `GET /api/placement/decisions`          | Last ~50 auto-placement decisions: unit, tier, candidate facts|
-| `POST /api/load`                        | `{server,model,lane?,force?,max_pack?}` → a Job               |
-| `POST /api/unload`                      | `{server?,lane?}` → free that lane's GPU                      |
-| `POST /api/reload`                      | Re-read every `data/*.yaml` catalog in place — no restart      |
-| `GET / PUT /api/lanes/{id}/default`     | Get / set a lane's startup-default model                      |
-| `POST /api/ollama/pull`                 | Pull an Ollama model (job)                                    |
-| `DELETE /api/ollama/{name}`             | Delete an Ollama model                                        |
-| `GET/POST/PUT/DELETE /api/vllm/aliases` | The vLLM alias registry for a lane (add/edit/remove)          |
-| `POST /api/vllm/download`               | HuggingFace-download a model into the WSL cache               |
-| `POST /api/leases`                      | Claim a unit → a lease id (409 when it's held)                |
-| `GET /api/leases`, `GET /api/leases/{id}` | List / poll leases (incl. why one ended)                    |
-| `POST /api/leases/{id}/renew`           | Push the TTL out; `DELETE /api/leases/{id}` hands it back     |
-| `POST /api/leases/{id}/revoke`          | Operator break-glass — take a unit back                       |
+| Method & path                             | Purpose                                                          |
+| ----------------------------------------- | ---------------------------------------------------------------- |
+| `GET /api/status`                         | Every lane under `lanes[]`: owner, loaded model, VRAM, swap      |
+| `GET /api/usage?lane=`                    | Compact tri-state per lane: `free` / `idle` / `active` + model   |
+| `GET /api/lanes`                          | Configured lanes (id, name, enabled, current default)            |
+| `GET /api/models?lane=`                   | That lane's Ollama tags + vLLM alias catalog (loaded flagged)    |
+| `GET /api/gpu?lane=`                      | Parsed `nvidia-smi` for that lane's GPU (by UUID)                |
+| `GET /api/monitor`                        | Latest thermals/power/VRAM + Ollama split                        |
+| `GET /api/monitor/history?window=`        | Bucketed telemetry history over the last `window` seconds        |
+| `GET /api/doctor`                         | On-box recon report (per-lane checks)                            |
+| `GET /api/jobs/{id}`                      | Progress + log for a long load/pull/download                     |
+| `GET /api/load-times`                     | Measured launch durations, every key (`{key: {est_s, n}}`)       |
+| `GET /api/load-times/{model}`             | One model's expected load time per unit (+ residency/failures)   |
+| `GET /api/placement/decisions`            | Last ~50 auto-placement decisions: unit, tier, priority, victims |
+| `GET /api/stats/models?days=`             | Per-model request counts, fleet share, last-used, evictions      |
+| `GET /api/stats/evictions?limit=`         | Recent evictions: who was displaced, by whom, and why            |
+| `POST /api/load`                          | `{server,model,lane?,force?,max_pack?}` → a Job                  |
+| `POST /api/unload`                        | `{server?,lane?}` → free that lane's GPU                         |
+| `POST /api/reload`                        | Re-read every `data/*.yaml` catalog in place — no restart        |
+| `GET / PUT /api/lanes/{id}/default`       | Get / set a lane's startup-default model                         |
+| `POST /api/ollama/pull`                   | Pull an Ollama model (job)                                       |
+| `DELETE /api/ollama/{name}`               | Delete an Ollama model                                           |
+| `GET/POST/PUT/DELETE /api/vllm/aliases`   | The vLLM alias registry for a lane (add/edit/remove)             |
+| `POST /api/vllm/download`                 | HuggingFace-download a model into the WSL cache                  |
+| `POST /api/leases`                        | Claim a unit → a lease id (409 when it's held)                   |
+| `GET /api/leases`, `GET /api/leases/{id}` | List / poll leases (incl. why one ended)                         |
+| `POST /api/leases/{id}/renew`             | Push the TTL out; `DELETE /api/leases/{id}` hands it back        |
+| `POST /api/leases/{id}/revoke`            | Operator break-glass — take a unit back                          |
 
 ## Leases — sharing a unit between callers
 
@@ -250,9 +276,10 @@ llmconfig lease release $LEASE                             # hand it back
   for 45 minutes" (recorded, displayed, never enforced); `--minutes` is a short
   renewable leash proving you're alive. A crashed client frees the unit in minutes
   instead of pinning it for its whole declared duration.
-- **Preemption.** A `--no-preempt` lease is never taken by another claim (not even
-  with `--force`); a preemptible one yields to a higher `--priority` claim. Equal
-  priority is first-come-first-served unless `--force`.
+- **Two kinds of claim.** `--no-preempt` is *exclusivity*: no other claim takes it
+  (not even `--force`), un-leased `/v1` traffic is refused, and placement will never
+  evict the model. A plain (preemptible) lease is *notification*: it says "tell me
+  when I lose this", not "keep everyone else out" — see below.
 - **Being displaced** shows up two ways: `GET /api/leases/{id}` reports
   `state=revoked` with who took it and why, and your next `/v1` request returns
   `409 lease_revoked`. `llmconfig lease wait <id>` blocks and exits **0** released
@@ -263,9 +290,12 @@ llmconfig lease release $LEASE                             # hand it back
   (the holder passes by sending its lease id as `X-LLM-Lease`) — otherwise anyone
   could swap the model right over the held unit. Set `LEASE_BLOCK_UNLEASED=false`
   to disable both.
-- **Effect on idle-unload.** Any live lease stops the [idle reaper](#idle-auto-unload),
-  so a holder pausing between bursts keeps its model resident — at the cost of the
-  card staying in P0 for up to one lease period.
+- **Effect on idle-unload.** Any live lease stops the
+  [idle reaper](#idle-auto-unload-power-saving), preemptible ones included — the reaper
+  is a power-saving optimisation, not a competing claimant, so a holder pausing between
+  bursts keeps its model resident at the cost of the card staying in P0. A lease that
+  **names a model** shields only that model, so on a multi-model Spark its co-tenants
+  can still be reaped; a whole-unit claim (no `--model`) shields everything on the node.
 - **Expiry releases the claim; it does not unload anything.** The model stays
   resident and the reaper simply resumes its normal timer.
 
@@ -275,6 +305,106 @@ llmconfig lease release $LEASE                             # hand it back
 > also a **forward** guarantee only: work already running when you claim keeps the
 > unit until it finishes (there is no job cancellation) — the claim response reports
 > that as `busy_with`.
+
+### Priority preemption — how batch and interactive work share the fleet
+
+The fleet is **free more than 95 % of the time**. What it actually has to arbitrate is
+a lopsided collision: batch jobs (analysis sweeps, evals, OCR) run for hours or days
+and are *designed* to be interrupted and retried, while interactive sessions (opencode,
+Hermes) want a different model *now* and use a few percent of the fleet's time. So the
+rule is not "first claim wins" — it is **the long job yields, and is told to**.
+
+A **preemptible lease buys its holder a notification, not tenure**. For an
+**auto-placed `/v1` request** — no `X-LLM-Lane`, the normal case — who may be
+displaced is:
+
+| Victim's state                                | Displaced by an auto-placed request? |
+| --------------------------------------------- | ------------------------------------ |
+| Non-preemptible lease                         | **Never** — the hard shield          |
+| Preemptible lease, model **idle** (>60 s)     | **Yes**, by anyone                   |
+| Preemptible lease, model **actively serving** | Only by **strictly higher priority** |
+| No lease, model **idle**                      | Yes (unchanged behaviour)            |
+| No lease, model **actively serving**          | Never — there is no holder to notify |
+
+Priority comes from the request's own shape, via the same classifier that does
+[workload tiering](#openai-v1-gateway--auto-load-on-first-request) — no client has to
+ask for it:
+
+| Traffic                                                           | Priority |
+| ----------------------------------------------------------------- | -------- |
+| **interactive** (small prompt, bounded `max_tokens`)              | `60`     |
+| **neutral** — unclassified, or `PLACEMENT_WORKLOAD_ENABLED=false` | `40`     |
+| **batch** (long prompt, big `max_tokens`, any pooling body)       | `20`     |
+
+so an opencode turn displaces a running batch sweep, and a batch request never
+displaces another batch job that is mid-burst. Override per request with
+`X-LLM-Workload: interactive|batch`; retune the numbers with
+`PLACEMENT_PRIORITY_INTERACTIVE` / `_NEUTRAL` / `_BATCH`.
+
+**Manual claims default to `priority: 0`** and therefore lose to *all* classified
+traffic. That is deliberate — a bare `llmconfig lease claim` means "track me", not
+"protect me". To actually hold a unit, claim `--no-preempt`, or claim a
+`--priority` above the tier you want to beat.
+
+**Eviction is immediate and the interruption is hard.** There is no drain: the
+victim's backend stops, an in-flight generation dies at the socket, and the revoked
+lease is what explains why. That is the contract the batch apps here are written
+against — they poll `GET /api/leases/{id}` (or `llmconfig lease wait`), see
+`revoked_reason: preempted_by_placement` with `revoked_by` naming who took it, and
+retry once the unit frees. If you need a hard guarantee instead, that is what
+`--no-preempt` is for.
+
+**Multi-node models are evicted last.** A tensor-parallel [SparkGroup](#the-units)
+is the most expensive thing in the fleet to displace, so victim ordering prefers
+single-node models first, then groups by ascending node count (a 2-node deployment
+goes before a 4-node one). A group teardown stops the whole cluster job, releases
+its claim, and the *members* come back as free capacity.
+
+Three kill switches restore the pre-2026-08-05 behaviour, independently:
+
+| Setting                                 | `false` restores                                  |
+| --------------------------------------- | ------------------------------------------------- |
+| `PLACEMENT_PREEMPT_LEASED_IDLE_ENABLED` | a preemptible lease shields even an idle model    |
+| `PLACEMENT_PREEMPT_ACTIVE_ENABLED`      | an actively-serving model is never displaced      |
+| `PLACEMENT_GROUP_EVICTION_ENABLED`      | multi-node groups are never evicted automatically |
+
+> **What "shielded" means at each layer.** The idle reaper is *stricter* than
+> placement on purpose: any lease stops the reaper, while only a non-preemptible one
+> stops an eviction. Freeing a card to save power should defer to any claimant;
+> answering a user's request should not.
+
+#### Explicit targeting is not part of the priority ladder
+
+Naming the unit yourself means *you* are the scheduler, so the tables above do not
+apply: `X-LLM-Lane: <unit>`, a request pinned by its own `X-LLM-Lease`, a
+sole-candidate model (only one unit can run it), `POST /api/load`, the cookbook and
+the boot autoload all carry **no priority**. Each unit then applies its own load
+semantics, and the two kinds differ:
+
+- a **GPU lane** is last-writer-wins — it evicts whatever is on the card, active or
+  not (that has always been what "load this here" means on a 24 GB card that holds
+  one model);
+- a **Spark or a group** still refuses to displace an actively-serving co-tenant, and
+  answers `placement_conflict` instead.
+
+A **non-preemptible lease refuses both**, on `/v1` and on `/api/load` alike — that
+gate is the one thing explicit targeting cannot walk through (unless you pass the
+holder's own id as `X-LLM-Lease`). Preemptible leases on the unit are revoked either
+way, with reason `displaced_by_load`, so a holder always finds out.
+
+### `X-LLM-Hold` — a lease for clients that can't hold one
+
+A static client config (opencode) cannot send a lease id, because none exists until
+something claims it. `X-LLM-Hold: <name>` closes that gap: the gateway claims and
+renews a **preemptible** lease on the model that client is using, at the request's
+classified priority, lapsing `AUTO_HOLD_TTL_S` (10 min) after its last request.
+
+It buys three things — the model is shielded from the idle reaper, the session sticks
+to one unit (prefix-cache affinity rather than ping-ponging between two Sparks serving
+the same model), and displacement becomes *visible* instead of silent. It deliberately
+does **not** refuse anyone else's traffic; a non-preemptible auto-hold would 409 every
+other client the moment opencode touched a shared model. It also never steals: if
+someone else already holds that model, the header is a no-op.
 
 ## OpenAI `/v1` gateway — auto-load on first request
 
@@ -289,13 +419,24 @@ the switch happens on the inference path.
 - **Unit selection:** `X-LLM-Lane: <unit>` pins. **No header (or `auto`) auto-places**:
   the unit already serving the model wins (idle preferred, deterministic tie-break for
   prefix-cache affinity); else a unit with free capacity (declared Spark budgets, or a
-  free lane); else one whose idle + unleased occupant can be evicted; else `503
+  free lane); else one whose occupant can be displaced; else `503
   no_capacity` naming why each unit refused. The chosen unit is echoed back as
   **`X-LLM-Unit`**. A valid `X-LLM-Lease` pins to its lease's unit. Placement is
   advisory — admission, the unit locks and the lease gate stay the real gates — and a
   conflict is retried once on the runner-up. `AUTO_PLACE_ENABLED=false` restores the
   old implicit-`primary` default. `/v1/models` without a header lists the whole
   fleet's catalog union.
+- **Displacement (the last tier):** who may be evicted is
+  [priority preemption](#priority-preemption--how-batch-and-interactive-work-share-the-fleet)
+  — idle models, and actively-serving ones held below this request's priority; never a
+  non-preemptibly-leased model, and never an *unleased* model that is actively serving
+  (no holder exists to notify). Among eligible victims: **single-node models before
+  multi-node groups** (groups ascending by node count), then the fewest victims that
+  free enough budget, then the stalest. A displaced preemptible lease is revoked
+  before the stop, so its holder learns why. Because the ranking runs on a snapshot,
+  every victim is **re-validated under the target unit's own lock** — if the world
+  moved (it gained a lease, or got busy), the load refuses with `placement_conflict`
+  and the gateway re-places once.
 - **Proven-load gate (2026-07-28):** a fresh load is only *chosen* on a unit where
   the model has **launched successfully before** — a recorded load-time sample, or
   current residency (Sparks prove fleet-wide, identical hardware; GPU lanes prove
@@ -328,11 +469,14 @@ the switch happens on the inference path.
   govern, and requests without a workload signal rank exactly as before.
 - **Decision log:** `GET /api/placement/decisions` shows the last ~50 placements,
   newest first — which unit won, which tier fired (`pin`/`resident`/`fits`/
-  `displace`), and per-candidate facts (proven, fail-blocked, lease-refused,
-  committed budgets) for the losers. Consecutive identical routine placements
-  collapse into one entry with a `count`; in-memory only, empty after a restart.
-  This is the "why did that land on spark3?" surface — the always-on task's
-  console is effectively write-only, so it's an endpoint, not a log line.
+  `displace`), the request's `priority` and `workload`, what it displaced
+  (`victims`, `group_victims`), and per-candidate facts (proven, fail-blocked,
+  lease-refused, committed budgets) for the losers. Consecutive identical routine
+  placements collapse into one entry with a `count` — a decision that evicted
+  something never collapses. In-memory only, empty after a restart. This is the
+  "why did that land on spark3?" surface — the always-on task's console is
+  effectively write-only, so it's an endpoint, not a log line. For the longer
+  history ("what gets evicted, and how often?") see [usage stats](#usage-stats).
 - **Resolution (per unit):** a Spark catalog `served_name` → that node's own slot
   port (multi-model nodes route per model); a vLLM `served_name` → the lane's relay;
   else an Ollama tag (has a `:`) → the lane's Ollama; else `404`.
@@ -354,11 +498,11 @@ be **restarted** to pick up a new gateway build.
 `http://192.168.1.40:11430/` — tabs are built at runtime from `/api/lanes`, so a unit
 appearing in config appears in the UI with no front-end change.
 
-| Tab             | What it is                                                                             |
-| --------------- | -------------------------------------------------------------------------------------- |
-| **Home**        | One box per unit: owner badge, loaded model + its real HF repo, served context, memory bar, and a **quick-switch dropdown**. Clicking a unit's name jumps to its tab. |
-| **Per unit**    | One tab each for the 3090, 3070 Ti and every Spark. GPU lanes show the Ollama ⇄ vLLM split with per-model Load / star-as-default buttons and an Ollama pull box; Spark tabs show the curated recipe list. |
-| **Monitor**     | Every unit's thermals, power, memory and the Ollama GPU/CPU split, over a selectable window. |
+| Tab          | What it is                                                                                                                                                                                                |
+| ------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Home**     | One box per unit: owner badge, loaded model + its real HF repo, served context, memory bar, and a **quick-switch dropdown**. Clicking a unit's name jumps to its tab.                                     |
+| **Per unit** | One tab each for the 3090, 3070 Ti and every Spark. GPU lanes show the Ollama ⇄ vLLM split with per-model Load / star-as-default buttons and an Ollama pull box; Spark tabs show the curated recipe list. |
+| **Monitor**  | Every unit's thermals, power, memory and the Ollama GPU/CPU split, over a selectable window.                                                                                                              |
 
 Units that are configured but unreachable render greyed rather than disappearing, so a
 powered-off Spark is visibly *offline* instead of silently absent. Load/unload state is
@@ -367,6 +511,79 @@ tracked **per unit**, so a 15-minute Spark load never freezes the other five box
 A shared **Activity** drawer at the bottom streams the log of whichever job is running.
 
 ## CLI
+
+`llmconfig` is a thin client over the REST API — point it anywhere with `--url` or
+`$LLMCONFIG_URL` (e.g. `http://192.168.1.40:11430` over Tailscale). Only `serve` and
+`doctor --local` run anything in-process.
+
+| Command                           | What it does                                                        |
+| --------------------------------- | ------------------------------------------------------------------- |
+| `llmconfig serve`                 | Run the app itself (uvicorn on `:11430`)                            |
+| `llmconfig status`                | Every unit: owner, loaded model, VRAM, idle                         |
+| `llmconfig usage [--lane]`        | `free` / `idle` / `active` per unit                                 |
+| `llmconfig models [--lane]`       | That unit's Ollama tags + catalog (loaded flagged)                  |
+| `llmconfig gpu [--lane]`          | Parsed `nvidia-smi` for that unit's GPU                             |
+| `llmconfig load <server> <model>` | Load a model (streams the job log)                                  |
+| `llmconfig unload [--lane]`       | Free a unit                                                         |
+| `llmconfig companion-default`     | Get / set the 3070 Ti's startup-default model                       |
+| `llmconfig pull <model>`          | Pull an Ollama model                                                |
+| `llmconfig load-times [MODEL]`    | Measured launch durations                                           |
+| `llmconfig doctor [--local]`      | Read-only on-box recon                                              |
+| `llmconfig reload`                | Re-read every `data/*.yaml` in place — no restart                   |
+| `llmconfig lease …`               | `claim` / `list` / `show` / `renew` / `release` / `revoke` / `wait` |
+| `llmconfig cookbook …`            | `list` / `save` / `apply` / `set-default` / `delete`                |
+
+`llmconfig lease wait <id>` is the one built for scripting: it blocks until the lease
+ends and exits **0** released, **3** revoked, **4** expired, **2** unknown — so a batch
+driver can park on it and resume when the fleet frees up.
+
+## Usage stats
+
+Answers *which models are actually used, and what preemption is costing* — the numbers
+behind any decision to retune priorities or eviction order. Two endpoints, both
+read-only:
+
+```bash
+curl -s :11430/api/stats/models?days=30 | jq '.models[] | {model, requests, share_pct}'
+curl -s :11430/api/stats/evictions?limit=20 | jq '.evictions[]'
+```
+
+- **`GET /api/stats/models?days=N`** — per model: request count and fleet `share_pct`,
+  the per-unit and per-workload split, `last_used_ts`, and the evictions it *suffered*,
+  broken down by reason. Most-requested first.
+- **`GET /api/stats/evictions?limit=N`** — the raw events, newest first: what was
+  displaced, from which unit, how many nodes it spanned, who evicted it
+  (`evicted_by`), at what `incoming_priority`, and which lease holder lost it.
+
+`reason` says which path did the displacing, which is the interesting column:
+
+| `reason`            | What happened                                                                                                                |
+| ------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| `idle_preempt`      | Idle model under a preemptible lease, taken for another model                                                                |
+| `active_preempt`    | Actively serving, displaced by strictly higher-priority traffic                                                              |
+| `displaced_idle`    | Idle and unleased — the ordinary make-room case                                                                              |
+| `displaced_by_load` | A GPU lane taken by an explicitly-targeted load (last-writer-wins)                                                           |
+| `group_preempt`     | A multi-node group torn down to free its nodes                                                                               |
+| `idle_reaper`       | Power saving, not contention — nobody wanted the unit                                                                        |
+| `lease_free`        | A unit emptied on request: an incoming claim asked for it free (`free_on_preempt`), or an operator revoked with `free: true` |
+
+Requests are aggregated into **hourly buckets** per (unit, model, workload); evictions
+are kept as raw rows because they are rare. Both live in a best-effort SQLite DB
+(`data/stats.db`, `STATS_RETENTION_DAYS` = 90) on the same contract as the Monitor — a
+DB failure disables persistence and collection continues in memory, and the recording
+path itself is synchronous and I/O-free, so it can never slow down or wedge an
+eviction. Set `STATS_ENABLED=false` to turn the whole thing off.
+
+Two edges worth knowing before you read the numbers as gospel: `last_used_ts` has
+**hour resolution** (it is the end of the newest bucket holding a request, clamped to
+now), and an **unload records nothing** — only a load that displaced something does.
+So freeing a unit by hand, or a cookbook apply that unloads extras, leaves no
+eviction row; the reaper and the lease sweeper do record theirs.
+
+> **Record-only, deliberately.** Nothing in placement reads these numbers yet. The
+> intended use is a human looking at a month of data and deciding *"this model is
+> asked for twice a week and evicts a 4-node deployment every time"* — feeding usage
+> back into victim ranking automatically is a follow-up, not a silent behaviour.
 
 ## Monitor (telemetry)
 
@@ -413,8 +630,31 @@ exempts it. The choice persists across restarts (`data/lane_pins.yaml`) and is
 `PUT /api/lanes/{id}/pin` (`{"pinned": true|false|null}` — `null` clears the override
 back to configured behavior); each GPU lane's **effective** pin is reported as
 `pinned` on `/api/status` → `lanes[]`. Only the global `IDLE_UNLOAD_ENABLED` master
-switch sits above it (off = the reaper loop never runs); a live lease still protects a
-model independently, exactly as below.
+switch sits above it (off = the reaper loop never runs).
+
+> **The pin is a power-saving override, not a claim.** It stops the *reaper* from
+> reaping an unused model; it does **not** stop another client's request from
+> [displacing](#priority-preemption--how-batch-and-interactive-work-share-the-fleet)
+> it to load something else. "Nobody may take this model" is a lease —
+> `--no-preempt` for a hard shield, or a priority above the tier you want to beat.
+
+**Reaping vs. eviction** are two different things that both end with a model unloaded,
+and they answer to different rules:
+
+|                        | Idle reaper                                                                        | Placement eviction                                                     |
+| ---------------------- | ---------------------------------------------------------------------------------- | ---------------------------------------------------------------------- |
+| Why                    | Save power — nobody wants the unit                                                 | Someone wants the unit for another model                               |
+| Any live lease         | **Blocks it** (preemptible included; a model-scoped lease shields only that model) | Only a *non-preemptible* one blocks                                    |
+| The Home-card pin      | **Blocks it**                                                                      | Ignored                                                                |
+| Actively-serving model | Never (that *is* the idle timer)                                                   | Only if held below the request's priority †                            |
+| Multi-node groups      | **Never touched**                                                                  | Evictable, ranked last                                                 |
+| Scope on this box      | The 3090 only (companion/Sparks exempt)                                            | Every unit                                                             |
+| Recorded as            | `idle_reaper`                                                                      | `idle_preempt` / `active_preempt` / `displaced_idle` / `group_preempt` |
+
+† The eviction column describes an **auto-placed** request. A load that names its
+unit (`X-LLM-Lane`, `POST /api/load`, the cookbook) is
+[outside the priority ladder](#explicit-targeting-is-not-part-of-the-priority-ladder)
+and takes a GPU lane regardless.
 
 The same activity signals back a **usage query**: `GET /api/usage` (and the `usage`
 field on each `/api/status` lane, plus `llmconfig usage`) classifies every lane as
@@ -430,11 +670,11 @@ box and on `/api/status` → `lanes[].loaded.context_len`. This is deliberately 
 *runtime* window, not the model's architectural maximum, because it is the number a
 client's prompt budget has to respect:
 
-| Backend | Source                        | Set by                                     |
-| ------- | ----------------------------- | ------------------------------------------ |
-| Ollama  | `/api/ps` → `context_length`  | the tag's baked `num_ctx`, capped by `OLLAMA_CONTEXT_LENGTH` |
-| vLLM    | relay `/v1/models`            | `--max-model-len` in that alias's `serve.sh` case |
-| Spark   | the node's `/v1/models`       | `--max-model-len`, pinned from the catalog entry  |
+| Backend | Source                       | Set by                                                       |
+| ------- | ---------------------------- | ------------------------------------------------------------ |
+| Ollama  | `/api/ps` → `context_length` | the tag's baked `num_ctx`, capped by `OLLAMA_CONTEXT_LENGTH` |
+| vLLM    | relay `/v1/models`           | `--max-model-len` in that alias's `serve.sh` case            |
+| Spark   | the node's `/v1/models`      | `--max-model-len`, pinned from the catalog entry             |
 
 **Ollama takes no context parameter at load time.** `/api/load` and the `/v1` auto-load
 deliberately do not accept one — a model loads at the `num_ctx` baked into its
@@ -500,6 +740,18 @@ gotchas, is in [`deploy/README-deploy.md`](deploy/README-deploy.md).
   needed. It prints what it re-read, and names any `.env` field that changed but is
   structural (lane/spark definitions, GPU UUIDs, paths, the listen socket): those are
   reported, never hot-applied, and still need a restart.
+- **"My model disappeared / my request died mid-stream"** → something displaced it.
+  `GET /api/stats/evictions` names what took it and why (`active_preempt` = higher-
+  priority traffic; `idle_preempt` = it had gone idle; `idle_reaper` = nobody wanted
+  the unit, it was only power saving). If you were holding a lease,
+  `GET /api/leases/{id}` says the same thing with `revoked_by`. To make it stop:
+  claim `--no-preempt`, or raise your `--priority` above the tier that beat you —
+  a bare preemptible claim is a *notification*, not a shield.
+- **`503 no_capacity` when units look free** → read the per-unit `reasons` in the
+  response; each one says exactly why that unit refused (non-preemptible lease, all
+  slots in use, an unbudgeted or group-held node, the proven-load gate, or a
+  cooldown after repeated launch failures). `GET /api/placement/decisions` shows the
+  same facts for the losing candidates of the last ~50 placements.
 - **A model loads on the wrong card** → a GPU was pinned by index somewhere. Everything
   pins by UUID; `serve.sh` resolves the vLLM index via torch (vLLM ignores
   `CUDA_DEVICE_ORDER` and uses FASTEST_FIRST order). Run `llmconfig doctor`.
@@ -519,13 +771,13 @@ gotchas, is in [`deploy/README-deploy.md`](deploy/README-deploy.md).
 The box patches itself and Windows Update may auto-restart it unattended (permitted
 window 00:00-06:00). LLMConfig is expected to come back **clean, with no keyboard**:
 
-| Layer | What it does |
-| ----------------------------- | ----------------------------------------------- |
-| Auto-logon (LSA secret)       | Guarantees the interactive session the task needs — the trigger is *at logon*, and the app must run as a real user because `wsl.exe -u <user>` has no Session 0 equivalent |
-| Task delay `PT2M` + `RestartCount 3` | Keeps the app off a cold WSL, and restarts it if it crashes |
-| `wsl.wait_ready()` gate       | The real fix — the boot `autoload_defaults()` waits until WSL can actually *execute*, not merely respond |
-| `WslRecovery`                 | Self-heals a distro that comes up wedged |
-| Bounded locks + bounded reap  | A stuck operation fails and names itself instead of hanging the unit forever |
+| Layer                                | What it does                                                                                                                                                               |
+| ------------------------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Auto-logon (LSA secret)              | Guarantees the interactive session the task needs — the trigger is *at logon*, and the app must run as a real user because `wsl.exe -u <user>` has no Session 0 equivalent |
+| Task delay `PT2M` + `RestartCount 3` | Keeps the app off a cold WSL, and restarts it if it crashes                                                                                                                |
+| `wsl.wait_ready()` gate              | The real fix — the boot `autoload_defaults()` waits until WSL can actually *execute*, not merely respond                                                                   |
+| `WslRecovery`                        | Self-heals a distro that comes up wedged                                                                                                                                   |
+| Bounded locks + bounded reap         | A stuck operation fails and names itself instead of hanging the unit forever                                                                                               |
 
 Without the gate, the app starting ~58 s after boot raced WSL's first-boot init and
 deadlocked its exec path — a 60-second reboot became a six-hour outage.
@@ -538,9 +790,14 @@ llmconfig/
   main.py           FastAPI app: REST endpoints + static UI + lifespan
   orchestrator.py   coordinates every unit; shared WSL keepalive + defaults
   lane.py           per-GPU arbitration state machine (eviction-wait gate)
+  slot_lane.py      companion lane in SLOT mode: co-resident vLLM, per-slot lifecycle
   spark_unit.py     a remote DGX Spark as a unit (same contract, no eviction gate)
+  spark_group.py    a SET of Sparks serving one tensor-parallel model (synthetic unit)
+  group_state.py    live group claims + persisted (model, node-set) placement history
   leases.py         LeaseManager + LeaseSweeper (resource sharing between callers)
-  lane_state.py     persisted per-unit default model
+  placement.py      auto-placement: pure rank() + the Placer's fact sweep
+  load_times.py     measured launch durations + per-unit failure counters
+  lane_state.py     persisted per-unit default model + reaper pin overrides
   backends/
     ollama.py       Ollama REST client + Windows service control
     vllm.py         vLLM relay status + serve.sh/systemctl lifecycle over wsl.exe
@@ -549,23 +806,26 @@ llmconfig/
   gpu.py            nvidia-smi truth (by UUID) + Monitor metric sampling
   nvapi.py          NVAPI hotspot + GDDR6X junction temps (ctypes)
   monitor.py        telemetry sampler + SQLite history
+  stats.py          request/eviction accounting behind /api/stats/* (SQLite)
   idle.py           idle auto-unload policy (reap an unused unit → GPU drops to P8)
   registry.py       vLLM alias + Spark recipe catalogs (YAML)
+  reload.py         runtime re-read of every disk-backed catalog/state file
   schemas.py        pydantic models
   jobs.py           async job manager (streamed logs)
   cookbook.py       named fleet states: snapshot / edit / apply
   wsl.py            wsl.exe bridge + WslKeepalive + WslHealth/WslRecovery
   ssh.py            native OpenSSH transport for Spark nodes (no WSL)
   winsvc.py         Windows service control
-  proc.py           subprocess wrapper
+  proc.py           subprocess wrapper (kills the process TREE on timeout)
+  fsio.py           atomic_write_text — every persisted YAML write goes through it
   doctor.py         read-only on-box recon
-  openai_gateway.py OpenAI /v1 gateway (auto-load)
+  openai_gateway.py OpenAI /v1 gateway (auto-load, leases, placement wiring)
   cli.py            the `llmconfig` CLI
   web/              static UI + templates
   data/*.default.yaml   shipped registry seeds
 deploy/             install scripts, serve.sh, systemd units, deploy guide
 tests/              pytest (respx-mocked; no GPU needed)
-data/               live registry, lane defaults, monitor.db (gitignored)
+data/               live registry, lane defaults, monitor.db, stats.db (gitignored)
 ```
 
 ## Testing
@@ -592,6 +852,12 @@ anywhere — **no GPU required**. `asyncio_mode = auto` (see `pyproject.toml`).
 - **Leases** — full lifecycle proven against live inference: un-leased traffic allowed →
   non-preemptible claim → `409 lease_required` → holder passes with `X-LLM-Lease` →
   revoke → `409 lease_revoked`.
+- **Priority preemption + usage stats** (2026-08-05) — deployed to `.40` with the whole
+  fleet resident (DS4 across spark1+spark2, `qwen35-122b` serving on spark3, the
+  pooling pair on spark4, both companion slots): residency survived the restart and
+  `/api/stats/*` began recording real traffic immediately. 459 unit tests cover the
+  eviction decision tables, the revoke-before-stop ordering, group teardown under the
+  member locks, and the three kill switches.
 - **Telemetry** persisted across restarts.
 
 See the homelab wiki (`hosts/ollama-host/services/llmconfig`) for deployed-state detail
