@@ -77,6 +77,23 @@ case "$ALIAS" in
       --max-num-seqs 256 \
       --gpu-memory-utilization 0.60
     ;;
+  harrier-embed)
+    # harrier-oss-v1-0.6b -- winner of the 2026-08 LitRank embedding bake-off:
+    # +41% relative on title->story retrieval vs Qwen3-Embedding-0.6B (0.318 vs
+    # 0.225 R@1, measured on 18,960 real stories) at IDENTICAL 1024 dims, storage
+    # and throughput. Same Qwen3Model pooling shape as qwen3-embed above, so the
+    # same packing knobs apply: the big batched-tokens/seqs caps are what keep the
+    # backfill from going GPU-bound at a tiny effective batch.
+    exec vllm serve microsoft/harrier-oss-v1-0.6b \
+      --host "$HOST" \
+      --port "$PORT" \
+      --served-model-name harrier-oss-06b \
+      --runner pooling \
+      --max-model-len 8192 \
+      --max-num-batched-tokens 32768 \
+      --max-num-seqs 256 \
+      --gpu-memory-utilization 0.60
+    ;;
   smoke)
     exec vllm serve Qwen/Qwen2.5-0.5B-Instruct \
       --host "$HOST" \
