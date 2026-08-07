@@ -13,7 +13,7 @@ cluster_only: false
 solo_only: false
 
 # Container image to use
-container: vllm-node
+container: eugr/spark-vllm@sha256:4cfcfa3b79d22759dd27e53da164019199ee0b94bf90c1c849a803ceeb76fdaa
 
 # Mods
 # mods:

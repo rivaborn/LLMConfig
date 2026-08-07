@@ -52,7 +52,7 @@ description: vLLM serving deepseek-ai/DeepSeek-V4-Flash on a DGX Spark cluster (
 
 model: deepseek-ai/DeepSeek-V4-Flash
 
-container: vllm-node
+container: eugr/spark-vllm@sha256:4cfcfa3b79d22759dd27e53da164019199ee0b94bf90c1c849a803ceeb76fdaa
 
 cluster_only: true
 
