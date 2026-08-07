@@ -1,0 +1,30 @@
+recipe_version: "2"
+model: Qwen/Qwen3-Embedding-0.6B
+runtime: vllm
+max_nodes: 1
+container: eugr/spark-vllm@sha256:4cfcfa3b79d22759dd27e53da164019199ee0b94bf90c1c849a803ceeb76fdaa
+
+metadata:
+  description: >
+    Qwen3-Embedding-0.6B on a Spark - SAME-HARDWARE BASELINE for the LitRank
+    embedding bake-off. The incumbent normally runs on the 3090, so comparing
+    its throughput against Spark-hosted challengers was apples-to-oranges.
+    Distinct alias so it cannot collide with the primary's copy.
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.2
+  max_model_len: 32768
+  load_format: safetensors
+
+command: |
+  vllm serve {model} \
+    --runner pooling \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    -tp {tensor_parallel} \
+    --host {host} \
+    --port {port} \
+    --max-model-len {max_model_len} \
+    --load-format {load_format}

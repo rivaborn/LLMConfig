@@ -1,0 +1,32 @@
+recipe_version: "2"
+model: Qwen/Qwen3-Embedding-4B
+runtime: vllm
+max_nodes: 1
+container: eugr/spark-vllm@sha256:4cfcfa3b79d22759dd27e53da164019199ee0b94bf90c1c849a803ceeb76fdaa
+
+metadata:
+  description: >
+    Qwen3-Embedding-4B - text embedding model, 2560-dim, last-token pooling.
+    Staged 2026-08-06 for the LitRank embedding bake-off. Text sibling of the
+    VL embedder already catalogued: same family, but its prompt contract
+    (query gets an "Instruct: ...\nQuery:" prefix, documents embed RAW)
+    matches what LitRank's build_embeddings.py already implements, which the
+    VL variant does NOT.
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  tensor_parallel: 1
+  gpu_memory_utilization: 0.3
+  max_model_len: 32768
+  load_format: safetensors
+
+command: |
+  vllm serve {model} \
+    --runner pooling \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    -tp {tensor_parallel} \
+    --host {host} \
+    --port {port} \
+    --max-model-len {max_model_len} \
+    --load-format {load_format}

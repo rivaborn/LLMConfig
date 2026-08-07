@@ -36,7 +36,7 @@ recipe_version: "2"
 model: Qwen/Qwen3-VL-Reranker-8B
 runtime: vllm
 max_nodes: 1
-container: ghcr.io/spark-arena/dgx-vllm-eugr-nightly-tf5:latest
+container: eugr/spark-vllm@sha256:4cfcfa3b79d22759dd27e53da164019199ee0b94bf90c1c849a803ceeb76fdaa
 
 metadata:
   description: Qwen3-VL-Reranker-8B as a yes/no classifier (fixed score path)
