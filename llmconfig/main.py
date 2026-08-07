@@ -1091,9 +1091,16 @@ def create_app() -> FastAPI:
         return lease
 
     @app.post("/api/leases/{lease_id}/renew", response_model=Lease, dependencies=write)
-    async def api_lease_renew(lease_id: str, req: LeaseRenewRequest) -> Lease:
+    async def api_lease_renew(lease_id: str,
+                              req: Optional[LeaseRenewRequest] = None) -> Lease:
+        # The body is OPTIONAL: every field has a default (bare renew = keep the
+        # lease's own ttl_s), and requiring it produced a silent failure mode —
+        # a bodyless renew 422s, which a tolerant client reads as transient API
+        # trouble and reports as success, so the lease quietly expires at TTL
+        # with nothing in either log (observed 2026-08-07: an entire backfill
+        # ran leaseless this way).
         try:
-            return leases.renew(lease_id, req.ttl_s)
+            return leases.renew(lease_id, req.ttl_s if req else None)
         except UnknownUnit as e:
             raise HTTPException(status_code=404, detail={"error": "lease_unknown", "message": e.message})
         except LeaseNotActive as e:
@@ -1107,9 +1114,12 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=404, detail={"error": "lease_unknown", "message": e.message})
 
     @app.post("/api/leases/{lease_id}/revoke", response_model=Lease, dependencies=write)
-    async def api_lease_revoke(lease_id: str, req: LeaseRevokeRequest) -> Lease:
+    async def api_lease_revoke(lease_id: str,
+                               req: Optional[LeaseRevokeRequest] = None) -> Lease:
         """Operator break-glass — takes a unit back even from a non-preemptible lease
-        (which `force` on a claim deliberately cannot do)."""
+        (which `force` on a claim deliberately cannot do). Body optional — every
+        field defaults (same reasoning as renew above)."""
+        req = req or LeaseRevokeRequest()
         try:
             return leases.revoke(lease_id, by=req.by, reason=req.reason, free=req.free)
         except UnknownUnit as e:

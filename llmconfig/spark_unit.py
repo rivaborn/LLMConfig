@@ -89,8 +89,10 @@ class SparkUnit:
         that never look idle, or a lease on `m1` that fails to shield `served-1`.
 
         Optional part of the unit contract — callers use
-        `getattr(unit, "canonical_model", None)`, and a `Lane` (one model, named
-        one way) simply doesn't need it.
+        `getattr(unit, "canonical_model", None)`. `Lane` implements it too now:
+        "one model, named one way" stopped being true when vLLM aliases with
+        distinct served names landed on the lanes, and the gap revoked a live
+        lease as "unused" (see Lane.canonical_model).
         """
         entry = self.registry.get(model) or self.registry.find_by_served_name(model)
         return entry.alias if entry else model

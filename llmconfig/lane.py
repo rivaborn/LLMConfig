@@ -69,6 +69,26 @@ class Lane:
 
     kind = "gpu"
 
+    def canonical_model(self, model: str) -> str:
+        """Fold any name for a vLLM model on this lane onto one key: its catalog
+        alias. Mirrors `SparkUnit.canonical_model`, same registry API.
+
+        SparkUnit's docstring used to claim a Lane ("one model, named one way")
+        doesn't need this. That stopped being true the moment a vLLM alias with a
+        distinct `served_name` landed on a lane: a load takes the ALIAS
+        (`harrier-embed`) while residency reports the SERVED name
+        (`harrier-oss-06b`), and anything keyed by model silently splits in two.
+        Observed 2026-08-07: a lease claimed under the alias failed the unused-
+        reaper's residency check against the served name and was revoked
+        "unused" at ~305 s — while the model it named was loaded and serving the
+        very holder it belonged to.
+
+        Ollama tags and unknown names pass through unchanged (identity), so the
+        Ollama half of the lane is unaffected.
+        """
+        entry = self.registry.get(model) or self.registry.find_by_served_name(model)
+        return entry.alias if entry else model
+
     def touch(self, ts: float | None = None, model: str | None = None) -> None:
         """Record lane activity for the idle reaper. Never moves the clock backwards,
         so a stale Monitor sample can't shorten the idle window.

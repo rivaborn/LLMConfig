@@ -81,6 +81,15 @@ class SlotLane:
         (slot lanes are reap-exempt in practice, so per-model clocks buy nothing)."""
         self.last_activity = max(self.last_activity, time.time() if ts is None else ts)
 
+    def canonical_model(self, model: str) -> str:
+        """Fold alias/served-name onto the catalog alias — same contract as
+        `Lane.canonical_model` / `SparkUnit.canonical_model`, and needed for the
+        same reason: this lane is multi-model and residency reports SERVED names,
+        so a lease claimed under an alias would otherwise fail the unused-reaper's
+        residency check and be revoked while its model is loaded and serving."""
+        entry = self.registry.get(model) or self.registry.find_by_served_name(model)
+        return entry.alias if entry else model
+
     async def aclose(self) -> None:
         await asyncio.gather(*(b.aclose() for b in self.backends.values()))
 

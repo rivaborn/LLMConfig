@@ -120,6 +120,74 @@ def test_api_load_free_unit_unaffected(client):
 
 
 # --------------------------------------------------------------------------- #
+# renew/revoke bodies are OPTIONAL (2026-08-07)
+#
+# Every field of both request models has a default, and requiring the body
+# produced a silent failure mode: a bodyless renew 422s, a tolerant client
+# reads 422 as transient API trouble and reports "still ours", and the lease
+# quietly expires at TTL with nothing in either log. An entire embedding
+# backfill ran leaseless this way.
+# --------------------------------------------------------------------------- #
+def test_lease_renew_with_no_body(client):
+    lid = _claim(client)
+    r = client.post(f"/api/leases/{lid}/renew")          # no body at all
+    assert r.status_code == 200, r.text
+    assert r.json()["renew_count"] == 1
+    assert r.json()["state"] == "active"
+
+
+def test_lease_renew_with_body_still_sets_ttl(client):
+    lid = _claim(client)
+    r = client.post(f"/api/leases/{lid}/renew", json={"ttl_s": 300})
+    assert r.status_code == 200, r.text
+    assert r.json()["ttl_s"] == 300
+
+
+def test_lease_revoke_with_no_body(client):
+    lid = _claim(client)
+    r = client.post(f"/api/leases/{lid}/revoke")         # defaults: operator/admin
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["state"] == "revoked"
+    assert body["revoked_by"] == "operator" and body["revoked_reason"] == "admin"
+
+
+# --------------------------------------------------------------------------- #
+# Lane.canonical_model — a lease claimed under a vLLM ALIAS must govern (and be
+# kept alive by) the lane's SERVED name (2026-08-07)
+#
+# /api/load takes the alias while residency reports the served name. Without
+# folding, the unused-reaper compared `harrier-embed` against `harrier-oss-06b`,
+# concluded the leased model was absent, and revoked a live lease "unused" at
+# ~305 s — while that model was loaded and serving the very holder it belonged
+# to. SparkUnit always folded; Lane (and SlotLane) now do too.
+# --------------------------------------------------------------------------- #
+def test_lane_canonical_model_folds_alias_and_served_name(client):
+    from llmconfig.schemas import VllmAliasEntry
+    lane = client.app.state.orch.units["primary"]
+    lane.registry.upsert(VllmAliasEntry(alias="harrier-embed",
+                                        served_name="harrier-oss-06b"))
+    assert lane.canonical_model("harrier-embed") == "harrier-embed"
+    assert lane.canonical_model("harrier-oss-06b") == "harrier-embed"
+    # Ollama tags and unknown names pass through unchanged.
+    assert lane.canonical_model("qwen2.5:1.5b") == "qwen2.5:1.5b"
+
+
+def test_lane_lease_claimed_by_served_name_stores_the_alias(client):
+    """_canon at claim time now folds on lanes: a claim naming the SERVED name
+    lands on the same key as one naming the alias, so the two can never split
+    into a lease that fails to shield its own model."""
+    from llmconfig.schemas import VllmAliasEntry
+    lane = client.app.state.orch.units["primary"]
+    lane.registry.upsert(VllmAliasEntry(alias="harrier-embed",
+                                        served_name="harrier-oss-06b"))
+    r = client.post("/api/leases", json={"unit": "primary", "holder": "embedder",
+                                         "model": "harrier-oss-06b"})
+    assert r.status_code == 201, r.text
+    assert r.json()["lease"]["model"] == "harrier-embed"
+
+
+# --------------------------------------------------------------------------- #
 # server/unit kind mismatch is a clear 400, not a confusing job failure
 # --------------------------------------------------------------------------- #
 def test_api_load_rejects_spark_server_on_a_gpu_lane(client):
