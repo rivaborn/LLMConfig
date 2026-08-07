@@ -20,12 +20,14 @@ Ollama/vLLM back-compat shims are meaningless for a remote node.
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import Optional, Union
 
 from .backends.ollama import OllamaBackend
 from .backends.vllm import VllmBackend
 from .config import Settings, SparkConfig
 from .group_state import GroupPlacements, GroupState
+from .idle import classify_usage
 from .jobs import JobManager
 from .gpu import GpuInfo, query_all_gpus
 from .lane import Lane
@@ -38,6 +40,8 @@ from .schemas import (Job, LaneStatus, LoadRequest, StatusResponse, UnloadReques
 from .spark_group import SparkGroup
 from .spark_unit import SparkUnit
 from .wsl import WslKeepalive
+
+log = logging.getLogger(__name__)
 
 Unit = Union[Lane, SparkUnit, SparkGroup]
 
@@ -55,6 +59,11 @@ class Orchestrator:
         self.defaults = LaneDefaults(settings)
         self.pins = LanePins(settings)
         self.units: dict[str, Unit] = {}
+        # Set by attach_leases() / attach_monitor(); None = no lease awareness /
+        # no util signal. Both are constructed WITH the orchestrator, so neither
+        # can be a constructor arg.
+        self.leases = None
+        self.monitor = None
 
         for cfg in settings.lanes():
             # The primary lane reuses the registry the app already loaded; the companion
@@ -236,7 +245,42 @@ class Orchestrator:
         d = self.defaults_for(unit_id)
         return d[0] if d else None
 
-    def autoload_defaults(self) -> list[Job]:
+    async def autoload_skip_reason(self, unit: "Unit") -> str:
+        """Why the boot autoload must leave this unit alone, or "" to proceed.
+
+        The rule: load defaults only into a unit that is FREE or holds an IDLE
+        model. Anything else is someone's live work, and the defaults are a
+        convenience rather than a claim (see Settings.autoload_skip_busy).
+
+        A failed status probe is treated as "leave it alone" on purpose: if we
+        cannot see what a unit is holding we must not load over it, and a load
+        would very likely fail anyway.
+        """
+        # A live lease is an explicit claim by a live holder — stronger than any
+        # activity heuristic, and the reason it exists. Same convention as the
+        # idle reaper (ANY lease blocks, not just non-preemptible ones): autoload
+        # is a restore-my-defaults convenience, not a competing request.
+        if self.leases is not None:
+            held = self.leases.active_for(unit.cfg.id)
+            if held is not None:
+                return (f"leased by '{held.holder}' ({held.id}"
+                        + (f", model {held.model}" if held.model else "") + ")")
+        try:
+            st = await unit.status()
+        except Exception as e:  # noqa: BLE001 — unseeable unit: never load over it
+            return f"status probe failed ({type(e).__name__}: {e})"
+        if st.swap_in_progress or st.active_job_id:
+            return "a swap is already in flight"
+        if not st.loaded_models:
+            return ""                       # free — the clean case
+        util = (self.monitor.util_for(unit.cfg.gpu_uuid)
+                if self.monitor is not None else None)
+        if classify_usage(st, util, self.s) == "active":
+            return ("holding " + ", ".join(m.model for m in st.loaded_models)
+                    + " with recent activity")
+        return ""                           # loaded but idle — displaceable
+
+    async def autoload_defaults(self, *, skip_busy: Optional[bool] = None) -> list[Job]:
         """Fire (don't await) a load Job for every default on every enabled unit.
 
         One job PER MODEL: the unit's own lock serialises them, so a Spark asked for
@@ -248,7 +292,18 @@ class Orchestrator:
         hand-edited lane_defaults.yaml listing it second must still load it first.
         Job-creation order is lock-acquisition order, and SparkUnit's own
         needs_empty_node refusal remains the backstop.
+
+        By default (`Settings.autoload_skip_busy`) a unit that is ACTIVE,
+        mid-swap, or leased is SKIPPED — this app restarts far more often than
+        the fleet goes idle, and an unconditional restore turns every restart
+        into an eviction event for whatever was actually working. `skip_busy`
+        overrides the setting per call; False is the old unconditional behaviour.
+
+        Async because the gate has to probe status. Skips are logged with their
+        reason, so "my default didn't come back" is answerable from the log.
         """
+        if skip_busy is None:
+            skip_busy = self.s.autoload_skip_busy
         jobs: list[Job] = []
         for cfg in self.s.units():
             if not cfg.enabled:
@@ -257,6 +312,15 @@ class Orchestrator:
             reg = getattr(unit, "registry", None)
             wanted = [d for d in self.defaults_for(cfg.id)
                       if d["server"] in ("ollama", "vllm", "spark") and d["model"]]
+            if not wanted:
+                continue                    # nothing to load — never probe
+            if skip_busy:
+                reason = await self.autoload_skip_reason(unit)
+                if reason:
+                    log.info("boot autoload: skipping %s — %s (defaults: %s)",
+                             cfg.id, reason,
+                             ", ".join(d["model"] for d in wanted))
+                    continue
             wanted.sort(key=lambda d: boot_order_key(
                 reg.get(d["model"]) if reg is not None else None))
             for d in wanted:
@@ -269,6 +333,13 @@ class Orchestrator:
         for u in self.units.values():
             u.load_times = load_times
 
+    def attach_monitor(self, monitor) -> None:
+        """Hand the orchestrator the Monitor (same call-after-construction pattern
+        as attach_leases). Only the boot autoload gate reads it, and only for the
+        util signal that catches a client talking straight to a backend — with no
+        Monitor the timestamps still classify (see idle.classify_usage)."""
+        self.monitor = monitor
+
     def attach_leases(self, leases) -> None:
         """Hand every unit the LeaseManager for under-lock victim checks.
 
@@ -278,6 +349,7 @@ class Orchestrator:
         Sparks in `_evict_victim`, groups in `placement_evict`, lanes in
         `_preempt_occupant_leases` — so the fanout is unconditional.
         """
+        self.leases = leases
         for u in self.units.values():
             u.leases = leases
 

@@ -256,7 +256,9 @@ async def test_autoload_fires_configured_default(monkeypatch, tmp_path):
 
     monkeypatch.setattr(lane_mod, "query_gpu", fake_query_gpu)
 
-    started = orch.autoload_defaults()
+    # skip_busy=False: these pin ORDERING, not the busy gate (see
+    # test_autoload_gate.py for that) — the fake units have no status().
+    started = await orch.autoload_defaults(skip_busy=False)
     for j in started:
         await jobs._tasks[j.id]
 

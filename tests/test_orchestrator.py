@@ -276,7 +276,9 @@ async def test_autoload_orders_needs_empty_node_first(monkeypatch, tmp_path):
     orch.defaults.add("spark9", "spark", "big")
     orch.defaults.add("spark9", "spark", "rr")
 
-    started = orch.autoload_defaults()
+    # skip_busy=False: these pin ORDERING, not the busy gate (see
+    # test_autoload_gate.py for that) — the fake units have no status().
+    started = await orch.autoload_defaults(skip_busy=False)
     for j in started:                       # completed fakes are already reaped
         t = jobs._tasks.get(j.id)
         if t is not None:
@@ -312,7 +314,9 @@ async def test_autoload_lane_defaults_keep_file_order(monkeypatch, tmp_path):
     orch.defaults.set("primary", "ollama", "b-tag:1")
     orch.defaults.add("primary", "ollama", "a-tag:1")
 
-    started = orch.autoload_defaults()
+    # skip_busy=False: these pin ORDERING, not the busy gate (see
+    # test_autoload_gate.py for that) — the fake units have no status().
+    started = await orch.autoload_defaults(skip_busy=False)
     for j in started:                       # completed fakes are already reaped
         t = jobs._tasks.get(j.id)
         if t is not None:

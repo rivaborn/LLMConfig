@@ -570,6 +570,23 @@ class Settings(BaseSettings):
     # and the `usage` field on /api/status lanes).
     usage_active_window_s: float = 60.0
 
+    # --- boot autoload ---
+    # Restore each unit's default model at startup ONLY where doing so disturbs
+    # nothing: a unit that is free, or holds an idle model. A unit that is ACTIVE,
+    # mid-swap, or under a live lease keeps what it has.
+    #
+    # This app restarts far more often than the fleet goes idle (a code deploy, a
+    # settings change, a logon), and the defaults are a convenience — "what I
+    # usually run here" — not a claim. Firing them unconditionally makes every
+    # restart an eviction event for whatever was actually working: a restart
+    # during the 2026-08 LitRank embedding backfill would have loaded `vl32` over
+    # the 3090 and `qwen35-122b` / the VL reranker pair over spark3 and spark4,
+    # taking 3 of its 5 lanes mid-run and costing three ~4-minute cold reloads to
+    # claw back.
+    #
+    # false restores the old unconditional behaviour.
+    autoload_skip_busy: bool = True
+
     # --- leases (resource sharing between callers — see leases.py) ---
     # A lease is a caller's claim on one unit: "I'm using this, and here's whether
     # you may take it from me." Advisory by design — clients that bypass LLMConfig

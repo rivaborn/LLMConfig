@@ -74,6 +74,7 @@ def create_app() -> FastAPI:
     leases = LeaseManager(settings, orch)
     orch.attach_leases(leases)   # Spark units re-validate eviction victims under their lock
     monitor = Monitor(settings, orch)
+    orch.attach_monitor(monitor)         # boot autoload's activity gate reads its util
     load_times = LoadTimes()
     orch.attach_load_times(load_times)   # units record real launch durations
     stats = UsageStats(settings)
@@ -132,7 +133,7 @@ def create_app() -> FastAPI:
         await _reclaim_groups()
         try:
             if await wait_ready(settings=settings, on_stall=recovery.attempt):
-                orch.autoload_defaults()
+                await orch.autoload_defaults()
                 return
             log.error(
                 "WSL not ready after %.0fs (recovery: %s) — skipping the boot autoload of "
