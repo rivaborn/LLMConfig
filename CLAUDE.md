@@ -89,6 +89,15 @@ Every swap on a lane is serialized behind that lane's own `asyncio.Lock`.
 - **vLLM** = one model per *process*. "Loading a different model" = restarting the
   templated systemd-user unit `vllm@<alias>` (which runs `serve.sh <alias>`). Status
   is read from the socat **relay** `/v1/models` (reports the currently-served name).
+- **Every request is attributed** (2026-08-08): clients send `X-LLM-App: <name>`
+  (+ optional `X-LLM-Function: <purpose>`); the peer IP is captured server-side, so
+  even a silent browser resolves to a machine. The chain is app header → `X-LLM-Hold`
+  name → lease holder → `unknown@<ip>`. `GET /api/stats/clients` answers "what is
+  THAT on spark2?" in one call (it took a three-machine netstat hunt before this).
+  `CLIENT_ID_REQUIRED=true` flips anonymous `/v1` + `/api/load` to a 400 once every
+  client that matters identifies itself — default off; read-only endpoints never
+  gated. Direct-to-backend paths (Ollama :11434/:11435, the relay :11437) bypass the
+  gateway and stay unattributed, same caveat leases carry.
 
 ## Module map (`llmconfig/`)
 

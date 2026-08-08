@@ -101,8 +101,8 @@ async def test_prune_drops_rows_past_retention(tmp_path):
     st.start()
     old_hour = int((time.time() - 3 * 86400) // 3600) * 3600
     with st._db_lock:
-        st._db.execute("INSERT INTO request_buckets VALUES (?,?,?,?,?)",
-                       (old_hour, "primary", "ancient", "", 5))
+        st._db.execute("INSERT INTO request_buckets VALUES (?,?,?,?,?,?)",
+                       (old_hour, "primary", "ancient", "", "", 5))
         st._db.execute("INSERT INTO eviction_events VALUES (?,?,?,?,?,?,?,?,?,?)",
                        (time.time() - 3 * 86400, "primary", "ancient", "ancient",
                         1, "idle_reaper", "", "", None, ""))
@@ -158,3 +158,71 @@ async def test_api_stats_endpoints_shapes(tmp_path, monkeypatch):
     assert models["days"] == 7
     assert models["models"][0]["model"] == "qwen3:4b"
     assert evs["evictions"][0]["reason"] == "displaced_by_load"
+
+
+# --------------------------------------------------------------------------- #
+# Client identity (2026-08-08): app@ip in the buckets + the clients registry
+# --------------------------------------------------------------------------- #
+def test_client_registry_records_app_ip_and_function(tmp_path):
+    st = make(tmp_path)
+    for _ in range(3):
+        st.note_request("spark1", "m1", "batch",
+                        client="litrank-enrich", ip="192.168.1.6",
+                        fn="tier3-enrichment")
+    st.note_request("primary", "m1", "", client="", ip="192.168.1.41")
+    rows = st.clients(days=1)
+    by = {r["client"]: r for r in rows}
+    assert by["litrank-enrich@192.168.1.6"]["requests"] == 3
+    assert by["litrank-enrich@192.168.1.6"]["function"] == "tier3-enrichment"
+    # Anonymous traffic still lands as unknown@<ip> — the Edge-tab case.
+    assert by["unknown@192.168.1.41"]["requests"] == 1
+    assert rows[0]["last_seen"] >= rows[-1]["last_seen"], "most recent first"
+
+
+def test_client_registry_survives_flush_and_merges_deltas(tmp_path):
+    st = make(tmp_path)
+    # start() needs an event loop for the flush task; open the DB half directly.
+    import sqlite3 as _s
+    db = _s.connect(str(tmp_path / "stats.db"), check_same_thread=False)
+    from llmconfig.stats import _SCHEMA
+    db.executescript(_SCHEMA)
+    st._db = db
+    st.note_request("spark1", "m1", "", client="app-a", ip="1.2.3.4", fn="x")
+    st._flush()                                   # persisted
+    st.note_request("spark1", "m1", "", client="app-a", ip="1.2.3.4", fn="x")
+    rows = st.clients(days=1)                     # DB row + unflushed delta
+    assert rows[0]["client"] == "app-a@1.2.3.4" and rows[0]["requests"] == 2
+
+
+def test_bucket_migration_v1_to_v2_preserves_history(tmp_path):
+    # Build a v1 DB (no `client` column), as any pre-2026-08-08 install has.
+    p = tmp_path / "stats.db"
+    db = sqlite3.connect(str(p))
+    db.execute("CREATE TABLE request_buckets ("
+               "hour_ts INTEGER NOT NULL, unit TEXT NOT NULL, "
+               "model TEXT NOT NULL, workload TEXT NOT NULL, "
+               "n INTEGER NOT NULL DEFAULT 0, "
+               "PRIMARY KEY (hour_ts, unit, model, workload))")
+    hour = int(time.time() // 3600) * 3600
+    db.execute("INSERT INTO request_buckets VALUES (?,?,?,?,?)",
+               (hour, "primary", "old-model", "batch", 42))
+    db.commit(); db.close()
+
+    st = make(tmp_path)
+    db2 = sqlite3.connect(str(p), check_same_thread=False)
+    st._migrate_buckets(db2)
+    from llmconfig.stats import _SCHEMA
+    db2.executescript(_SCHEMA)
+    st._db = db2
+    # History preserved under client='', new writes get the wide key.
+    out = {m["model"]: m for m in st.models(days=1)}
+    assert out["old-model"]["requests"] == 42
+    st.note_request("primary", "old-model", "batch",
+                    client="new-app", ip="9.9.9.9")
+    st._flush()
+    out = {m["model"]: m for m in st.models(days=1)}
+    assert out["old-model"]["requests"] == 43
+    # And the migration is idempotent.
+    st._migrate_buckets(db2)
+    out = {m["model"]: m for m in st.models(days=1)}
+    assert out["old-model"]["requests"] == 43

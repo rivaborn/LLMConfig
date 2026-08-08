@@ -11,7 +11,7 @@ import shlex
 from contextlib import asynccontextmanager
 from typing import Optional
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException, Response
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -517,6 +517,16 @@ def create_app() -> FastAPI:
         days = max(1, min(int(days), settings.stats_retention_days))
         return {"days": days, "models": stats.models(days=days)}
 
+    @app.get("/api/stats/clients")
+    async def api_stats_clients(days: int = 30) -> dict:
+        """Who is using the fleet: one row per (app, ip, function) with
+        first/last seen and request count, most recently seen first. The first
+        stop for "what is THAT on spark2?" — replaces the netstat hunt of
+        2026-08-08. `unknown@<ip>` rows are clients that sent no X-LLM-App
+        (and had no hold/lease to infer from)."""
+        days = max(1, min(int(days), settings.stats_retention_days))
+        return {"days": days, "clients": stats.clients(days=days)}
+
     @app.get("/api/stats/evictions")
     async def api_stats_evictions(limit: int = 50) -> dict:
         """Recent eviction/preemption events, newest first: who was displaced,
@@ -643,8 +653,19 @@ def create_app() -> FastAPI:
         })
 
     @app.post("/api/load", response_model=Job, dependencies=write)
-    async def api_load(req: LoadRequest,
+    async def api_load(req: LoadRequest, request: Request,
                        x_llm_lease: Optional[str] = Header(default=None)) -> Job:
+        # Attribution: who is asking for this load. Same identity chain as /v1
+        # (X-LLM-App -> hold -> lease holder) + the server-captured peer IP;
+        # the strict gate applies here too — a load consumes a unit.
+        app_name, _fn, ip = gateway._client_identity(request)
+        reject = gateway._identity_reject(app_name)
+        if reject is not None:
+            raise HTTPException(status_code=400,
+                                detail="client identity required — send "
+                                       "X-LLM-App: <app-name>")
+        who = (f"{app_name}@{ip}" if app_name and ip
+               else app_name or (f"unknown@{ip}" if ip else ""))
         if req.lane.strip().lower() == "auto":
             # The REST caller already names a server kind, so it constrains the
             # candidate set; placement then rewrites `lane` to the chosen unit and
@@ -664,7 +685,7 @@ def create_app() -> FastAPI:
             # Workload): priority is left None, so units keep the idle-only
             # eviction rule and explicit-load semantics for this request.
             req.requested_by = req.requested_by or (
-                _holder_of(x_llm_lease) or "api")
+                _holder_of(x_llm_lease) or who or "api")
             if decision.group_victims:
                 # Tear the group(s) down BEFORE the load job — the teardown
                 # needs the target member's lock (see Placer.evict_group_victims).
@@ -676,6 +697,10 @@ def create_app() -> FastAPI:
                     raise HTTPException(
                         status_code=503,
                         detail=f"could not free the nodes for '{req.model}': {e}")
+        # Direct-lane loads get the same attribution the auto path already had —
+        # `requested_by` feeds eviction events' `evicted_by`, so a hand-issued
+        # load that displaces something now names its issuer, not "".
+        req.requested_by = req.requested_by or who
         unit = _lane(req.lane)
         # Catch the kind mismatch here — otherwise server="spark" on a GPU lane
         # falls into the vLLM path and fails with a misleading "unknown alias".
@@ -1027,7 +1052,13 @@ def create_app() -> FastAPI:
 
     @app.post("/api/leases", response_model=LeaseClaimResponse, status_code=201,
               dependencies=write)
-    async def api_lease_claim(req: LeaseClaimRequest, response: Response) -> LeaseClaimResponse:
+    async def api_lease_claim(req: LeaseClaimRequest, request: Request,
+                              response: Response) -> LeaseClaimResponse:
+        # Attribution: a claim with no note records where it came from. The
+        # holder field already names the app; the IP is what the holder alone
+        # cannot tell you (the same holder string can run from anywhere).
+        if not req.note and request.client:
+            req.note = f"from {req.holder or 'unknown'}@{request.client.host}"
         try:
             lease, displaced = leases.claim(req)
         except LeaseError as e:

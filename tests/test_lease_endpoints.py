@@ -173,6 +173,70 @@ def test_lane_canonical_model_folds_alias_and_served_name(client):
     assert lane.canonical_model("qwen2.5:1.5b") == "qwen2.5:1.5b"
 
 
+def test_client_identity_recorded_from_headers_and_ip(client):
+    """/v1 traffic lands in the clients registry as app@ip with its function;
+    anonymous traffic still lands as unknown@<ip> (2026-08-08)."""
+    stats = client.app.state.stats
+    gw = client.app.state.gateway
+
+    class _Req:                                    # duck-typed Request
+        def __init__(self, headers, host="10.0.0.9"):
+            self.headers = headers
+            self.client = type("C", (), {"host": host})()
+
+    app, fn, ip = gw._client_identity(_Req(
+        {"x-llm-app": "litrank-enrich", "x-llm-function": "tier3"}))
+    assert (app, fn, ip) == ("litrank-enrich", "tier3", "10.0.0.9")
+    # Fallback chain: no app header -> hold name; neither -> "".
+    app, _, _ = gw._client_identity(_Req({"x-llm-hold": "opencode-sess"}))
+    assert app == "opencode-sess"
+    app, _, _ = gw._client_identity(_Req({}))
+    assert app == ""
+
+    stats.note_request("primary", "m", "", client="litrank-enrich",
+                       ip="10.0.0.9", fn="tier3")
+    stats.note_request("primary", "m", "", client="", ip="10.0.0.7")
+    by = {r["client"]: r for r in stats.clients(days=1)}
+    assert by["litrank-enrich@10.0.0.9"]["function"] == "tier3"
+    assert "unknown@10.0.0.7" in by
+
+
+def test_strict_mode_rejects_anonymous_and_admits_identified(client, monkeypatch):
+    """CLIENT_ID_REQUIRED=true -> anonymous /v1 + /api/load get an actionable
+    400; identified requests pass. Default (off) is exercised by every other
+    test in this file."""
+    monkeypatch.setattr(client.app.state.settings, "client_id_required", True)
+    r = client.post("/api/load", json=LOAD)
+    assert r.status_code == 400 and "X-LLM-App" in r.text
+    r = client.post("/api/load", json=LOAD, headers={"X-LLM-App": "test-app"})
+    assert r.status_code == 200, r.text
+
+
+def test_api_load_requested_by_defaults_to_app_at_ip(client):
+    """A direct-lane load with no requested_by is attributed app@ip, so an
+    eviction it causes names its issuer instead of ''."""
+    seen = {}
+    orig = client.app.state.orch.load
+
+    def spy(req):
+        seen["requested_by"] = req.requested_by
+        return orig(req)
+
+    client.app.state.orch.load = spy
+    r = client.post("/api/load", json=LOAD, headers={"X-LLM-App": "my-tool"})
+    assert r.status_code == 200
+    assert seen["requested_by"].startswith("my-tool@"), seen
+
+
+def test_stats_clients_endpoint_shape(client):
+    client.app.state.stats.note_request(
+        "primary", "m", "", client="app-x", ip="10.1.1.1", fn="probe")
+    d = client.get("/api/stats/clients?days=7").json()
+    assert d["days"] == 7
+    row = next(r for r in d["clients"] if r["client"] == "app-x@10.1.1.1")
+    assert row["function"] == "probe" and row["requests"] >= 1
+
+
 def test_lane_lease_claimed_by_served_name_stores_the_alias(client):
     """_canon at claim time now folds on lanes: a claim naming the SERVED name
     lands on the same key as one naming the alias, so the two can never split

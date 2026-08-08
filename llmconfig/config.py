@@ -570,6 +570,21 @@ class Settings(BaseSettings):
     # and the `usage` field on /api/status lanes).
     usage_active_window_s: float = 60.0
 
+    # --- client identity (who is using the fleet) ---
+    # Every /v1 and /api/load request is ATTRIBUTED: client IP captured
+    # server-side (uvicorn serves directly, so the peer IP is the real client),
+    # app name from `X-LLM-App` (falling back to the X-LLM-Hold name, then the
+    # lease holder), free-text purpose from `X-LLM-Function`. Recorded in the
+    # request buckets and the clients registry (GET /api/stats/clients) — built
+    # after 2026-08-08, when finding who launched qwen35-122b took a netstat
+    # hunt across three machines instead of one API call.
+    #
+    # `client_id_required` is the flip-on switch once every client that matters
+    # sends the header: anonymous /v1 + /api/load requests then get a 400 naming
+    # X-LLM-App. Default OFF so nothing breaks on deploy day; read-only /api
+    # endpoints are never gated.
+    client_id_required: bool = False
+
     # --- boot autoload ---
     # Restore each unit's default model at startup ONLY where doing so disturbs
     # nothing: a unit that is free, or holds an idle model. A unit that is ACTIVE,

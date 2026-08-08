@@ -381,17 +381,56 @@ class OpenAIGateway:
 
     def _requester(self, request: Request) -> str:
         """Who to name in `revoked_by` when this request's load displaces someone:
-        the X-LLM-Hold holder, else the holder of a known X-LLM-Lease, else
-        'placement'. Sync dict reads only."""
+        the X-LLM-Hold holder, else X-LLM-App, else the holder of a known
+        X-LLM-Lease, else 'placement'. Sync dict reads only."""
         holder = (request.headers.get("x-llm-hold") or "").strip()[:64]
         if holder:
             return holder
+        app = (request.headers.get("x-llm-app") or "").strip()[:64]
+        if app:
+            return app
         lease_id = (request.headers.get("x-llm-lease") or "").strip()
         if lease_id and self.leases is not None:
             lease = self.leases.get(lease_id)
             if lease is not None and lease.holder:
                 return lease.holder
         return "placement"
+
+    def _client_identity(self, request: Request) -> tuple[str, str, str]:
+        """(app, function, ip) — who is behind this request, for attribution.
+
+        `app` resolves X-LLM-App -> the X-LLM-Hold name -> the holder of a
+        valid X-LLM-Lease -> "" (the strict gate and the stats layer render
+        that as "unknown"). `ip` is captured SERVER-SIDE from the connection —
+        uvicorn serves directly, so the peer address is the real client and
+        even a silent browser is attributed to a machine. Built 2026-08-08,
+        after naming the launcher of a mystery qwen35-122b took a netstat hunt
+        across three machines. Sync dict/header reads only."""
+        app = (request.headers.get("x-llm-app") or "").strip()[:64]
+        fn = (request.headers.get("x-llm-function") or "").strip()[:120]
+        ip = (request.client.host if request.client else "") or ""
+        if not app:
+            app = (request.headers.get("x-llm-hold") or "").strip()[:64]
+        if not app and self.leases is not None:
+            lid = (request.headers.get("x-llm-lease") or "").strip()
+            if lid:
+                lease = self.leases.get(lid)
+                if lease is not None and lease.holder:
+                    app = lease.holder
+        return app, fn, ip
+
+    def _identity_reject(self, app: str):
+        """400 for an anonymous request when CLIENT_ID_REQUIRED is on, else None.
+
+        Actionable by design: the message names the header to send. Never gates
+        read-only endpoints — only the paths that consume an LLM unit."""
+        if not self.s.client_id_required or app:
+            return None
+        return JSONResponse(status_code=400, content={"error": {
+            "message": "this gateway requires clients to identify themselves — "
+                       "send X-LLM-App: <app-name> (and optionally "
+                       "X-LLM-Function: <purpose>) on every request",
+            "type": "invalid_request_error", "code": "client_id_required"}})
 
     def _auto_hold(self, lane: "Unit", model: str, request: Request,
                    priority: int | None = None) -> None:
@@ -662,6 +701,13 @@ class OpenAIGateway:
         model = body.get("model") or ""
         stream = bool(body.get("stream"))
 
+        # Identity FIRST: the strict gate must refuse before placement runs any
+        # side effects, and the capture is needed for attribution either way.
+        app, fn, ip = self._client_identity(request)
+        reject = self._identity_reject(app)
+        if reject is not None:
+            return reject
+
         # Admission + placement BEFORE resolve() and before the first lane.touch():
         # the decision shouldn't depend on model resolution, and a refused request
         # must not extend anyone's idle window (it never reached a backend).
@@ -686,7 +732,8 @@ class OpenAIGateway:
         wl = classify_workload(body or {}, request.headers.get("x-llm-workload"),
                                self.s)
         if self.stats is not None:   # once per request, not per touch
-            self.stats.note_request(lane.cfg.id, model, wl.cls if wl else "")
+            self.stats.note_request(lane.cfg.id, model, wl.cls if wl else "",
+                                    client=app, ip=ip, fn=fn)
         self._auto_hold(lane, model, request,
                         priority=workload_priority(wl, self.s))
 
@@ -877,6 +924,12 @@ class OpenAIGateway:
             raise HTTPException(status_code=400, detail="request body must be a JSON object")
         model = body.get("model") or ""
 
+        # Identity first — same reasoning as the chat path.
+        app, fn, ip = self._client_identity(request)
+        reject = self._identity_reject(app)
+        if reject is not None:
+            return reject
+
         # Same ordering as the chat path: admission + placement before resolve()
         # and before the first touch(). `stream` is always False — see docstring.
         chosen = await self._choose(request, model, is_chat=False, stream=False,
@@ -909,7 +962,8 @@ class OpenAIGateway:
         wl = classify_workload(body or {}, request.headers.get("x-llm-workload"),
                                self.s)
         if self.stats is not None:   # once per request, not per touch
-            self.stats.note_request(lane.cfg.id, model, wl.cls if wl else "")
+            self.stats.note_request(lane.cfg.id, model, wl.cls if wl else "",
+                                    client=app, ip=ip, fn=fn)
         self._auto_hold(lane, model, request,
                         priority=workload_priority(wl, self.s))
 
